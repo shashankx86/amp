@@ -58,6 +58,18 @@ struct CostModelConstants {
     // Never plan right up to the edge: the allocator fragments, and a failed context init costs
     // far more than a slightly smaller ubatch.
     double vram_safety = 0.92;
+    // What a CUDA context costs before any of amp's own buffers exist: the driver's own allocation
+    // plus the context's bookkeeping. Measured here as the gap between the planner's estimate and the
+    // free VRAM actually reported after llama_init_from_model(): 119 MiB free against a 5.56 GiB
+    // estimate at 200k context, i.e. ~400-500 MiB unaccounted for. Ignoring it makes the planner pick
+    // plans that the runtime then has to halve twice to fit.
+    double vram_context_bytes = 450.0 * 1024 * 1024;
+    // Ceiling on the page cache we plan against. The theoretical figure (RAM minus the OS reserve) is
+    // ~12.9 GiB here, but the largest working set ever measured resident on this box is 11.15 GiB, and
+    // the decode cliff is real: 10.25 GiB of CPU experts gave 25.6-29.9 t/s, 11.54 GiB gave 2.8-4.8.
+    // Planning against the theoretical number therefore disables the cliff term in the cost model -
+    // every candidate looks fully resident, including the ones that thrash.
+    double cache_ceiling_bytes = 11.2 * 1024 * 1024 * 1024;
     // Score weights for the planner.
     double weight_prefill = 0.65;
     double weight_decode  = 0.35;

@@ -101,8 +101,8 @@ int main(int argc, char ** argv) {
     if (what == "plan") {
         PlannerOptions opts;
         opts.n_ctx = ctx;
-        DeviceBudget budget = detect_device_budget();
-        const CostModel cost = CostModel::from_environment();
+        const CostModel    cost   = CostModel::from_environment();
+        const DeviceBudget budget = detect_device_budget(cost.constants());
         auto plan_res = MemoryPlanner::plan(geo, budget, opts, cost);
         if (!plan_res.ok()) {
             fprintf(stderr, "amp-warm: planning failed: %s\n", plan_res.message().c_str());

@@ -30,6 +30,12 @@ CostModel CostModel::from_environment() {
     c.vram_bytes_per_ubatch_token = env_double("AMP_VRAM_PER_UBATCH_TOKEN_MB",
                                                c.vram_bytes_per_ubatch_token / (1024.0 * 1024.0)) *
                                    1024.0 * 1024.0;
+    c.vram_context_bytes = env_double("AMP_VRAM_CONTEXT_MB",
+                                     c.vram_context_bytes / (1024.0 * 1024.0)) *
+                           1024.0 * 1024.0;
+    c.cache_ceiling_bytes = env_double("AMP_CACHE_CEILING_GB",
+                                      c.cache_ceiling_bytes / (1024.0 * 1024.0 * 1024.0)) *
+                           1024.0 * 1024.0 * 1024.0;
     c.decode_ms_per_cpu_layer    = env_double("AMP_DECODE_MS_PER_LAYER", c.decode_ms_per_cpu_layer);
     return CostModel(c);
 }

@@ -194,3 +194,48 @@ Protocol traps found while building this, all of which first looked like numeric
    same config. The difference is page-cache state: after warming 12.19 GiB only ~4.5 GiB stayed
    resident because other processes hold ~4 GiB, so the head-to-head was run in a partially cold
    state. Needs a controlled cold/warm matrix before quoting either number.
+
+## 2026-09-26 — the server, and what the planner had to be corrected about
+
+Reproduce with:
+
+```bash
+./scripts/fetch_deps.sh && ./scripts/build.sh          # vendored llama.cpp, static, 31 tests
+./build/bin/amp-server --model $M --port 8085 --ctx 200000
+python3 scripts/smoke_server.py --url http://127.0.0.1:8085
+```
+
+Server at the real 200k context, planner's own choice, page cache otherwise quiet:
+
+| measurement | value |
+|---|---|
+| start-up warm | 10.90 GiB in 4.3 s (2.52 GiB/s) |
+| plan chosen | 4 expert layers on GPU, ubatch 1024, 5.60 GiB of 5.89 GiB VRAM free |
+| prefill, 20-token prompt | 2.2 t/s (dominated by the first fault-in of each expert layer; not a throughput number) |
+| decode, 40 tokens | 6.89 t/s — **cache-bound, see below** |
+| `Cached` after the warm | 11.56 GiB, against a 12.35 GiB working set |
+
+That last row is the whole story: 10.90 GiB of CPU experts plus 1.45 GiB of dense weights does not fit
+alongside everything else, so part of the cyclic expert scan is being evicted and decode sits in the
+cliff regime rather than the compute-bound one. It is the same 10x effect measured in M3
+(10.25 GiB → 25.6-29.9 t/s, 11.54 GiB → 2.8-4.8 t/s), reached here by a different route: g=4 was
+chosen because VRAM at 200k context only affords it. `amp-plan` predicted 15.5 t/s and printed
+"0.6 t/s with the cache free right now" for the state that actually existed; the served number landed
+between the two, which is what the "tg now" column is for.
+
+### Planner corrections found by running the server at 200k
+
+1. **The VRAM safety factor was applied to the whole plan**, so a 6.05 GiB configuration was accepted
+   against 5.89 GiB usable. Weights and the KV cache are exact byte counts from the GGUF; only the
+   compute buffer is an estimate. The factor now applies to the compute estimate alone, and the total
+   must fit. Effect: the runtime's VRAM backoff stopped halving the ubatch three times
+   (1024 → 512 → 256 → 128) and the server comes up at ubatch 1024.
+2. **The CUDA context's own cost was unmodelled** — 450 MiB, measured as the gap between the estimate
+   and the 119 MiB the driver reported free after init at 200k context. Now in the fixed cost.
+3. **The decode cliff could never fire.** The planning budget was the theoretical page cache
+   (RAM − OS reserve ≈ 12.9 GiB), so every candidate looked fully resident, including the ones that
+   thrash. The budget is now capped at 11.2 GiB, the largest working set ever measured resident here.
+   With that, g=3 (11.54 GiB of CPU experts) correctly shows a 21.20 MiB/ubatch stream and a lower
+   predicted decode than g=4 (10.90 GiB, fully resident).
+4. **The ubatch backoff stopped at its floor while VRAM was still over budget**, accepting a context
+   with 119 MiB free. It now says so explicitly and names the flags that would fix it.

@@ -138,8 +138,8 @@ int main(int argc, char ** argv) {
     opts.n_ctx  = cfg.n_ctx;
     opts.cache_k = cfg.cache_k;
     opts.cache_v = cfg.cache_v;
-    DeviceBudget budget = detect_device_budget();
-    const CostModel cost = CostModel::from_environment();
+    const CostModel    cost   = CostModel::from_environment();
+    const DeviceBudget budget = detect_device_budget(cost.constants());
     auto plan_res = MemoryPlanner::plan(geo, budget, opts, cost);
     if (!plan_res.ok()) { fprintf(stderr, "amp-infer: %s\n", plan_res.message().c_str()); return 1; }
     ExecutionPlan plan = *plan_res;

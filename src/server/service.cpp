@@ -191,8 +191,9 @@ Result<std::unique_ptr<InferenceService>> InferenceService::create(const ServerC
     opts.n_ctx   = cfg.n_ctx;
     opts.cache_k = cfg.cache_k;
     opts.cache_v = cfg.cache_v;
-    const CostModel cost = CostModel::from_environment();
-    auto            plan_res = MemoryPlanner::plan(**geo_res, detect_device_budget(), opts, cost);
+    const CostModel     cost   = CostModel::from_environment();
+    const DeviceBudget  budget = detect_device_budget(cost.constants());
+    auto plan_res = MemoryPlanner::plan(**geo_res, budget, opts, cost);
     if (!plan_res.ok()) {
         return plan_res.status().context("planning");
     }
@@ -252,9 +253,20 @@ Result<std::unique_ptr<InferenceService>> InferenceService::create(const ServerC
         svc->ctx_ = llama_init_from_model(svc->model_, cp);
         if (svc->ctx_) {
             const uint64_t free_vram = cuda_free_bytes();
-            if (free_vram == 0 || free_vram >= want_vram || ubatch <= floor_ub) {
+            if (free_vram == 0 || free_vram >= want_vram) {
                 plan.ubatch = ubatch;
                 svc->plan_  = plan;
+                break;
+            }
+            if (ubatch <= floor_ub) {
+                // Out of room to back off any further. Accept it - refusing to start would be worse -
+                // but say plainly that the context is over budget, because that is the state in which
+                // a later allocation can fail inside the CUDA allocator rather than here.
+                plan.ubatch = ubatch;
+                svc->plan_  = plan;
+                AMP_WARN("amp: only ", human_bytes(free_vram),
+                         " VRAM free and the ubatch is already at the floor (", ubatch,
+                         "): the context is over budget. Lower --ctx or --gpu-layers.");
                 break;
             }
             AMP_WARN("amp: only ", human_bytes(free_vram), " VRAM free after init, want ",

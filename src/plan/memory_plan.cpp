@@ -96,7 +96,7 @@ std::vector<RangePlan> select_resident_ranges(const ModelGeometry & geo, int32_t
 
 } // namespace
 
-DeviceBudget detect_device_budget() {
+DeviceBudget detect_device_budget(const CostModelConstants & cost_constants) {
     DeviceBudget b;
     const MemInfo mi = read_meminfo();
     b.ram_total     = mi.mem_total_bytes;
@@ -111,7 +111,10 @@ DeviceBudget detect_device_budget() {
     // this second: the operating mode we are planning for has other RAM users closed. The
     // momentary reading is still reported, as the "tg now" column, so the cost of not closing
     // them is visible rather than silently baked into the ranking.
-    b.cache_budget    = potential;
+    // Capped at the largest working set ever measured resident, so the cost model's overflow (decode
+    // cliff) term can actually fire. See CostModelConstants::cache_ceiling_bytes.
+    const uint64_t ceiling = (uint64_t) cost_constants.cache_ceiling_bytes;
+    b.cache_budget    = potential < ceiling ? potential : ceiling;
     b.cache_potential = potential;
     b.cache_realistic = realistic;
 
@@ -135,10 +138,13 @@ std::vector<CandidatePlan> MemoryPlanner::rank(const ModelGeometry & geo, const 
                                                size_t keep_top) {
     std::vector<CandidatePlan> cands;
 
-    const int64_t             n_layer  = geo.n_layer();
-    const int64_t             fixed    = vram_fixed_bytes(geo, opts);
-    const uint64_t            vram_cap = budget.vram_usable();
-    const CostModelConstants  cc       = cost.constants();
+    const int64_t            n_layer  = geo.n_layer();
+    const uint64_t           vram_cap = budget.vram_usable();
+    const CostModelConstants cc       = cost.constants();
+    // The CUDA context's own cost is included: it exists before any buffer of ours is allocated.
+    // Measured as the gap between this estimate and the free VRAM the driver reports after context
+    // init - 119 MiB free against a 5.56 GiB estimate at 200k context.
+    const int64_t fixed = vram_fixed_bytes(geo, opts) + (int64_t) cc.vram_context_bytes;
 
     // Decode prediction as a function of the page cache we assume. Evaluated twice: once for
     // the budget we plan against, once for what is free right now, because the difference between
@@ -191,13 +197,20 @@ std::vector<CandidatePlan> MemoryPlanner::rank(const ModelGeometry & geo, const 
             c.kv_bytes            = geo.kv_bytes(opts.n_ctx, opts.cache_k, opts.cache_v);
             c.compute_bytes = (int64_t) (cc.vram_bytes_per_ubatch_token * (double) ub) +
                                 (int64_t) (cc.vram_bytes_per_gpu_expert_layer * (double) g);
-            c.vram_bytes          = fixed + gpu_experts + c.compute_bytes;
+            // The safety factor covers the *estimate* only. Weights and the KV cache are exact byte
+            // counts read out of the GGUF, so applying a margin to the total lets a plan that is
+            // physically too large look affordable - which is exactly what happened at 200k: a
+            // 6.05 GiB plan was accepted against 5.89 GiB usable, and the runtime then had to halve
+            // the ubatch three times to fit. Better to reject it here and pick the largest ubatch
+            // that genuinely fits.
+            c.vram_bytes = fixed + gpu_experts +
+                           (int64_t) ((double) c.compute_bytes * cc.vram_safety);
 
-            if ((uint64_t) ((double) c.vram_bytes * cc.vram_safety) > vram_cap) {
+            if ((uint64_t) c.vram_bytes > vram_cap) {
                 c.fits          = false;
-                c.reject_reason = format("vram %s > usable %s (with safety %.0f%%)",
-                                         human_bytes((uint64_t) ((double) c.vram_bytes * cc.vram_safety)).c_str(),
-                                         human_bytes(vram_cap).c_str(), cc.vram_safety * 100.0);
+                c.reject_reason = format("vram %s > usable %s",
+                                         human_bytes((uint64_t) c.vram_bytes).c_str(),
+                                         human_bytes(vram_cap).c_str());
                 cands.push_back(c);
                 continue;
             }
@@ -331,7 +344,7 @@ Result<ExecutionPlan> MemoryPlanner::plan(const ModelGeometry & geo, const Devic
             human_bytes((uint64_t) p.cache_needed).c_str(), human_bytes(budget.cache_free_now).c_str(),
             p.predicted_decode_tps_now, p.predicted_decode_tps));
     }
-    p.notes.push_back(format("ubatch %lld, compute buffer %s, total VRAM %s of %s usable",
+    p.notes.push_back(format("ubatch %lld, compute buffer %s, total VRAM %s of %s free",
                              (long long) p.ubatch, human_bytes((uint64_t) p.compute_bytes).c_str(),
                              human_bytes((uint64_t) p.vram_total).c_str(),
                              human_bytes((uint64_t) p.vram_budget).c_str()));

@@ -137,7 +137,7 @@ int main(int argc, char ** argv) {
     const ModelGeometry & geo = **geo_res;
 
     // ---- box ----
-    budget = detect_device_budget();
+    budget = detect_device_budget(CostModel::from_environment().constants());
     if (vram_total) {
         budget.vram_total = vram_total;
     }

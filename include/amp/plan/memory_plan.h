@@ -40,7 +40,8 @@ struct DeviceBudget {
 };
 
 // Reads /proc/meminfo and the NVIDIA driver for the real numbers.
-DeviceBudget detect_device_budget();
+// `cost_constants` supplies the page-cache ceiling the plan is held to.
+DeviceBudget detect_device_budget(const CostModelConstants & cost_constants = CostModelConstants{});
 
 struct PlannerOptions {
     int64_t   n_ctx          = 200000;
