@@ -133,11 +133,23 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
 - **API-level variants** (llama.cpp): `reasoning_format` ∈ `none` | `auto` | `deepseek` |
   `deepseek-legacy`; `reasoning_budget_tokens` / `thinking_budget_tokens` / `--reasoning-budget`
   (`-1` unrestricted, `0` immediate, `N`); `reasoning_budget_message`; `reasoning_control`.
-- **Unresolved:** `enable_thinking: false` does not change the render even when routed through
-  `common_chat_templates_inputs::enable_thinking` (which is the field the value comes from, since
-  `chat-auto-parser-helpers.cpp:322` overwrites the kwarg). The specialized-template path is not
-  involved — it only handles Ministral Large 3 and GPT-OSS — so it is the autoparser's reasoning-mode
-  detection. Do not retry the kwargs route; check the autoparser.
+- **SOLVED (2026-09-26) - the bug was ours, not upstream's.** The old hand-rolled server could not
+  make `enable_thinking: false` work. llama.cpp's own server does, with no patch. The real gate is
+  `server-context.cpp:1463-1464`:
+
+      template_supports_thinking = params_base.use_jinja
+                                && common_chat_templates_support_enable_thinking(...);
+      enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
+
+  and the per-request value is applied at `server-common.cpp:1339-1346`. Verified with
+  `/apply-template`: default renders `<|im_start|>assistant\n<think>\n`; `enable_thinking:false`
+  renders `<|im_start|>assistant\n<think>\n\n</think>\n\n`. End to end, same question, same
+  answer `4`: 104 completion tokens with thinking on, **2** with it off.
+  The earlier hypothesis was wrong on both counts: the autoparser's reasoning-mode detection comes
+  from template analysis in `chat-diff-analyzer.cpp`, not from `enable_thinking`, and the
+  specialized-template path was never involved. Lesson: when a reimplementation disagrees with
+  upstream, suspect the reimplementation first, and prove it with `/apply-template` before
+  theorising.
 
 ## Thinking-model rules learned the hard way (this template, this quant)
 
@@ -188,6 +200,17 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
 - Copy response shapes from `tools/server/server-task.cpp`, not from memory: `system_fingerprint` on
   every chunk, and `stream_options.include_usage` producing a trailing chunk with **empty** `choices`
   and only `usage` (the spec requires it; the AI SDK is fine either way but be exact).
+
+## llama.cpp defaults that are dangerous on this box (clamped by the preflight)
+
+These are llama.cpp's own defaults, not amp's, and each is a way to OOM or thrash a 6 GB card with
+14 GiB of RAM. `amp::PreflightOptions` clamps them and says so in the startup log:
+
+| default | value | why it is dangerous here | clamped to |
+|---|---|---|---|
+| `n_ctx_checkpoints` | 32 | each checkpoint is a **full** serialized sequence state (`common_prompt_checkpoint::data_tgt`, filled by `llama_state_seq_get_data_ext`) - 8320 B/token of KV plus the 62.81 MiB recurrent state, so ~1.6 GiB each at 200k, and the ring reaches tens of GiB | 2 |
+| `cache_ram_mib` | 8192 | an *anonymous* RAM prompt cache that evicts the model's page cache - the exact mechanism behind the 10x decode cliff | 512 |
+| `fit_params` | on | llama.cpp's fitter throws on our layout (`fit.cpp:463-486`), the failure is ignored (`common.cpp:1320`), and a *successful* fit would overwrite the buft overrides and re-fill the GPU | off |
 
 ## Facts about this model that are easy to get wrong
 
