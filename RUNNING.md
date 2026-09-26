@@ -97,8 +97,30 @@ will evaluate, for free.
 ### Concurrency
 
 llama.cpp's server owns slot scheduling, so a `llama_context` is never reentered. Our old
-hand-rolled server got this wrong and died under four concurrent streams; section 7 of
-section 14 of `scripts/parity_test.py` is the regression test for it.
+hand-rolled server got this wrong and died under four concurrent streams; section 14 of
+`scripts/parity_test.py` is the regression test for it.
+
+**amp runs one slot by default, and that has a cost you should know about.** Stock
+`llama-server` resolves `--parallel` to 4 (`arg.cpp:1400` -> `server.cpp:156-159`). Four
+concurrent generations each want the same shared ~10.9 GiB CPU expert working set, and on a
+box with ~10.9 GiB of usable page cache that is thrashing, not sharing: measured **0.64 t/s**
+with two slots active against 28.4 t/s with one. So the preflight sets `n_parallel = 1` and
+requests queue instead of interfering.
+
+What that costs:
+
+| | `n_parallel = 1` (default) | `--parallel 4` |
+|---|---|---|
+| concurrent requests | queue, each at full speed | thrash to ~0.6 t/s |
+| `n > 1`, several choices in one response | **400**, bounded by slot count | works |
+
+`n > 1` needs more than one slot, so it is unavailable by default and returns a typed
+`invalid_request_error`. Stock llama-server can serve it. This is a deliberate trade, not an
+oversight — but it is a capability stock llama-server has and amp does not by default, so it
+should be your call rather than mine. Pass `--parallel N` if you need it.
+
+Re-measured with one slot, three simultaneous requests: 3/3 completed, all with
+`finish_reason`, decode 21.26 / 29.87 / 33.46 t/s, and only slot 0 ever used.
 
 Point OpenCode at it by setting `baseURL` to `http://127.0.0.1:8081/v1` in
 `~/.config/opencode/opencode.json`.
