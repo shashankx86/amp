@@ -78,7 +78,7 @@ mkdir -p "$OUT"
 cat > "$OUT/opencode.json" <<JSON
 {
   "\$schema": "https://opencode.ai/config.json",
-  "provider": {
+  "providers": {
     "amp": {
       "name": "amp-server (under test)",
       "package": "@opencode/ai/providers/openai-compatible",
@@ -127,8 +127,10 @@ SUMMARY="$OUT/summary.md"
 
 for p in "$HERE"/prompts/*.md; do
     name="$(basename "$p" .md)"
-    num="${name%%-*}"
-    if [ -n "$ONLY" ] && [ "$num" != "$ONLY" ]; then
+    # Files are zero-padded (01-, 02-, 03-) so they sort in order, but a user types --only 1.
+    # 10# strips the padding so both work. Comparing the strings silently skipped every prompt.
+    num=$((10#${name%%-*}))
+    if [ -n "$ONLY" ] && [ "$num" -ne "$ONLY" ]; then
         continue
     fi
 
