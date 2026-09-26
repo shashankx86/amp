@@ -13,3 +13,7 @@ third_party/llama.cpp/
 
 # harness results: real transcripts, regenerated per run
 scripts/harness/runs/
+
+# python bytecode
+__pycache__/
+*.pyc
