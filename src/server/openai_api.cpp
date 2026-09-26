@@ -26,20 +26,40 @@ int64_t now_s() {
         .count();
 }
 
+// llama.cpp stamps every chunk with system_fingerprint (llama_build_info()). Clients ignore it; it
+// is here so responses are shaped identically for anything that diffs them.
+const char * fingerprint() { return "amp-" AMP_VERSION; }
+
 std::string make_id(const char * prefix) {
     return format("%s-%llx-%llu", prefix, (unsigned long long) now_s(),
                   (unsigned long long) g_req_counter.fetch_add(1));
 }
 
-Status json_error(http::ResponseWriter & w, int code, const std::string & msg) {
-    Value body = Value::object();
-    Value err  = Value::object();
+// Error body, shaped like llama.cpp's format_error_response(). Clients branch on `type`, so these are
+// OpenAI's type strings rather than something amp-specific.
+const char * error_type_for(int code) {
+    switch (code) {
+        case 400: return "invalid_request_error";
+        case 401: return "authentication_error";
+        case 403: return "permission_error";
+        case 404: return "not_found_error";
+        default:  return "server_error";
+    }
+}
+
+Value error_body(int code, const std::string & msg) {
+    Value err = Value::object();
     err.set("message", msg);
-    err.set("type", "amp_error");
+    err.set("type", error_type_for(code));
     err.set("code", (int64_t) code);
+    Value body = Value::object();
     body.set("error", std::move(err));
+    return body;
+}
+
+Status json_error(http::ResponseWriter & w, int code, const std::string & msg) {
     (void) w.send_headers(code, "application/json", false);
-    return w.write(body.dump());
+    return w.write(error_body(code, msg).dump());
 }
 
 bool authorized(const http::Request & req, const ServerConfig & cfg) {
@@ -65,6 +85,43 @@ std::vector<std::string> parse_stop(const Value * stop) {
         }
     }
     return out;
+}
+
+// The envelope every chunk carries: id, created, model, system_fingerprint, object. Same fields in
+// the same shape as llama.cpp's chat.completion.chunk.
+Value stream_envelope(const std::string & id, int64_t created, const std::string & model,
+                      const char * object) {
+    Value env = Value::object();
+    env.set("id", id);
+    env.set("object", object);
+    env.set("created", created);
+    env.set("model", model);
+    env.set("system_fingerprint", fingerprint());
+    return env;
+}
+
+Value chunk_with(const Value & env, const Value & delta, Value finish_reason, int index) {
+    Value choice = Value::object();
+    choice.set("index", (int64_t) index);
+    choice.set("delta", delta);
+    choice.set("finish_reason", std::move(finish_reason));
+    Value choices = Value::array();
+    choices.push(std::move(choice));
+    Value chunk = env;
+    chunk.set("choices", std::move(choices));
+    return chunk;
+}
+
+// stream_options.include_usage, as OpenAI and llama.cpp both spell it.
+bool wants_usage(const Value & body) {
+    const Value * so = body.get("stream_options");
+    if (so && so->is_object()) {
+        const Value * iu = so->get("include_usage");
+        if (iu && iu->as_bool(false)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 Value usage_object(const GenerationResult & r, bool include_prompt) {
@@ -204,14 +261,38 @@ void OpenAIApi::register_routes(http::Server & srv, InferenceService & svc, cons
         return apply_template(r, w, svc);
     });
 
+    // A throw inside a handler must not take down the worker thread or leave the client with a
+    // half-written response. llama.cpp wraps its handlers the same way (server-http.cpp) and turns
+    // any escaping exception into a 500 with the OpenAI error shape.
+    auto guard = [](Status st, http::ResponseWriter & w) {
+        if (st.ok()) {
+            return st;
+        }
+        if (w.headers_sent()) {
+            return st;   // mid-stream: the stream path already reported it
+        }
+        return json_error(w, 500, st.message());
+    };
     auto comp = [&](const http::Request & r, http::ResponseWriter & w) {
-        return completions(r, w, svc, cfg);
+        try {
+            return guard(completions(r, w, svc, cfg), w);
+        } catch (const std::exception & e) {
+            return guard(Status::Errorf("%s", e.what()), w);
+        } catch (...) {
+            return guard(Status::Error("unknown exception"), w);
+        }
     };
     srv.route("POST", "/v1/completions", comp);
     srv.route("POST", "/completion", comp);
 
     auto chat = [&](const http::Request & r, http::ResponseWriter & w) {
-        return chat_completions(r, w, svc, cfg);
+        try {
+            return guard(chat_completions(r, w, svc, cfg), w);
+        } catch (const std::exception & e) {
+            return guard(Status::Errorf("%s", e.what()), w);
+        } catch (...) {
+            return guard(Status::Error("unknown exception"), w);
+        }
     };
     srv.route("POST", "/v1/chat/completions", chat);
     srv.route("POST", "/chat/completions", chat);
@@ -290,6 +371,15 @@ Status OpenAIApi::props(const http::Request &, http::ResponseWriter & w, Inferen
     root.set("total_generated_tokens", (int64_t) svc.total_generated());
     root.set("plan", std::move(plan));
     root.set("prefix_cache", std::move(cache));
+
+    const TaskQueue::Stats q = svc.queue_stats();
+    Value                   queue = Value::object();
+    queue.set("posted", (int64_t) q.posted);
+    queue.set("done", (int64_t) q.done);
+    queue.set("failed", (int64_t) q.failed);
+    queue.set("in_flight", (int64_t) q.in_flight);
+    queue.set("depth", (int64_t) q.depth);
+    root.set("queue", std::move(queue));
     root.set("system", std::move(sys));
     (void) w.send_headers(200, "application/json", false);
     return w.write(root.dump(2));
@@ -428,66 +518,70 @@ Status OpenAIApi::completions(const http::Request & req, http::ResponseWriter & 
         return w.write(root.dump());
     }
 
-    (void) w.send_headers(200, "text/event-stream", /*chunked=*/true);
-    auto emit = [&](const Value & chunk) { return w.write_sse(chunk.dump()); };
+    (void) w.send_headers(200, "text/event-stream", /*chunked=*/ true);
+
+    // Envelope, built once, matching llama.cpp's chunk shape field for field.
+    const Value env = stream_envelope(id, created, cfg.model_id, "text_completion");
+    const bool  include_usage = wants_usage(*body);
+
+    // A write that fails means the client is gone. Stop generating rather than burn tokens into a
+    // dead socket - llama.cpp cancels the task when the connection drops, and so does this.
+    bool client_gone = false;
+    auto emit        = [&](const Value & chunk) -> Status {
+        if (client_gone) {
+            return Status::OK();
+        }
+        const Status st = w.write_sse(chunk.dump());
+        if (!st.ok()) {
+            client_gone = true;
+        }
+        return st;
+    };
 
     auto sse_result = svc.generate(*toks, gp, [&](const StreamChunk & c) {
+        if (client_gone) {
+            return;
+        }
         if (c.first) {
-            Value d = Value::object();
-            d.set("role", "assistant");
-            Value ch = Value::object();
-            ch.set("index", (int64_t) 0);
-            ch.set("delta", std::move(d));
-            ch.set("finish_reason", Value());
-            Value root = Value::object();
-            root.set("id", id);
-            root.set("object", "text_completion");
-            root.set("created", created);
-            root.set("model", cfg.model_id);
-            Value choices = Value::array();
-            choices.push(std::move(ch));
-            root.set("choices", std::move(choices));
-            (void) emit(root);
+            Value delta = Value::object();
+            delta.set("role", "assistant");
+            (void) emit(chunk_with(env, delta, Value(), 0));
         } else if (!c.done && !c.text.empty()) {
-            Value d = Value::object();
-            d.set("content", c.text);
-            Value ch = Value::object();
-            ch.set("index", (int64_t) 0);
-            ch.set("delta", std::move(d));
-            ch.set("finish_reason", Value());
-            Value root = Value::object();
-            root.set("id", id);
-            root.set("object", "text_completion");
-            root.set("created", created);
-            root.set("model", cfg.model_id);
-            Value choices = Value::array();
-            choices.push(std::move(ch));
-            root.set("choices", std::move(choices));
-            (void) emit(root);
+            Value delta = Value::object();
+            delta.set("content", c.text);
+            (void) emit(chunk_with(env, delta, Value(), 0));
         }
     });
+
+    // Whatever happened, the stream ends the way the OpenAI spec says it must: a chunk carrying
+    // finish_reason, then the [DONE] sentinel. A client that never sees finish_reason reports
+    // "stream ended without finish_reason" and retries - which is worse than any error we could
+    // have sent it, so on failure we send the error *and* still finish the stream properly.
     if (!sse_result.ok()) {
+        if (!client_gone) {
+            Value err = error_body(500, sse_result.message());
+            (void) w.write_sse(err.dump());
+        }
+        (void) emit(chunk_with(env, Value::object(), Value("stop"), 0));
+    } else {
+        (void) emit(chunk_with(env, Value::object(), Value(sse_result->finish_str()), 0));
+    }
+    if (!client_gone && include_usage && sse_result.ok()) {
+        Value usage = usage_object(*sse_result, /*include_prompt=*/ true);
+        Value u     = env;
+        u.set("choices", Value::array());   // OpenAI: empty choices on the usage-only chunk
+        u.set("usage", std::move(usage));
+        u.set("amp_timings", timings_object(*sse_result));
+        (void) w.write_sse(u.dump());
+    }
+    if (!client_gone) {
         (void) w.write_sse_done();
-        return sse_result;
     }
-    {
-        Value ch = Value::object();
-        ch.set("index", (int64_t) 0);
-        ch.set("delta", Value::object());
-        ch.set("finish_reason", sse_result->finish_str());
-        Value root = Value::object();
-        root.set("id", id);
-        root.set("object", "text_completion");
-        root.set("created", created);
-        root.set("model", cfg.model_id);
-        Value choices = Value::array();
-        choices.push(std::move(ch));
-        root.set("choices", std::move(choices));
-        root.set("usage", usage_object(*sse_result, true));
-        root.set("amp_timings", timings_object(*sse_result));
-        (void) emit(root);
+    if (client_gone) {
+        svc.interrupt();
     }
-    return w.write_sse_done();
+    return sse_result.ok() ? Status::OK()
+                           : Status::Error("stream terminated early: " + sse_result.message());
 }
 
 Status OpenAIApi::chat_completions(const http::Request & req, http::ResponseWriter & w,
@@ -561,54 +655,73 @@ Status OpenAIApi::chat_completions(const http::Request & req, http::ResponseWrit
         return w.write(root.dump());
     }
 
-    (void) w.send_headers(200, "text/event-stream", /*chunked=*/true);
+    (void) w.send_headers(200, "text/event-stream", /*chunked=*/ true);
 
-    auto build_chunk = [&](const std::string & content, const std::string & reasoning, bool first,
-                           Value &&finish) {
-        Value d = Value::object();
-        if (first) {
-            d.set("role", "assistant");
+    const Value env           = stream_envelope(id, created, cfg.model_id, "chat.completion.chunk");
+    const bool  include_usage = wants_usage(*body);
+    bool        client_gone   = false;
+
+    // A failed write means the client hung up. Stop generating rather than compute tokens nobody
+    // will read - llama.cpp cancels the task when the connection drops.
+    auto emit = [&](const Value & chunk) -> Status {
+        if (client_gone) {
+            return Status::OK();
         }
-        if (!content.empty()) {
-            d.set("content", content);
+        const Status st = w.write_sse(chunk.dump());
+        if (!st.ok()) {
+            client_gone = true;
         }
-        if (!reasoning.empty()) {
-            d.set("reasoning_content", reasoning);
-        }
-        Value ch = Value::object();
-        ch.set("index", (int64_t) 0);
-        ch.set("delta", std::move(d));
-        ch.set("finish_reason", std::move(finish));
-        Value root = Value::object();
-        root.set("id", id);
-        root.set("object", "chat.completion.chunk");
-        root.set("created", created);
-        root.set("model", cfg.model_id);
-        Value choices = Value::array();
-        choices.push(std::move(ch));
-        root.set("choices", std::move(choices));
-        return root;
+        return st;
     };
 
     auto sse_result = svc.generate(*toks, gp, [&](const StreamChunk & c) {
-        if (c.first) {
-            (void) w.write_sse(build_chunk("", "", true, Value()).dump());
-        } else if (!c.done && (!c.text.empty() || !c.reasoning.empty())) {
-            (void) w.write_sse(build_chunk(c.text, c.reasoning, false, Value()).dump());
+        if (client_gone) {
+            return;
         }
+        if (c.first) {
+            Value delta = Value::object();
+            delta.set("role", "assistant");
+            (void) emit(chunk_with(env, delta, Value(), 0));
+            return;
+        }
+        if (c.done || (c.text.empty() && c.reasoning.empty())) {
+            return;
+        }
+        Value delta = Value::object();
+        if (!c.text.empty()) {
+            delta.set("content", c.text);
+        }
+        if (!c.reasoning.empty()) {
+            delta.set("reasoning_content", c.reasoning);
+        }
+        (void) emit(chunk_with(env, delta, Value(), 0));
     });
-    if (!sse_result.ok()) {
-        (void) w.write_sse_done();
-        return sse_result;
-    }
-    {
-        Value fr(sse_result->finish_str());
-        Value root = build_chunk("", "", false, std::move(fr));
-        root.set("usage", usage_object(*sse_result, true));
-        root.set("amp_timings", timings_object(*sse_result));
-        (void) w.write_sse(root.dump());
-    }
-    return w.write_sse_done();
-}
 
+    // The stream must always end with a finish_reason and then the [DONE] sentinel. A client that
+    // never sees finish_reason reports "stream ended without finish_reason" and retries, so on
+    // failure we send the error *and* still finish the stream the way the spec requires.
+    if (!sse_result.ok()) {
+        if (!client_gone) {
+            (void) w.write_sse(error_body(500, sse_result.message()).dump());
+        }
+        (void) emit(chunk_with(env, Value::object(), Value("stop"), 0));
+    } else {
+        (void) emit(chunk_with(env, Value::object(), Value(sse_result->finish_str()), 0));
+    }
+    if (!client_gone && include_usage && sse_result.ok()) {
+        Value u = env;
+        u.set("choices", Value::array());   // OpenAI: the usage-only chunk carries empty choices
+        u.set("usage", usage_object(*sse_result, /*include_prompt=*/ true));
+        u.set("amp_timings", timings_object(*sse_result));
+        (void) w.write_sse(u.dump());
+    }
+    if (!client_gone) {
+        (void) w.write_sse_done();
+    }
+    if (client_gone) {
+        svc.interrupt();
+    }
+    return sse_result.ok() ? Status::OK()
+                           : Status::Error("stream terminated early: " + sse_result.message());
+}
 } // namespace amp

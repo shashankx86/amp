@@ -116,6 +116,7 @@ target_compile_options(amp_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
 # server: HTTP + OpenAI-compatible API on top of the runtime
 add_library(amp_server STATIC
   src/server/http_server.cpp
+  src/server/task_queue.cpp
   src/server/service.cpp
   src/server/openai_api.cpp
 )
@@ -153,5 +154,17 @@ if(AMP_BUILD_TESTS)
   add_test(NAME amp_tests COMMAND amp_tests)
 endif()
 
+# Reported as system_fingerprint on every response, the way llama.cpp stamps llama_build_info().
+execute_process(COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" rev-parse --short HEAD
+                OUTPUT_VARIABLE AMP_GIT_SHA OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+if(NOT AMP_GIT_SHA)
+  set(AMP_GIT_SHA "unknown")
+endif()
+string(TIMESTAMP AMP_BUILD_DATE "%Y-%m-%d" UTC)
+target_compile_definitions(amp_util PUBLIC
+  AMP_VERSION="${AMP_GIT_SHA}+${AMP_BUILD_DATE}")
+
 message(STATUS "amp: vendored llama.cpp at ${AMP_VENDOR_DIR}")
+message(STATUS "amp: version ${AMP_GIT_SHA}+${AMP_BUILD_DATE}")
 message(STATUS "amp: CUDA ${AMP_WITH_CUDA}   binaries -> ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")

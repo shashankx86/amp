@@ -17,6 +17,7 @@
 #include "amp/plan/memory_plan.h"
 #include "amp/io/warmer.h"
 #include "amp/runtime/prefix_cache.h"
+#include "amp/server/task_queue.h"
 #include "amp/status.h"
 #include "llama.h"
 
@@ -142,9 +143,18 @@ public:
                                      const std::string & tools_json = "");
 
     // Prompt tokens -> completion, with an optional streaming callback.
+    //
+    // Serialized: the work runs on the queue's single worker, because a llama_context is not
+    // reentrant and an agentic client will happily have two requests in flight at once. See
+    // server/task_queue.h for why that is not hypothetical.
     Result<GenerationResult> generate(const std::vector<llama_token> & prompt_tokens,
                                       const GenerateParams & params,
                                       const std::function<void(const StreamChunk &)> & on_chunk);
+
+    // Blocks until every request submitted so far has finished. Used by tests.
+    void drain() { queue_.drain(); }
+    std::string queue_status() const { return queue_.describe(); }
+    TaskQueue::Stats queue_stats() const { return queue_.stats(); }
 
     // Tokenize plain text (adds BOS if the model's tokenizer does).
     Result<std::vector<llama_token>> tokenize(const std::string & text, bool add_special = true) const;
@@ -165,6 +175,11 @@ public:
     uint64_t checkpoint_bytes() const { return cache_->checkpoint_bytes(); }
 
 private:
+    // The un-serialized body of generate(). Only the queue's worker may call it.
+    Result<GenerationResult> generate_locked(const std::vector<llama_token> & prompt_tokens,
+                                             const GenerateParams & params,
+                                             const std::function<void(const StreamChunk &)> & on_chunk);
+
     InferenceService();
     InferenceService(const InferenceService &) = delete;
     InferenceService & operator=(const InferenceService &) = delete;
@@ -176,6 +191,7 @@ private:
     llama_context *                ctx_   = nullptr;
     const llama_vocab *            vocab_ = nullptr;
     std::unique_ptr<PrefixCache>   cache_;
+    TaskQueue                      queue_;
     std::shared_ptr<ChatTemplates> tmpls_;   // complete type lives in the .cpp
     std::atomic<bool>              interrupt_{false};
     uint64_t                       total_generated_ = 0;

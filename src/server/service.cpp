@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <condition_variable>
 #include <mutex>
 
 namespace amp {
@@ -428,6 +429,33 @@ std::string InferenceService::status_line() const {
 }
 
 Result<GenerationResult> InferenceService::generate(
+    const std::vector<llama_token> & prompt_tokens, const GenerateParams & params,
+    const std::function<void(const StreamChunk &)> & on_chunk) {
+    // One generation at a time, on the queue's worker. The caller blocks until it is done, so the
+    // streaming callback runs on the worker thread - which is fine, because that connection belongs
+    // to exactly this request.
+    std::mutex              done_mu;
+    std::condition_variable done_cv;
+    bool                    finished = false;
+    Result<GenerationResult> out(Status::Error("generation was not run"));
+
+    queue_.post([&] {
+        out = generate_locked(prompt_tokens, params, on_chunk);
+        {
+            std::lock_guard<std::mutex> lock(done_mu);
+            finished = true;
+        }
+        done_cv.notify_all();
+    });
+
+    {
+        std::unique_lock<std::mutex> lock(done_mu);
+        done_cv.wait(lock, [&] { return finished; });
+    }
+    return out;
+}
+
+Result<GenerationResult> InferenceService::generate_locked(
     const std::vector<llama_token> & prompt_tokens, const GenerateParams & params,
     const std::function<void(const StreamChunk &)> & on_chunk) {
     if (prompt_tokens.empty()) {

@@ -115,6 +115,29 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
       two copies of the same loop today: the CLI has the prefetcher, the server has the cache. This is
       known duplication, deliberately left until the server is proven, and it is the first thing to fix.
 
+## Server rules learned the hard way
+
+- **A `llama_context` is not reentrant.** Two generations on one context corrupt the KV and the
+  sampler, and the process dies inside `ggml_abort` — every in-flight stream returns zero bytes. This
+  is not hypothetical: OpenCode issues a side request (conversation title) while the main stream is
+  running, on a second connection, and my HTTP layer happily served both on one context. Fixed with
+  `amp::TaskQueue` (one worker, FIFO), and `InferenceService::generate()` is now serialized *inside*
+  the service so no handler path can forget. Reproduce with section 7 of
+  `scripts/smoke_server.py`; before the fix all four streams were empty and the server was dead.
+- **A stream must always end with `finish_reason`, then `[DONE]`.** Otherwise the Vercel AI SDK
+  reports "OpenAI Chat stream ended without finish_reason" and retries forever, which presents as a
+  mysterious hang rather than an error. On failure amp now sends the error object *and* a proper
+  finishing chunk — strictly more robust than llama.cpp, which sends the error and stops.
+- **A failed SSE write means the client is gone.** Stop generating (`interrupt()`) instead of
+  computing tokens nobody will read. llama.cpp cancels the task on disconnect for the same reason.
+- Handler exceptions are caught and turned into a 500 with OpenAI's error shape, mirroring
+  `server-http.cpp`. An escaping exception through the worker thread would drop the connection.
+- Error bodies use OpenAI's `type` strings (`invalid_request_error`, `server_error`, ...), because
+  clients branch on them.
+- Copy response shapes from `tools/server/server-task.cpp`, not from memory: `system_fingerprint` on
+  every chunk, and `stream_options.include_usage` producing a trailing chunk with **empty** `choices`
+  and only `usage` (the spec requires it; the AI SDK is fine either way but be exact).
+
 ## Facts about this model that are easy to get wrong
 
 - **30 of the 40 layers are recurrent** (linear attention / SSM), only 10 use the KV cache. That is

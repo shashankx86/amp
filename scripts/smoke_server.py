@@ -174,6 +174,55 @@ def main():
         check(False, "absurd max_tokens handled", str(e)[:80])
     check(get(f"{base}/health").get("status") == "ok", "server still healthy afterwards")
 
+    # ---- 7. concurrency: the regression test that matters -------------------------
+    # A llama_context is not reentrant. Agentic clients put two requests in flight at once all the
+    # time (OpenCode asks for a conversation title while the main stream is running), and before the
+    # task queue this produced zero-byte streams and took the process down with them.
+    print("\n7. concurrent streams (the OpenCode pattern: a main stream plus a side request)")
+    import threading
+
+    results = {}
+
+    def run(name, body, n_predict):
+        try:
+            results[name] = ("ok", post(f"{base}/v1/chat/completions", body, stream=True))
+        except Exception as e:  # noqa: BLE001
+            results[name] = ("error", str(e)[:120])
+
+    long_body = {"messages": [{"role": "user", "content": "Write two sentences about caches."}],
+                 "max_tokens": 120, "temperature": 0.7, "stream": True,
+                 "stream_options": {"include_usage": True}}
+    short_body = {"messages": [{"role": "user", "content": "Reply with just the word OK"}],
+                  "max_tokens": 8, "temperature": 0, "stream": True}
+    threads = [threading.Thread(target=run, args=("main", long_body, 120))]
+    threads += [threading.Thread(target=run, args=(f"side{i}", short_body, 8)) for i in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=900)
+
+    for name in ["main", "side0", "side1", "side2"]:
+        if name not in results:
+            check(False, f"{name} stream completed", "timed out")
+            continue
+        kind, payload = results[name]
+        if kind != "ok":
+            check(False, f"{name} stream completed", payload)
+            continue
+        frags = [c for c in payload if c is not None]
+        finish = [c for c in frags if c["choices"] and c["choices"][0].get("finish_reason")]
+        check(bool(frags) and bool(finish),
+              f"{name} stream has content and a finish_reason",
+              f"{len(frags)} chunks, finish_reason="
+              f"{finish[0]['choices'][0]['finish_reason'] if finish else 'MISSING'}")
+    check(payload[-1] is None, "streams end with [DONE]")
+    usage_chunks = [c for c in results["main"][1] if c and not c.get("choices")]
+    check(bool(usage_chunks), "include_usage produces the usage-only chunk",
+          str(usage_chunks[0].get("usage")) if usage_chunks else "missing")
+    check(get(f"{base}/health").get("status") == "ok", "server survived the concurrent load")
+    q = get(f"{base}/props").get("queue", {})
+    check(q.get("failed", 0) == 0, "no task threw", str(q))
+
     print("\n" + ("FAILED: " + ", ".join(FAIL) if FAIL else "all checks passed"))
     return 1 if FAIL else 0
 
