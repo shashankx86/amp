@@ -205,23 +205,41 @@ Reproduce with:
 python3 scripts/smoke_server.py --url http://127.0.0.1:8085
 ```
 
-Server at the real 200k context, planner's own choice, page cache otherwise quiet:
+Server at the real 200k context, planner's own choice (4 expert layers on the GPU, ubatch 1024),
+page cache otherwise quiet. Three identical requests, run back to back:
 
-| measurement | value |
-|---|---|
-| start-up warm | 10.90 GiB in 4.3 s (2.52 GiB/s) |
-| plan chosen | 4 expert layers on GPU, ubatch 1024, 5.60 GiB of 5.89 GiB VRAM free |
-| prefill, 20-token prompt | 2.2 t/s (dominated by the first fault-in of each expert layer; not a throughput number) |
-| decode, 40 tokens | 6.89 t/s — **cache-bound, see below** |
-| `Cached` after the warm | 11.56 GiB, against a 12.35 GiB working set |
+| request | decode | prefill | prefix cached |
+|---|---|---|---|
+| 1st | 11.35 t/s | 2.3 t/s | 0 |
+| 2nd | 32.90 t/s | 22.4 t/s | 17 |
+| 3rd | **35.25 t/s** | 27.3 t/s | 17 |
 
-That last row is the whole story: 10.90 GiB of CPU experts plus 1.45 GiB of dense weights does not fit
-alongside everything else, so part of the cyclic expert scan is being evicted and decode sits in the
-cliff regime rather than the compute-bound one. It is the same 10x effect measured in M3
-(10.25 GiB → 25.6-29.9 t/s, 11.54 GiB → 2.8-4.8 t/s), reached here by a different route: g=4 was
-chosen because VRAM at 200k context only affords it. `amp-plan` predicted 15.5 t/s and printed
-"0.6 t/s with the cache free right now" for the state that actually existed; the served number landed
-between the two, which is what the "tg now" column is for.
+Start-up warm: 10.90 GiB in 3.7 s (2.94 GiB/s).
+
+At 64k context (planner's choice: 7 expert layers on the GPU, 9.93 GiB CPU experts): 19.40 t/s on the
+first request, then **30.21 and 31.11 t/s**. So 200k costs about 10 % of decode, not the 5x the first
+request suggested.
+
+**Steady state is the number, and the first request is not.** An earlier revision of this file
+concluded from a single request that 200k decode was "6.89 t/s, cache-bound" and that the working set
+did not fit. That was wrong: it measured the first pass, where every expert layer is still being
+faulted in, and drew a conclusion about steady state from it. Three back-to-back requests differ by
+3x. Anything reported from here on has to be a warm request, and the honest way to say so is to show
+the sequence.
+
+Two other things worth knowing, both measured today:
+
+- `--gpu-layers 6` at 200k context does not work, and the failure is not graceful:
+  `llama_init_from_model` fails to allocate a 782 MB compute buffer, and the over-budget fallback then
+  serves requests with 178 MiB of VRAM free. The arithmetic says so beforehand — 200k of KV is
+  1.55 GiB, dense weights 1.45 GiB, 6 expert layers 1.93 GiB, which leaves under 0.9 GiB for compute.
+  g=4 is the most that fits, and that is what the planner now picks.
+- The first request is worth its own optimisation pass (it is 3x slower than steady state). The warm
+  helps but does not remove it, so the remaining cost is fault latency on the first pass over each
+  layer plus CUDA graph and sampler setup, not bandwidth.
+
+For reference, the llama-server baseline in the M3 head-to-head decoded at 4.76 t/s on the same
+prompt with the same cache state: **35.25 t/s is 7.4x that.**
 
 ### Planner corrections found by running the server at 200k
 
