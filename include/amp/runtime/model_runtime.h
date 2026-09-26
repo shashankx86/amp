@@ -19,6 +19,7 @@
 #include "amp/model/geometry.h"
 #include "amp/plan/memory_plan.h"
 #include "amp/status.h"
+#include "amp/runtime/buft_overrides.h"
 #include "ggml-backend.h"
 #include "llama.h"
 
@@ -152,11 +153,9 @@ private:
     mutable RuntimeConfig                cfg_;
     const ExecutionPlan *                plan_ = nullptr;
     const ModelGeometry *                geo_  = nullptr;
-    // per-layer buffer-type overrides so *expert* tensors can live on the GPU independently of
-    // the layer count, which is what -ncmoe does inside llama.cpp
-    std::vector<llama_model_tensor_buft_override> buft_overrides_;
-    std::vector<std::string>                     override_patterns_;   // owned: overrides hold char*
-    std::vector<ggml_backend_buffer_type_t>      override_bufts_;
+    // per-tensor buffer-type overrides, so expert tensors can live on the GPU independently of the
+    // layer count (the -ncmoe equivalent)
+    ExpertCpuOverrides overrides_;
     llama_model *                        model_ = nullptr;
     llama_context *                      ctx_   = nullptr;
     const llama_vocab *                  vocab_ = nullptr;

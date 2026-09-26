@@ -1,5 +1,7 @@
 #include "amp/runtime/model_runtime.h"
 
+#include "amp/runtime/buft_overrides.h"
+
 #include "amp/bytes.h"
 #include "amp/format.h"
 #include "amp/log.h"
@@ -169,25 +171,13 @@ Result<std::unique_ptr<ModelRuntime>> ModelRuntime::create(const RuntimeConfig &
     mparams.n_gpu_layers  = -1;   // everything that is not overridden goes to the GPU
     mparams.split_mode    = LLAMA_SPLIT_MODE_NONE;
 
-    // The plan decides how many *expert* layers live on the GPU. That is a per-tensor decision,
-    // which the public API now exposes directly (this is what -ncmoe/-ot use internally), so we
-    // express the plan as explicit buffer-type overrides instead of abusing n_gpu_layers.
-    const int64_t first_gpu_expert_layer = geo.n_layer() - plan.n_expert_layers_gpu;
-    for (int64_t il = 0; il < first_gpu_expert_layer; il++) {
-        for (const char * suffix : { "ffn_gate_exps.weight", "ffn_up_exps.weight",
-                                     "ffn_down_exps.weight" }) {
-            rt->override_patterns_.push_back(std::string("blk.") + std::to_string(il) + "." + suffix);
-            rt->override_bufts_.push_back(ggml_backend_cpu_buffer_type());
-            llama_model_tensor_buft_override ov{};
-            ov.pattern = rt->override_patterns_.back().c_str();
-            ov.buft    = rt->override_bufts_.back();
-            rt->buft_overrides_.push_back(ov);
-        }
-    }
-    if (!rt->buft_overrides_.empty()) {
-        mparams.tensor_buft_overrides = rt->buft_overrides_.data();
-        AMP_INFO("amp: pinning ", rt->buft_overrides_.size(),
-                 " expert tensors to the CPU (layers 0..", first_gpu_expert_layer - 1, ")");
+    // The plan decides how many expert layers live on the GPU; the shared helper builds the
+    // null-terminated override array (see buft_overrides.h for why the sentinel matters).
+    rt->overrides_.build(geo, plan.n_expert_layers_gpu);
+    if (!rt->overrides_.empty()) {
+        mparams.tensor_buft_overrides = rt->overrides_.data();
+        AMP_INFO("amp: pinning ", rt->overrides_.size(), " expert tensors to the CPU (layers 0..",
+                 geo.n_layer() - plan.n_expert_layers_gpu - 1, ")");
     }
 
     rt->model_ = llama_load_model_from_file(cfg.model_path.c_str(), mparams);

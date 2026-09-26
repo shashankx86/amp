@@ -106,6 +106,8 @@ target_compile_options(amp_plan PRIVATE -Wall -Wextra -Wno-unused-parameter)
 # runtime: the forward path, built on llama.cpp's own kernels so the arithmetic is identical
 add_library(amp_runtime STATIC
   src/runtime/model_runtime.cpp
+  src/runtime/prefix_cache.cpp
+  src/runtime/buft_overrides.cpp
 )
 target_include_directories(amp_runtime PUBLIC "${AMP_VENDOR_DIR}/include")
 target_link_libraries(amp_runtime PUBLIC amp_io amp_plan llama llama-common)
