@@ -534,3 +534,36 @@ test, after:
 
 Requests now take turns instead of interfering, which is what `--parallel 1` has always meant.
 `--parallel N` still works for anyone who wants the batching and accepts the memory cost.
+
+## 2026-09-27 — acceptance: the real OpenCode client, 3 tool-using prompts
+
+`scripts/harness/run.sh` drives the installed `opencode` CLI (`opencode run --auto --format json`)
+against the running server, in a pristine copy of a small fixture project, three times.
+
+| prompt | wall | exit | tool calls | result |
+|---|---|---|---|---|
+| `01-read-and-report` | 499.1 s | 0 | `read` | ok |
+| `02-fix-failing-test` | 163.4 s | 0 | `edit`, `glob`, `read`, `shell` | ok |
+| `03-add-feature-and-test` | 232.9 s | 0 | `edit`, `read`, `shell` | ok |
+
+`exit 0` only means the client process succeeded, so the transcripts were read to confirm the model
+actually did the work:
+
+- **02** ran the suite three times (before, after, verify) and made exactly one edit — removing the
+  `/ 100` from `total_value_cents` — then reported all four tests passing. That is the correct
+  diagnosis and the minimal fix; it did not change the test to make it pass, which the prompt
+  explicitly warned against.
+- **03** made three edits (the new function reusing the existing `low_stock` helper, its import,
+  and its test), ran the suite, and reported the real output.
+
+Two things worth recording from the timings:
+
+- **Prompt 2 ran 3x faster than prompt 1** (163 s vs 499 s). Prompt 1 pays the cold prompt: a
+  several-thousand-token prefill of OpenCode's system prompt plus every tool definition, at
+  12-15 t/s while the expert set is still settling. Once warm, the same model decodes at 22-24 t/s.
+- The same run against `llama-server`, before the `n_parallel = 1` fix, **stalled ~50 minutes on
+  prompt 1 alone**. That stall is what surfaced the four-slot thrash documented above. Reading the
+  server log is what turned "the harness is slow" into "the harness is 44x slower than it should be".
+
+This is the acceptance test the project's goals ask for: a real agentic client holding multi-turn
+conversations with tool calls, which is how the server is actually used.
