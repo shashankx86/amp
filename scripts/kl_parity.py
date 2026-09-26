@@ -560,9 +560,23 @@ def compare(args):
     print(f"  positions compared: {len(stats)}")
     print(f"  top-1 agreement:    {agree_count}/{len(stats)} ({100*agree_count/len(stats):.2f}%)")
     print()
-    print(f"  KL(A || B):  mean={mean_kl_ab:.6e}  max={worst_kl:.6e}  (inf at {n_inf_kl_ab} positions)")
-    print(f"  KL(B || A):  mean={mean_kl_ba:.6e}  max={max((s['kl_ba'] for s in stats), default=float('nan')):.6e}  (inf at {n_inf_kl_ba} positions)")
+    # The means are over FINITE positions only (kl_ab_vals excludes inf), so they must say so and
+    # be accompanied by the inf count as a first-class number. Reporting a small mean next to a
+    # large "inf at N positions" annotation invites the reader to quote the mean and miss it.
+    n_pos = len(stats)
+    worst_kl_ba = max((s["kl_ba"] for s in stats), default=float("nan"))
+    print(f"  KL(A || B):  mean(finite)={mean_kl_ab:.6e} over {len(kl_ab_vals)}/{n_pos}"
+          f"   max={worst_kl:.6e}   inf at {n_inf_kl_ab}/{n_pos} ({100.0*n_inf_kl_ab/n_pos:.1f}%)")
+    print(f"  KL(B || A):  mean(finite)={mean_kl_ba:.6e} over {len(kl_ba_vals)}/{n_pos}"
+          f"   max={worst_kl_ba:.6e}   inf at {n_inf_kl_ba}/{n_pos} ({100.0*n_inf_kl_ba/n_pos:.1f}%)")
     print(f"  JS(A, B):    mean={mean_js:.6e}  (bounded [0, {math.log(2):.6f}])")
+    if n_inf_kl_ab or n_inf_kl_ba:
+        print()
+        print("  NOTE: infinite KL means one side assigned non-zero probability to a token the other")
+        print("        side did not capture in its top-N. With matched settings we measure exactly 0,")
+        print("        so a non-zero inf count is a real difference, not truncation noise. Check that")
+        print("        both captures used the same n_probs and the same placement before concluding"
+              " anything else.")
     print()
     print(f"  captured mass A: mean={mean_mass_a:.6f} min={min_mass_a:.6f}")
     print(f"  captured mass B: mean={mean_mass_b:.6f} min={min_mass_b:.6f}")
@@ -577,6 +591,13 @@ def compare(args):
     # Gate check
     if args.max_kl is not None:
         threshold = args.max_kl
+        # A single infinite position must fail the gate. Gating on the mean of the finite values
+        # alone would let a comparison pass in which almost every position diverged to infinity,
+        # which is exactly the failure this gate exists to catch.
+        if n_inf_kl_ab or n_inf_kl_ba:
+            print(f"  FAIL: {n_inf_kl_ab} position(s) KL(A||B) and {n_inf_kl_ba} position(s) "
+                  f"KL(B||A) are infinite out of {len(stats)}")
+            return 1
         if mean_kl_ab > threshold:
             print(f"  FAIL: mean KL(A||B) {mean_kl_ab:.6e} exceeds threshold {threshold:.6e}")
             return 1
