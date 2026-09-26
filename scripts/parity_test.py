@@ -892,6 +892,605 @@ def s_not_testable(suite, sec):
     sec.skip("Multimodal input (image_url, input_audio, ...)", "no mmproj file; model is text-only (PARITY.md 7.2)")
 
 
+# ---- 17. Sampler fields ------------------------------------------------------
+
+
+@section("Sampler fields")
+def s_sampler_fields(suite, sec):
+    base = suite.base
+    # One request per field (grouped where fields are independent scalars), thinking
+    # off, max_tokens 1-16. A rejected field surfaces as a non-200 or an error body,
+    # which the status + key-set assertions catch.
+
+    def sampler_request(label, extra, max_tokens=4, temperature=0, prompt="Say OK"):
+        payload = {"messages": [{"role": "user", "content": prompt}],
+                   "max_tokens": max_tokens, "temperature": temperature,
+                   "chat_template_kwargs": {"enable_thinking": False}}
+        payload.update(extra)
+        status, _, body = http_request(base + "/v1/chat/completions", "POST", payload,
+                                       timeout=suite.timeout)
+        try:
+            j = json.loads(body)
+        except Exception:
+            j = {}
+        sec.check(status == 200, "%s -> 200" % label, "status=%s" % status, response=body)
+        ok = check_keys(sec, "%s: well-formed (PARITY.md 3.1)" % label, j, CHAT_KEYS,
+                        response=body)
+        if ok:
+            sec.check(j["choices"][0].get("finish_reason") in ("stop", "length", "tool_calls"),
+                      "%s: finish_reason valid" % label, str(j["choices"][0].get("finish_reason")))
+            content = (j["choices"][0].get("message") or {}).get("content")
+            sec.check(isinstance(content, str) and len(content) > 0,
+                      "%s: content non-empty" % label, repr(content)[:60])
+        return j
+
+    sampler_request("top_k=1, top_p=0.9, min_p=0.05 (PARITY.md 2.3)",
+                    {"top_k": 1, "top_p": 0.9, "min_p": 0.05})
+    sampler_request("typical_p, repeat_penalty, repeat_last_n, presence/frequency_penalty (PARITY.md 2.3)",
+                    {"typical_p": 0.9, "repeat_penalty": 1.1, "repeat_last_n": 32,
+                     "presence_penalty": 0.1, "frequency_penalty": 0.1})
+    sampler_request("mirostat=2 with mirostat_tau/mirostat_eta (PARITY.md 2.3)",
+                    {"mirostat": 2, "mirostat_tau": 5.0, "mirostat_eta": 0.1}, temperature=0.8)
+    sampler_request("dry_multiplier=0.8 (PARITY.md 2.3)", {"dry_multiplier": 0.8})
+    sampler_request("xtc_probability=0.1 (PARITY.md 2.3)", {"xtc_probability": 0.1})
+
+    # seed is the one field with a crisp deterministic assertion: same seed,
+    # temperature > 0 and a fixed budget must give identical text (PARITY.md 7.1).
+    j1 = sampler_request("seed=12345, temperature=0.8, n_predict=16 (call 1)",
+                         {"seed": 12345}, max_tokens=16, temperature=0.8,
+                         prompt="The capital of France is")
+    j2 = sampler_request("seed=12345, temperature=0.8, n_predict=16 (call 2)",
+                         {"seed": 12345}, max_tokens=16, temperature=0.8,
+                         prompt="The capital of France is")
+    c1 = (j1.get("choices", [{}])[0].get("message") or {}).get("content")
+    c2 = (j2.get("choices", [{}])[0].get("message") or {}).get("content")
+    sec.check(c1 is not None and c1 == c2,
+              "seed: identical seed + temperature > 0 gives identical text across two calls",
+              "call1=%r call2=%r" % (c1, c2))
+
+    # logit_bias: acceptance only. The effect depends on token ids we would have to
+    # discover first, so a behavioural assertion is not possible black-box
+    # (PARITY.md 2.3, server-schema.cpp:434-473).
+    sampler_request('logit_bias {"0": -100.0} (PARITY.md 2.3)', {"logit_bias": {"0": -100.0}})
+
+    # tfs_z and penalty_prompt do not exist in the vendored server-schema.cpp (grep over
+    # third_party/llama.cpp: no matches for either string) and are absent from PARITY.md
+    # 2.3. eval_llama_cmpl_schema evaluates the schema's registered fields, not the
+    # request keys (server-schema.cpp:549-551), so an unknown field is silently ignored:
+    # a request carrying it would return 200 while proving nothing. SKIP, not PASS.
+    sec.skip("tfs_z", "no such field in vendored server-schema.cpp or PARITY.md 2.3; "
+                      "unknown fields are ignored by eval_llama_cmpl_schema (server-schema.cpp:549-551)")
+    sec.skip("penalty_prompt", "no such field in vendored server-schema.cpp or PARITY.md 2.3; "
+                             "unknown fields are ignored by eval_llama_cmpl_schema (server-schema.cpp:549-551)")
+
+
+# ---- 18. Constrained generation ----------------------------------------------
+
+
+@section("Constrained generation")
+def s_constrained(suite, sec):
+    base = suite.base
+
+    # grammar: the only legal completion is the literal "yes"
+    status, _, body = http_request(base + "/v1/chat/completions", "POST",
+                                   {"messages": [{"role": "user", "content": "Say yes or no:"}],
+                                    "max_tokens": 4, "temperature": 0,
+                                    "grammar": "root ::= \"yes\"",
+                                    "chat_template_kwargs": {"enable_thinking": False}},
+                                   timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    content = (j.get("choices", [{}])[0].get("message") or {}).get("content")
+    sec.check(status == 200, "grammar request -> 200", "status=%s" % status, response=body)
+    sec.check(content is not None and content.strip() == "yes",
+              "grammar root ::= \"yes\": content satisfies the constraint", repr(content),
+              response=body)
+
+    # response_format json_schema: the schema requires a string field "city"
+    # (server-common.cpp:1193-1195). Verified by hand: the model answers {"city": "Paris"}.
+    status, _, body = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "user",
+                       "content": "Give me a JSON object with key city set to Paris."}],
+         "max_tokens": 16, "temperature": 0,
+         "response_format": {"type": "json_schema",
+                             "json_schema": {"name": "city", "strict": True,
+                                             "schema": {"type": "object",
+                                                        "properties": {"city": {"type": "string"}},
+                                                        "required": ["city"]}}},
+         "chat_template_kwargs": {"enable_thinking": False}},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    content = (j.get("choices", [{}])[0].get("message") or {}).get("content")
+    parsed = None
+    if content:
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            parsed = None
+    sec.check(status == 200, "response_format json_schema request -> 200", "status=%s" % status,
+              response=body)
+    sec.check(isinstance(parsed, dict) and "city" in parsed,
+              "response_format json_schema: content is a JSON object with the required \"city\" key",
+              repr(content)[:120], response=body)
+
+    # response_format json_object: any JSON object (server-common.cpp:1189-1192, 1202-1204)
+    status, _, body = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "user",
+                       "content": "Return a JSON object containing a friendly greeting."}],
+         # 32, not 8: constrained generation still has to *finish* the object. At 8 the
+         # model produced '{\n  "greeting": "' with finish_reason "length" - a truncated
+         # object, not a server bug. A short greeting fits well inside 32.
+         "max_tokens": 32, "temperature": 0,
+         "response_format": {"type": "json_object"},
+         "chat_template_kwargs": {"enable_thinking": False}},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    content = (j.get("choices", [{}])[0].get("message") or {}).get("content")
+    parsed = None
+    if content:
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            parsed = None
+    sec.check(status == 200, "response_format json_object request -> 200", "status=%s" % status,
+              response=body)
+    sec.check(isinstance(parsed, dict),
+              "response_format json_object: content parses as a JSON object",
+              repr(content)[:120], response=body)
+
+    # n_probs on /v1/completions: logprobs for the generated tokens. Sent WITHOUT
+    # top_k/top_p/min_p -- those interact with the n_probs code path, so the clean
+    # assertion is n_probs alone (PARITY.md 2.3, server-schema.cpp:179-181).
+    status, _, body = http_request(base + "/v1/completions", "POST",
+                                   {"prompt": "Q: What is 17*23? A:", "max_tokens": 4,
+                                    "temperature": 0, "n_probs": 5},
+                                   timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    ch = (j.get("choices") or [{}])[0] if isinstance(j, dict) else {}
+    lp = ch.get("logprobs")
+    sec.check(status == 200, "n_probs request -> 200", "status=%s" % status, response=body)
+    sec.check(isinstance(lp, dict),
+              "n_probs: choices[0].logprobs is an object (server-task.cpp:433-437)",
+              str(lp)[:120], response=body)
+    lpc = lp.get("content") if isinstance(lp, dict) else None
+    sec.check(isinstance(lpc, list) and len(lpc) > 0,
+              "n_probs: logprobs.content covers the generated tokens",
+              "n=%d" % (len(lpc) if isinstance(lpc, list) else -1))
+    tl = lpc[0].get("top_logprobs") if lpc else None
+    sec.check(isinstance(tl, list) and 1 <= len(tl) <= 5,
+              "n_probs=5: each generated token carries 1-5 top logprobs",
+              "n=%d" % (len(tl) if isinstance(tl, list) else -1))
+
+
+# ---- 19. n, stop, samplers, chat logprobs, cache_prompt, prefix completion -------
+
+
+@section("n, stop, samplers, chat logprobs, cache_prompt, prefix completion")
+def s_request_fields(suite, sec):
+    base = suite.base
+
+    # n > 1 needs more than one slot. Stock llama-server resolves n_parallel to 4
+    # (arg.cpp:1400 -> server.cpp:156-159) so n=2 works there. amp deliberately forces
+    # n_parallel = 1, because four concurrent slots thrash the shared ~10.9 GiB CPU expert
+    # set on this box and cost 44x on decode (docs/BENCH.md). The consequence is real and
+    # asserted here rather than hidden: n>1 is a typed 400, and --parallel N restores it.
+    # See RUNNING.md, "Concurrency".
+    status, _, body = http_request(base + "/v1/completions", "POST",
+                                   {"prompt": "Q: What is 17*23? A:", "max_tokens": 4,
+                                    "temperature": 0, "n": 2},
+                                   timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    choices = j.get("choices") if isinstance(j, dict) else None
+    err = j.get("error", {}) if isinstance(j, dict) else {}
+    n_parallel_1 = status == 400 and isinstance(err.get("type"), str)
+    sec.check(n_parallel_1 or (status == 200 and isinstance(choices, list) and len(choices) == 2),
+              "n=2 is served with >=2 slots, or is a typed 400 explaining the bound",
+              "status=%s type=%s" % (status, err.get("type")))
+    if isinstance(choices, list) and len(choices) == 2:
+        sec.check([c.get("index") for c in choices] == [0, 1],
+                  "n=2: choice indices are 0 and 1", str([c.get("index") for c in choices]))
+        sec.check(all(isinstance(c.get("text"), str) and c["text"] for c in choices),
+                  "n=2: both choices carry non-empty text",
+                  repr([c.get("text") for c in choices])[:100])
+
+    # stop: generation halts at the stop string, which is erased from the output
+    # (server-context.cpp:1854-1858).
+    status, _, body = http_request(
+        base + "/v1/completions", "POST",
+        # The stop string has to occur in the GENERATED text. An earlier version prompted
+        # "...one two three four..." and stopped on "three", which the model never generates
+        # because it is already in the prompt - so finish_reason came back "length" and the
+        # test was measuring the prompt, not the stop logic. Measured working: this prompt
+        # completes to " Tokyo", which is then erased, leaving finish_reason "stop".
+        {"prompt": "The capital city of Japan is called", "max_tokens": 12,
+         "temperature": 0, "stop": ["Tokyo"]},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    ch = (j.get("choices") or [{}])[0] if isinstance(j, dict) else {}
+    text = ch.get("text")
+    sec.check(status == 200, "stop request -> 200", "status=%s" % status, response=body)
+    sec.check(ch.get("finish_reason") == "stop",
+              "stop: finish_reason == stop", str(ch.get("finish_reason")))
+    sec.check(isinstance(text, str) and "Tokyo" not in text,
+              "stop: the stop string is erased from the output", repr(text)[:80])
+
+    # samplers: an explicit sampler sequence. Every name must be valid for this
+    # llama.cpp version: dry, top_k, top_p, top_n_sigma, typ_p, min_p, temperature, xtc,
+    # infill, penalties, adaptive_p (sampling.cpp:833-845). "dist" is NOT a valid name
+    # here (the alias is "temp"/"temperature"); unknown names are dropped with a
+    # warning (sampling.cpp:885), which would make the test pass without testing the
+    # field at all.
+    status, _, body = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "user", "content": "Say OK"}], "max_tokens": 4,
+         "temperature": 0,
+         "samplers": ["top_k", "typ_p", "top_p", "min_p", "temperature", "penalties"],
+         "chat_template_kwargs": {"enable_thinking": False}},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    ok = check_keys(sec, "samplers: accepted, well-formed (PARITY.md 2.3)", j, CHAT_KEYS,
+                    response=body)
+    if ok:
+        sec.check(j["choices"][0].get("finish_reason") in ("stop", "length", "tool_calls"),
+                  "samplers: finish_reason valid", str(j["choices"][0].get("finish_reason")))
+
+    # logprobs/top_logprobs on the chat path: logprobs:true sets n_probs=top_logprobs
+    # (PARITY.md 2.1, server-common.cpp:1407-1411); the response carries them per choice
+    # (server-task.cpp:433-437).
+    status, _, body = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "user", "content": "Say OK"}], "max_tokens": 4,
+         "temperature": 0, "logprobs": True, "top_logprobs": 5,
+         "chat_template_kwargs": {"enable_thinking": False}},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    ch = (j.get("choices") or [{}])[0] if isinstance(j, dict) else {}
+    ok = check_keys(sec, "chat logprobs: response key set", j, CHAT_KEYS, response=body)
+    if ok:
+        lp = ch.get("logprobs")
+        sec.check(isinstance(lp, dict),
+                  "chat logprobs: choices[0].logprobs is an object", str(lp)[:120])
+        lpc = lp.get("content") if isinstance(lp, dict) else None
+        sec.check(isinstance(lpc, list) and len(lpc) > 0,
+                  "chat logprobs: logprobs.content covers the generated tokens",
+                  "n=%d" % (len(lpc) if isinstance(lpc, list) else -1))
+        tl = lpc[0].get("top_logprobs") if lpc else None
+        sec.check(isinstance(tl, list) and 1 <= len(tl) <= 5,
+                  "chat logprobs: top_logprobs=5 -> 1-5 entries per token",
+                  "n=%d" % (len(tl) if isinstance(tl, list) else -1))
+
+    # cache_prompt:false: the prompt is neither read from nor written to the cache, so
+    # cached_tokens must be 0 even though earlier sections cached similar prompts.
+    # Unique prompt string: no earlier section can have populated the cache with it.
+    status, _, body = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "user", "content": "zebra cache probe 42"}],
+         "max_tokens": 4, "temperature": 0, "cache_prompt": False,
+         "chat_template_kwargs": {"enable_thinking": False}},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    cached = ((j.get("usage") or {}).get("prompt_tokens_details") or {}).get("cached_tokens")
+    sec.check(status == 200, "cache_prompt:false request -> 200", "status=%s" % status,
+              response=body)
+    sec.check(cached == 0,
+              "cache_prompt:false -> usage.prompt_tokens_details.cached_tokens == 0",
+              str(cached))
+
+    # continue_final_message + add_generation_prompt:false = assistant prefix completion.
+    #
+    # The message shape matters and is not obvious. With an ASSISTANT-ONLY message list this
+    # model's chat template throws ("No messages provided", jinja line 43) and llama.cpp's
+    # ex_wrapper turns that into a 500 - documented in PARITY.md 4.3 as the general
+    # exception-to-status rule. The realistic shape is a user turn followed by the assistant
+    # prefill, which is what prefix completion actually means in a conversation.
+    status, _, body = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "user", "content": "List three fruits."},
+                      {"role": "assistant", "content": "A list of fruits: 1. Apples 2. Bananas 3."}],
+         "continue_final_message": True, "add_generation_prompt": False,
+         "max_tokens": 16, "temperature": 0,
+         "chat_template_kwargs": {"enable_thinking": False}},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    content = (j.get("choices", [{}])[0].get("message") or {}).get("content")
+    sec.check(status == 200, "continue_final_message request -> 200", "status=%s" % status,
+              response=body)
+    # The prefix must be continued, not restarted: the model has to carry on from
+    # "... 2. Bananas 3." and the result still contains the prefix text.
+    sec.check(isinstance(content, str) and "Bananas" in content,
+              "continue_final_message: the assistant prefix was continued, not replaced",
+              repr(content)[:70])
+
+    # The assistant-only shape is a documented 500 from this template, not a silent success.
+    st_only, _, body_only = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "assistant", "content": "The capital of France is"}],
+         "continue_final_message": True, "add_generation_prompt": False,
+         "max_tokens": 4, "temperature": 0},
+        timeout=suite.timeout)
+    try:
+        jo = json.loads(body_only)
+    except Exception:
+        jo = {}
+    err_only = jo.get("error", {}) if isinstance(jo, dict) else {}
+    sec.check(st_only in (400, 500) and isinstance(err_only.get("type"), str),
+              "continue_final_message with an assistant-only list is a typed error, not a silent 200",
+              "status=%s type=%s" % (st_only, err_only.get("type")))
+
+    # add_generation_prompt:false on its own: accepted, generation still happens.
+    status, _, body = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "user", "content": "Say OK"}],
+         "add_generation_prompt": False, "max_tokens": 4, "temperature": 0,
+         "chat_template_kwargs": {"enable_thinking": False}},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    content = (j.get("choices", [{}])[0].get("message") or {}).get("content")
+    sec.check(status == 200, "add_generation_prompt:false request -> 200", "status=%s" % status,
+              response=body)
+    sec.check(isinstance(content, str) and len(content) > 0,
+              "add_generation_prompt:false: content is still produced", repr(content)[:60])
+
+    # parallel_tool_calls: accepted with tools supplied (PARITY.md 2.1). The model is
+    # not forced to call anything, so this stays a cheap shape check.
+    tools = [{"type": "function",
+              "function": {"name": "get_weather",
+                           "description": "Get the weather for a city",
+                           "parameters": {"type": "object",
+                                         "properties": {"location": {"type": "string"}},
+                                         "required": ["location"]}}}]
+    status, _, body = http_request(
+        base + "/v1/chat/completions", "POST",
+        {"messages": [{"role": "user", "content": "Say OK"}], "tools": tools,
+         "parallel_tool_calls": False, "max_tokens": 4, "temperature": 0,
+         "chat_template_kwargs": {"enable_thinking": False}},
+        timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    check_keys(sec, "parallel_tool_calls:false with tools: accepted, well-formed (PARITY.md 2.1)",
+               j, CHAT_KEYS, response=body)
+
+
+# ---- 20. Reasoning kwargs (accepted, ignored) --------------------------------
+
+
+@section("Reasoning kwargs (accepted, ignored)")
+def s_reasoning_kwargs(suite, sec):
+    base = suite.base
+    # PARITY.md 6.4/6.5 and 7.3: preserve_reasoning and reasoning_effort are accepted,
+    # but this template has no supports_preserve_reasoning / supports_reasoning_effort
+    # cap, so both kwargs are ignored. Assert acceptance + a well-formed response, and
+    # via /apply-template (free, no generation) that the rendered prompt is unchanged.
+
+    def chat(kwargs, label, extra=None):
+        payload = {"messages": [{"role": "user", "content": "Say OK"}],
+                   "max_tokens": 4, "temperature": 0,
+                   "chat_template_kwargs": kwargs}
+        if extra:
+            payload.update(extra)
+        status, _, body = http_request(base + "/v1/chat/completions", "POST", payload,
+                                       timeout=suite.timeout)
+        try:
+            j = json.loads(body)
+        except Exception:
+            j = {}
+        sec.check(status == 200, "%s -> 200" % label, "status=%s" % status, response=body)
+        ok = check_keys(sec, "%s: well-formed (PARITY.md 3.1)" % label, j, CHAT_KEYS,
+                        response=body)
+        if ok:
+            sec.check(j["choices"][0].get("finish_reason") in ("stop", "length", "tool_calls"),
+                      "%s: finish_reason valid" % label,
+                      str(j["choices"][0].get("finish_reason")))
+        return j
+
+    chat({"enable_thinking": False, "preserve_reasoning": False},
+         "preserve_reasoning=false in chat_template_kwargs (PARITY.md 6.4)")
+    chat({"enable_thinking": False}, "reasoning_effort=high (PARITY.md 6.5)",
+         extra={"reasoning_effort": "high"})
+
+    def render(kwargs):
+        body = {"messages": [{"role": "user", "content": "What is 2+2?"}],
+                 "chat_template_kwargs": kwargs}
+        status, _, resp = http_request(base + "/apply-template", "POST", body,
+                                       timeout=suite.timeout)
+        try:
+            return json.loads(resp).get("prompt", "")
+        except Exception:
+            return ""
+
+    p_base = render({"enable_thinking": False})
+    p_preserve = render({"enable_thinking": False, "preserve_reasoning": False})
+    p_effort = render({"enable_thinking": False, "reasoning_effort": "high"})
+    sec.check(bool(p_base) and p_preserve == p_base,
+              "preserve_reasoning: rendered prompt unchanged (kwarg ignored, PARITY.md 6.4/7.3)",
+              "base=%d chars, with-kwarg=%d chars" % (len(p_base), len(p_preserve)))
+    sec.check(bool(p_base) and p_effort == p_base,
+              "reasoning_effort: rendered prompt unchanged (kwarg ignored, PARITY.md 6.5/7.3)",
+              "base=%d chars, with-kwarg=%d chars" % (len(p_base), len(p_effort)))
+
+
+# ---- 21. Control and stream lookup routes ------------------------------------
+
+
+@section("Control and stream lookup routes")
+def s_control_lookup(suite, sec):
+    base = suite.base
+
+    # PARITY.md 1 + server-context.cpp:4950-4985: the body is {"id": "<cmpl_id>",
+    # "action": "reasoning_end"}. Note the completion id field is "id" -- the
+    # "reasoning_control":true field belongs to the ORIGINAL generation request and
+    # arms the budget sampler; it is not part of the control body.
+    status, _, body = http_request(base + "/v1/chat/completions/control", "POST",
+                                   {"id": "cmpl-nonexistent", "action": "reasoning_end"},
+                                   timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = {}
+    sec.check(status == 200, "control: unknown completion id -> 200", "status=%s" % status,
+              response=body)
+    sec.check(isinstance(j, dict) and j.get("success") is False,
+              "control: unknown id -> {\"success\":false} (server-context.cpp:2469-2476)",
+              str(j)[:120], response=body)
+    sec.check(isinstance(j.get("message"), str) and j.get("message"),
+              "control: failure carries a non-empty message", str(j.get("message"))[:80])
+
+    # missing id -> 400 (server-context.cpp:4956-4958)
+    status, _, body = http_request(base + "/v1/chat/completions/control", "POST",
+                                   {"action": "reasoning_end"}, timeout=suite.timeout)
+    err = parse_error(body)
+    sec.check(status == 400 and err.get("type") == "invalid_request_error",
+              "control: missing id -> 400 invalid_request_error",
+              "status=%s" % status, response=body)
+
+    # unknown action -> 400 (server-context.cpp:4960-4962)
+    status, _, body = http_request(base + "/v1/chat/completions/control", "POST",
+                                   {"id": "cmpl-nonexistent", "action": "bogus"},
+                                   timeout=suite.timeout)
+    err = parse_error(body)
+    sec.check(status == 400 and err.get("type") == "invalid_request_error",
+              "control: unknown action -> 400 invalid_request_error",
+              "status=%s" % status, response=body)
+
+    # PARITY.md 1 + server-stream.cpp:503-558: POST {"conversation_ids":[...]} -> 200
+    # with a JSON array (empty when no session matches). Lookup only reports sessions
+    # the server already knows; it never creates one.
+    status, _, body = http_request(base + "/v1/streams/lookup", "POST",
+                                   {"conversation_ids": ["cmpl-nonexistent",
+                                                          "cmpl-also-nonexistent"]},
+                                   timeout=suite.timeout)
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = None
+    sec.check(status == 200, "POST /v1/streams/lookup -> 200 for unknown ids",
+              "status=%s" % status, response=body)
+    sec.check(isinstance(j, list),
+              "POST /v1/streams/lookup -> JSON array (empty: no such stream sessions)",
+              repr(body)[:120], response=body)
+
+    # Live positive path: a streaming request with reasoning_control armed (the budget
+    # sampler also needs non-empty start/end tags, sampling.cpp:311) is force-ended
+    # mid-flight via the control route. Thinking must stay ON -- the budget machinery
+    # exists to cut reasoning short. Worst case ~128 generated tokens.
+    def open_stream_first(url, payload, timeout):
+        """Streaming POST; read only the first SSE data line so the completion id can
+        be used mid-generation. Returns (status, response_or_None, first_data_or_None)."""
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "text/event-stream")
+        try:
+            r = urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            return e.code, None, None
+        except Exception:
+            return -1, None, None
+        first = None
+        try:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if line.startswith("data: "):
+                    first = line[6:]
+                    break
+        except Exception:
+            pass
+        return 200, r, first
+
+    # "stream": True is load-bearing and was missing: without it the server returns one
+    # non-streaming JSON object, there are no "data: " lines to read, and the completion id
+    # can never be harvested mid-generation - which is the whole point of the control test.
+    payload = {"messages": [{"role": "user",
+                             "content": "Count from 1 to 1000, one number per line."}],
+               "max_tokens": 128, "stream": True, "reasoning_control": True,
+               "reasoning_budget_start_tag": "<think>", "reasoning_budget_end_tag": "</think>"}
+    status, r, first = open_stream_first(base + "/v1/chat/completions", payload,
+                                         suite.timeout)
+    sec.check(status == 200, "control: live reasoning_control stream -> 200",
+              "status=%s" % status)
+    if status != 200 or r is None:
+        return
+    cmpl_id = None
+    try:
+        cmpl_id = json.loads(first).get("id")
+    except Exception:
+        cmpl_id = None
+    if not cmpl_id:
+        sec.check(False, "control: stream chunk carries the completion id",
+                  repr(first)[:160])
+        r.close()
+        return
+    status_c, _, body_c = http_request(base + "/v1/chat/completions/control", "POST",
+                                       {"id": cmpl_id, "action": "reasoning_end"},
+                                       timeout=suite.timeout)
+    try:
+        jc = json.loads(body_c)
+    except Exception:
+        jc = {}
+    sec.check(status_c == 200, "control: reasoning_end on the live id -> 200",
+              "status=%s" % status_c, response=body_c)
+    sec.check(jc.get("success") is True,
+              "control: reasoning_end on a live reasoning_control completion -> success true",
+              str(jc)[:160], response=body_c)
+
+    # drain the stream: after the forced end tag the model finishes its answer
+    chunks = []
+    if first:
+        chunks.append(first)
+    try:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("data: "):
+                chunks.append(line[6:])
+    except Exception:
+        pass
+    finally:
+        r.close()
+    objs, done = parse_chunks(chunks)
+    sec.check(done, "control: stream still ends with [DONE] after the forced end")
+    finish = [o for o in objs if isinstance(o, dict) and o.get("choices") and
+              o["choices"][0].get("finish_reason")]
+    sec.check(bool(finish),
+              "control: stream still emits a finish_reason after the forced end",
+              str(finish[0]["choices"][0]["finish_reason"]) if finish else "none")
+
+
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
