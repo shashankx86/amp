@@ -5,6 +5,7 @@
 #include "amp/log.h"
 #include "amp/timing.h"
 #include "amp/util/json.h"
+#include "amp/util/text.h"
 
 #include <atomic>
 #include <chrono>
@@ -154,8 +155,11 @@ ChatMessage parse_message(const Value & m) {
     // re-evaluate the whole tail of the conversation every turn (see ../NOTES.md 7.2).
     for (const char * key : { "reasoning_content", "reasoning_text", "reasoning" }) {
         if (const Value * r = m.get(key); r && r->is_string() && !r->as_string().empty()) {
-            out.reasoning_content = r->as_string();
-            out.has_reasoning     = true;
+            // The template owns the thinking tags, so the stored value is the inner text. Accepting
+            // the tagged form as well is what keeps a client's echo from diverging the prompt on
+            // every turn - see util/text.h.
+            out.reasoning_content = normalize_reasoning(r->as_string());
+            out.has_reasoning     = !out.reasoning_content.empty();
             break;
         }
     }
@@ -195,6 +199,9 @@ void OpenAIApi::register_routes(http::Server & srv, InferenceService & svc, cons
     });
     srv.route("POST", "/tokenize", [&](const http::Request & r, http::ResponseWriter & w) {
         return tokenize(r, w, svc);
+    });
+    srv.route("POST", "/apply-template", [&](const http::Request & r, http::ResponseWriter & w) {
+        return apply_template(r, w, svc);
     });
 
     auto comp = [&](const http::Request & r, http::ResponseWriter & w) {
@@ -306,6 +313,51 @@ Status OpenAIApi::tokenize(const http::Request & req, http::ResponseWriter & w,
     }
     Value root = Value::object();
     root.set("tokens", std::move(arr));
+    (void) w.send_headers(200, "application/json", false);
+    return w.write(root.dump());
+}
+
+// The rendered prompt, as text and as token count. This is the endpoint to reach for when a turn
+// does not hit the prefix cache: it shows exactly what the server will evaluate, so a divergence in
+// the client's history is visible instead of inferred from a slow response.
+Status OpenAIApi::apply_template(const http::Request & req, http::ResponseWriter & w,
+                                 InferenceService & svc) {
+    auto body = Value::parse(req.body);
+    if (!body.ok()) {
+        return json_error(w, 400, body.message());
+    }
+    const Value *msgs = body->get("messages");
+    if (!msgs || !msgs->is_array() || msgs->as_array().empty()) {
+        return json_error(w, 400, "missing or empty 'messages'");
+    }
+    std::vector<ChatMessage> messages;
+    for (const auto & m : msgs->as_array()) {
+        messages.push_back(parse_message(m));
+    }
+    std::string tools_json;
+    if (const Value * t = body->get("tools"); t && t->is_array() && t->size() > 0) {
+        tools_json = t->dump();
+    }
+    auto rendered = svc.render_chat(messages, tools_json);
+    if (!rendered.ok()) {
+        return json_error(w, 500, rendered.message());
+    }
+    auto toks = svc.tokenize(rendered->prompt, /*add_special=*/ true);
+    const int64_t n_tokens = toks.ok() ? (int64_t) toks->size() : -1;
+    if (toks.ok()) {
+        // Round-tripping the rendered text back through the tokenizer is the whole point: the cache
+        // compares token ids, so this is what has to be stable for a turn to be reused.
+        auto again = svc.tokenize(rendered->prompt, /*add_special=*/ true);
+        if (!again.ok() || *again != *toks) {
+            return json_error(w, 500, "tokenizer is not deterministic for this prompt");
+        }
+    }
+    Value root = Value::object();
+    root.set("prompt", rendered->prompt);
+    root.set("n_tokens", n_tokens);
+    root.set("supports_thinking", rendered->supported_thinking);
+    root.set("thinking_start", rendered->thinking_start);
+    root.set("thinking_end", rendered->thinking_end);
     (void) w.send_headers(200, "application/json", false);
     return w.write(root.dump());
 }

@@ -73,7 +73,7 @@ target_include_directories(amp_util PUBLIC include)
 target_compile_options(amp_util PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 # util also owns the JSON layer used by the API
-target_sources(amp_util PRIVATE src/util/json.cpp)
+target_sources(amp_util PRIVATE src/util/json.cpp src/util/text.cpp)
 
 # io: mmap + page-cache warming + streaming reads
 add_library(amp_io STATIC
@@ -145,6 +145,7 @@ if(AMP_BUILD_TESTS)
     tests/test_gguf.cpp
     tests/test_plan.cpp
     tests/test_json.cpp
+    tests/test_text.cpp
   )
   target_link_libraries(amp_tests PRIVATE amp_plan)
   target_include_directories(amp_tests PRIVATE tests)
