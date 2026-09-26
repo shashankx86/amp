@@ -36,9 +36,17 @@ set(BUILD_SHARED_LIBS        OFF CACHE BOOL "" FORCE)
 set(LLAMA_STANDALONE         OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_COMMON       ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TESTS        OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_TOOLS        OFF CACHE BOOL "" FORCE)
+# ON only to get tools/{ui,server,mtmd} defined: llama.cpp's root CMakeLists gates the whole tools/
+# tree on LLAMA_BUILD_TOOLS, not on LLAMA_BUILD_SERVER. We build named targets only, so the other
+# tool targets (llama-bench, perplexity, ...) are defined but never compiled.
+set(LLAMA_BUILD_TOOLS        ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES     OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_SERVER       OFF CACHE BOOL "" FORCE)
+# ON so llama.cpp's own tools/CMakeLists.txt adds tools/{ui,cli,server,mtmd}. We do not build the
+# other tool targets (build.sh names our targets explicitly); we only want the `llama-server-impl`
+# and `server-context` libraries, which tools/server/CMakeLists.txt documents as "reusable by app".
+# Going through llama.cpp's own tools/CMakeLists.txt matters: those files use ${PROJECT_SOURCE_DIR},
+# which is only correct if llama.cpp's root CMakeLists is the one doing the add_subdirectory.
+set(LLAMA_BUILD_SERVER       ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_APP          OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_UI           OFF CACHE BOOL "" FORCE)
 set(LLAMA_USE_PREBUILT_UI    OFF CACHE BOOL "" FORCE)
@@ -125,18 +133,21 @@ target_link_libraries(amp_server PUBLIC amp_runtime llama-common)
 target_compile_options(amp_server PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 if(AMP_BUILD_TOOLS)
-  foreach(tool amp-plan amp-warm amp-infer amp-server)
+  foreach(tool amp-plan amp-warm amp-infer)
     string(REPLACE "-" "_" tool_src ${tool})
     add_executable(${tool} tools/${tool_src}.cpp)
     if(${tool} STREQUAL "amp-infer")
       target_link_libraries(${tool} PRIVATE amp_runtime)
-    elseif(${tool} STREQUAL "amp-server")
-      target_link_libraries(${tool} PRIVATE amp_server)
     else()
       target_link_libraries(${tool} PRIVATE amp_plan)
     endif()
     target_compile_options(${tool} PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endforeach()
+
+  # Build spike: prove llama.cpp's server links into an amp binary. Removed by the next commit.
+  add_executable(amp-server-spike EXCLUDE_FROM_ALL tools/amp_server_spike.cpp)
+  target_link_libraries(amp-server-spike PRIVATE llama-server-impl)
+  target_compile_options(amp-server-spike PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(AMP_BUILD_TESTS)
