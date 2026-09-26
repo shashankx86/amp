@@ -25,11 +25,18 @@ struct CostModelConstants {
     // Ubatch at which GEMM efficiency saturates (measured sweet spot).
     int64_t ubatch_saturation      = 1024;
     double ubatch_efficiency_floor = 0.35;
-    // NVMe, mmap random 4 KiB faults (fio, O_DIRECT, sustained).
-    double bandwidth_random_bps    = 555e6;
-    // NVMe, sequential / large-chunk reads (fio 128 KiB-1 MiB QD16-32).
-    double bandwidth_seq_bps       = 2000e6;
-    // Fraction of I/O time that hides behind compute when prefetching well.
+    // NVMe under *demand paging with readahead* (measured with mincore, this is the path amp
+    // and llama.cpp both use): 1737-1804 MiB/s cold, 100% of pages stay resident afterwards.
+    // Do NOT use the 555 MB/s O_DIRECT 4K-QD32 fio number here: that is random access with no
+    // readahead, which is not what expert streaming looks like.
+    double bandwidth_fault_bps     = 1.85e9;
+    // Fully resident: pure RAM copy speed of the same range (measured 3516-3620 MiB/s).
+    double bandwidth_resident_bps  = 3.5e9;
+    // Explicit 440 KiB async reads issued ahead of use (amp's IReadScheduler): same bytes as
+    // the fault path but decoupled from the compute thread, so this is a ceiling, not a rate.
+    double bandwidth_seq_bps       = 2.0e9;
+    // Fraction of I/O time that hides behind compute. Demand faults are synchronous (0);
+    // explicit prefetch overlaps (measured-shape estimate, calibrate in M5).
     double io_overlap              = 0.75;
     // Decode: measured 11-14 t/s with 38 of 40 layers' experts on the CPU.
     double decode_ms_per_cpu_layer = 1.79;

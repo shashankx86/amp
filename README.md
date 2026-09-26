@@ -20,14 +20,29 @@ changing the numbers.
 
 | Milestone | State |
 |---|---|
-| M0 scaffold | done |
-| M1 GGUF reader + memory planner | in progress |
-| M2 page-cache warmer | planned |
-| M3 forward path (CPU) | planned |
+| M0 scaffold (modules, build, tests) | done |
+| M1 GGUF reader + geometry | done |
+| M2 page-cache warmer | done — measured 1.92 GiB/s cold, whole 12.19 GiB set in 6.3 s |
+| M2b memory planner + cost model | done — predicts 225 t/s prefill / 12.4 t/s decode at 200k |
+| M3 forward path (CPU) | next |
 | M4 GPU offload | planned |
 | M5 async expert prefetch | planned |
 | M6 server | planned |
 | M7 decode optimization | planned |
+
+## Tools
+
+```bash
+# what the model is, what the box can do, and which configuration is predicted fastest
+./build/amp-plan --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
+
+# make the hot bytes actually resident, and measure whether it worked
+./build/amp-warm --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf \
+                 --what experts --drop-cache --verify
+```
+
+Measurements and open questions: `docs/BENCH.md`. Design: `docs/ARCHITECTURE.md`.
+Working rules and hard constraints: `AGENT.md`.
 
 ## Build
 

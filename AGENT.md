@@ -25,6 +25,21 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - Per-layer MoE expert bytes: 330.0 MiB (Q3_K, layers 0-9 and 30-39) / 294.0 MiB (IQ3_XXS, layers 10-29).
 - Per expert per layer: 3 tensors x ~440 KiB (gate/up `[2048,512]`, down `[512,2048]`), ~1.29 MiB total.
 
+## Established by measurement (see docs/BENCH.md — do not re-derive)
+
+- Demand paging **with readahead** runs at **1.8 GiB/s** and leaves **100 % of pages resident**
+  (mincore-verified). Fully resident reads run at **3.5 GiB/s**. The 555 MB/s O_DIRECT fio number is
+  random access without readahead and is NOT the right constant — the cost model was wrong until
+  this was measured.
+- `amp-warm` pulls the entire 12.19 GiB expert set in at **1.92 GiB/s (6.3 s)**.
+- The practical page-cache ceiling on this box is **~9.6 GiB** while other processes hold ~5 GiB, so
+  the 12.19 GiB working set does **not** fit. Plan for a resident hot set plus a streamed tail.
+- llama.cpp's 12 t/s collapse was a *latency* problem (synchronous faults, LRU thrash), not a
+  bandwidth problem.
+- KV cache is **8320 B/token** at k=q8_0/v=q4_0 → 1.55 GiB at 200k, 0.51 GiB at 65k.
+- The planner independently reproduces the measured llama.cpp optimum (large ubatch beats GPU
+  expert residency) and predicts **225 t/s prefill / 12.4 t/s decode** at 200k with prefetching.
+
 ## Architecture decisions already made
 
 1. **Reuse ggml kernels from the local llama.cpp build** (`../llama.cpp/build/bin/libggml*.so`). This makes
@@ -63,8 +78,9 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 ## Milestones
 
 - [x] M0 scaffold + this file
-- [ ] M1 GGUF header reader + memory planner (layer/expert byte ranges, GPU/CPU split, hot-set selection)
-- [ ] M2 page-cache warmer (sequential pre-fault + optional io_uring deep-queue prefetch) — measure it
+- [x] M1 GGUF header reader + geometry (validated against measured byte counts)
+- [x] M2 page-cache warmer (measured: 1.92 GiB/s, 12.19 GiB in 6.3 s)
+- [x] M2b cost model + memory planner (predicts 225 t/s / 12.4 t/s at 200k)
 - [ ] M3 forward path: tokenize -> embed -> 40 blocks -> output, CPU-only, bit-comparable to llama.cpp
 - [ ] M4 GPU offload of attention/SSM + N expert layers, with the VRAM planner
 - [ ] M5 expert-major async prefetch overlapping I/O with compute

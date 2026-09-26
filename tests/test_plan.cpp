@@ -48,10 +48,13 @@ AMP_TEST(cost_model_io_bounds_prefill) {
     const double tps_fault = c.prefill_tps(2048, 2048, 10ull * kGiB, IoMode::kPageFault);
     const double tps_pre   = c.prefill_tps(2048, 2048, 10ull * kGiB, IoMode::kPrefetch);
     AMP_CHECK_MSG(tps_fault < tps_clean, format("page faults %.0f vs clean %.0f", tps_fault, tps_clean));
-    // the same bytes via 440 KiB prefetches at 2 GB/s, overlapped with compute, are much cheaper
-    AMP_CHECK_MSG(tps_pre > tps_fault * 1.15,
+    // the same bytes via async 440 KiB prefetches, overlapped with compute, are cheaper still
+    AMP_CHECK_MSG(tps_pre > tps_fault,
                   format("prefetch %.0f should beat page faults %.0f", tps_pre, tps_fault));
     AMP_CHECK_MSG(tps_pre < tps_clean, "prefetching cannot exceed the compute ceiling");
+    // a *small* miss volume must be nearly free: that is the regime amp targets by warming
+    AMP_CHECK_MSG(c.prefill_tps(2048, 2048, 256ull * kMiB, IoMode::kPageFault) > tps_clean * 0.9,
+                  "a 256 MiB miss volume should barely register");
 
     // ...and a bigger ubatch must recover more (this is the whole -ub 512 -> 2048 story)
     const double tps_512 = c.prefill_tps(2048, 512, 10ull * kGiB, IoMode::kPageFault);
