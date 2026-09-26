@@ -633,3 +633,38 @@ It also fixes the VRAM ceiling with a measurement rather than an estimate: **g=4
 against a 12.19 GiB CPU expert working set. **Roughly 4 GiB of it always streams from NVMe** on this
 box. That is the structural reason decode sits at ~31 t/s rather than higher, and it is not
 fixable by scheduling: it is 14 GiB of RAM against a 12.19 GiB cyclically-scanned working set.
+
+### Decode across context lengths: 200k costs 2.6 %, and two measurements agree
+
+The goal asked for decode at multiple context lengths, not just 200k. This matters here because
+context size changes the *plan*: the KV cache grows into the same 6 GB of VRAM the expert layers
+want, so the planner gives layers away as context grows. 4 requests each, steady state = median of
+requests 2-4, same machine, same session:
+
+| context | GPU expert layers | KV | steady decode |
+|---|---|---|---|
+| 8,192 | 8 | 65 MiB | **35.61 t/s** |
+| 65,536 | 7 | 520 MiB | **35.27 t/s** |
+| 200,000 | 4 | 1.55 GiB | **34.68 t/s** |
+
+**Going from 8k to the full 200k target costs 2.6 %.** The plan really does give up expert layers
+(8 -> 4) as the KV grows, and it barely matters.
+
+That is the same answer as the `-ncmoe` sweep above, arrived at independently: there, moving expert
+layers CPU->GPU was worth 3.4 %; here, the planner *chose* 4 layers instead of 8 and lost 2.6 %. Two
+different experiments, same magnitude. That is the strongest evidence in this file that decode on
+this box is not bound by where the expert weights live - and it is the measurement that most
+undercuts M3c, whose entire premise is that the CPU expert path is the bottleneck.
+
+### Decode on this box varies ~20 % between sessions
+
+Steady-state decode at 200k, measured five times across this session:
+
+    28.39   30.39   31.44   33.94   34.68   t/s          spread 22 %
+
+The page cache is warmer later in a session, and other processes take RAM from it. This is the
+methodological point the whole file keeps circling: **a single-session A/B is only trustworthy if
+both engines are measured in that same session**, which is why the 28.39-vs-30.05 comparison was run
+alternating on one machine rather than quoted from two different days. It also explains how the
+project came to believe both "35.25 t/s" and "28.39 t/s" at different times without either being a
+lie: they are different cache states. Neither is a speedup over llama-server.
