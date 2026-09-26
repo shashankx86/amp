@@ -5,16 +5,30 @@ A purpose-built inference engine for one model: **Occamy-1.0 APEX-I-MiniPlus-V2.
 
 Target machine: RTX 4050 Laptop 6 GB + Ryzen 7 7735HS (8C/16T, AVX2) + 14 GiB RAM + NVMe.
 
-**Design goal: beat llama.cpp here with zero quality loss.** See `AGENT.md` for the rules and
-`../NOTES.md` for the measurements that motivate every decision.
+**`amp-server` is llama.cpp's server, with amp's memory plan in front of it.** The 40+ routes, the
+sampler, the chat templates, tool calls, reasoning formats, slot management and every CLI flag are
+upstream's, vendored at a pinned commit and linked statically. amp's own contribution is a ~90-line
+preflight that turns a measured memory plan into `common_params` before the model loads.
 
-## Why this model needs its own engine
+```
+argv ──► common_params_parse ──► apply_preflight ──► llama_server(...)
+         (every llama.cpp flag)   (amp's plan)        (llama.cpp's server)
+```
 
-It is a 12.19 GiB MoE expert working set (256 experts/layer, 8 active) that has to be cyclically
-re-read for every ubatch, competing against a ~11.5 GiB page cache on a 6 GB GPU. The arithmetic is
-cheap (the model runs at ~240 t/s prefill when the weights are resident); the *memory system* is the
-product. Everything amp does is about residency, I/O-compute overlap, and scheduling — never about
-changing the numbers.
+## Why this model needs a plan
+
+The expert working set is 12.19 GiB (256 experts/layer, 8 active) and has to be cyclically re-read
+for every ubatch, competing against a ~10.9 GiB page cache on a 6 GB card. The arithmetic is cheap —
+~240 t/s prefill when the weights are resident — so the *memory system* is the product. Where the
+experts live is worth 44x on decode under concurrency and 15x on a cold cache, and that is
+expressible through public API (`tensor_buft_overrides`, the same mechanism as `-ncmoe`), so it
+belongs in a preflight rather than a hand-written inference loop.
+
+**Zero quality loss is a hard constraint**, and it is structural rather than aspirational: same
+ggml kernels, same weights, same KV dtypes, same sampler, statically linked from the same commit.
+Measured, not asserted — with placement held fixed, llama.cpp's server and amp's produce
+**bit-identical** output distributions (KL = 0.000000e+00 both directions, JS = 0, max
+|Δ logprob| = 0 over 512 greedy tokens).
 
 ## Status
 
@@ -22,66 +36,72 @@ changing the numbers.
 |---|---|
 | M0 scaffold (modules, build, tests) | done |
 | M1 GGUF reader + geometry | done |
-| M2 page-cache warmer | done — measured 1.92 GiB/s cold, whole 12.19 GiB set in 6.3 s |
-| M2b memory planner + cost model | done — predicts 225 t/s prefill / 12.4 t/s decode at 200k |
-| M3 forward path + prefetcher | done — parity harness; see BENCH.md for measured rates |
-| M3b quality parity | done — bit-deterministic, no algorithmic difference |
-| M4 GPU offload of dense + N expert layers | done — expressed through `tensor_buft_overrides` |
-| M5 page-cache warm at start-up | done — 9.6 GiB in ~4 s, 2-3 GiB/s |
-| M6 server (OpenAI API, prefix cache, checkpoints) | done — `amp-server`, 35 t/s decode at 200k |
-| M6b concurrency + streaming correctness | done — one-worker task queue, always-finished streams |
-| M3c own graph (observable router) | next — needed to prefetch the 8 active experts per layer |
-| M7 decode optimization | planned |
+| M2 page-cache warmer | done — 1.92 GiB/s cold, 12.19 GiB in 6.3 s |
+| M2b memory planner + cost model | done |
+| M3 forward path + prefetcher (`amp-infer`) | done — the measurement harness |
+| M3b quality parity | done — bit-deterministic; KL = 0 vs upstream at matched placement |
+| M4 GPU offload via `tensor_buft_overrides` | done — the public equivalent of `-ncmoe` |
+| M5 page-cache warm at start-up | done — opt-in via `AMP_WARM=1` |
+| **M6 server: llama.cpp's, with amp's plan** | **done** — 40+ routes, tool calls, reasoning formats |
+| M6b preflight correctness | done — 7 tests assert it never overrides an explicit flag |
+| M6c parity test suite | done — 15 sections pass, 8 features honestly skipped |
+| M3c own graph (observable router) | next — to prefetch the 8 active experts per layer at decode |
+| M7 decode headroom | open — measured headroom is in `docs/BENCH.md`, not a claim |
+
+## On speed, honestly
+
+At steady state amp is **not** faster than a correctly configured `llama-server`: measured over 5
+identical requests each, amp sustains 28.39 t/s decode and llama-server 30.05 t/s. An earlier
+version of this file claimed 7.4x; that was amp's warm state measured against llama-server's cold
+one, and it did not reproduce.
+
+What the plan does buy is that it does not collapse. `llama-server`'s documented config needs
+~11.5 GiB of CPU experts — more than this box keeps resident — so its first request runs at
+**1.96 t/s** before recovering. amp keeps the CPU set at 10.90 GiB, inside the budget, and its first
+request runs at 26 t/s. It also forces a single slot by default, because `llama-server`'s four
+concurrent slots thrash the same shared working set (0.64 t/s measured). Full numbers, including
+the mistakes, in `docs/BENCH.md`.
 
 ## Thinking models
 
-This is a reasoning model: the chat template's generation prompt ends *inside* a `<think>` block, so
-the model reasons before answering and never emits the opening tag. amp therefore
+This is a reasoning model whose chat template renders the generation prompt already *inside* a
+`<think>` block, so it reasons before answering and never emits the opening tag.
 
-- reads the client's reasoning from `reasoning_content`, `reasoning_text` **and** `reasoning` — the
-  alias llama.cpp ignores, which makes OpenCode re-evaluate whole tool-call turns;
-- separates reasoning from content with tags matched whitespace-tolerantly, in responses and streams;
-- offers llama.cpp's reasoning budget (`--reasoning-budget`, `reasoning_budget_tokens`), off by
-  default because this quant tends to loop after a forced close.
-
-What the model's template supports, and what amp does not implement yet, is listed in `RUNNING.md`.
-
-## Tools
-
-```bash
-# what the model is, what the box can do, and which configuration is predicted fastest
-./build/bin/amp-plan --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-
-# head-to-head against llama-server on the same prompt, plus a logit-level quality diff
-./scripts/head2head.sh /tmp/opencode/amp_bench_prompt.txt 128
-./scripts/parity.py
-
-# make the hot bytes actually resident, and measure whether it worked
-./build/bin/amp-warm --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf \
-                 --what experts --drop-cache --verify
-```
-
-Measurements and open questions: `docs/BENCH.md`. Design: `docs/ARCHITECTURE.md`.
-Working rules and hard constraints: `AGENT.md`.
+- `chat_template_kwargs: {"enable_thinking": false}` **works** and is the supported way to get a
+  direct answer: the same question costs 104 completion tokens thinking and 2 not thinking.
+- `reasoning_content` is split out of `content` automatically, in responses and streams.
+- Structured `tool_calls` are emitted with a real id and parsed `arguments`. A thinking model needs
+  ~66 tokens to reach a tool call; with thinking disabled, 27.
+- `reasoning_format` (`none`/`auto`/`deepseek`/`deepseek-legacy`) is honoured.
+- `reasoning_effort` is accepted and **ignored** — this template has no such capability.
+- The reasoning budget is upstream's sampler, left off by default: this quant loops after a forced
+  `</think>`.
 
 ## Build and run
 
 ```bash
-./scripts/fetch_deps.sh          # vendored llama.cpp at the pinned commit
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
+./scripts/fetch_deps.sh && ./scripts/build.sh      # vendored llama.cpp, pinned; first build ~15 min
 
 M=/home/e0u/localhost/models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-./build/bin/amp-plan  --model $M                    # what the planner decided, and why
-./build/bin/amp-warm  --model $M --what plan        # pull the expert set into the page cache
-./build/bin/amp-infer --model $M --prompt "hi" -n 128
-./scripts/head2head.sh                          # amp vs llama-server on the same prompt
-./scripts/parity.py                             # quality parity, three ways
+./build/bin/amp-server --model $M --port 8081 -c 200000
 ```
 
-**amp is not a server yet** — for chat today keep using the `llama-server` command in `../RUN.md`.
-Full instructions: [`RUNNING.md`](RUNNING.md).
+Point an OpenAI-compatible client at `http://127.0.0.1:8081/v1`. Every `llama-server` flag works,
+so the context flag is `-c` / `--ctx-size`. `docs/PARITY.md` is the full API contract.
 
-Requires the local llama.cpp build (`../llama.cpp/build/bin/libllama*.so`); its location is baked
-into the binaries with RPATH, so no `LD_LIBRARY_PATH` is needed. amp links llama.cpp so the
-quantized math is literally the same code llama.cpp runs.
+## Tools and tests
+
+```bash
+./build/bin/amp-plan  --model $M             # what the planner decided, and why
+./build/bin/amp-warm  --model $M --what plan # pull the expert set into the page cache
+./build/bin/amp-infer --model $M --prompt hi # the forward path, with the prefetcher
+
+python3 scripts/parity_test.py --url http://127.0.0.1:8081   # 15 sections over the API surface
+./scripts/harness/run.sh --url http://127.0.0.1:8081          # the real client, 3 tool-using prompts
+python3 scripts/bench_server.py --url http://127.0.0.1:8081 --n 5   # prefill/decode as a sequence
+python3 scripts/kl_parity.py compare --a quality/llama-matched.json --b quality/amp-post-swap.json
+```
+
+Measurements and open questions: `docs/BENCH.md`. Design: `docs/ARCHITECTURE.md`. Operating guide:
+[`RUNNING.md`](RUNNING.md). Working rules and hard constraints: `AGENT.md`. Background:
+`../NOTES.md`, `../RUN.md`.
