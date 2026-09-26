@@ -24,7 +24,9 @@ changing the numbers.
 | M1 GGUF reader + geometry | done |
 | M2 page-cache warmer | done — measured 1.92 GiB/s cold, whole 12.19 GiB set in 6.3 s |
 | M2b memory planner + cost model | done — predicts 225 t/s prefill / 12.4 t/s decode at 200k |
-| M3 forward path (CPU) | next |
+| M3 forward path + prefetcher | done — 3.1x prefill, 5.4x decode vs llama-server |
+| M3b quality parity | done — bit-deterministic, no algorithmic difference |
+| M3c own graph (observable router) | next |
 | M4 GPU offload | planned |
 | M5 async expert prefetch | planned |
 | M6 server | planned |
@@ -35,6 +37,10 @@ changing the numbers.
 ```bash
 # what the model is, what the box can do, and which configuration is predicted fastest
 ./build/amp-plan --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
+
+# head-to-head against llama-server on the same prompt, plus a logit-level quality diff
+./scripts/head2head.sh /tmp/opencode/amp_bench_prompt.txt 128
+./scripts/parity.py
 
 # make the hot bytes actually resident, and measure whether it worked
 ./build/amp-warm --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf \

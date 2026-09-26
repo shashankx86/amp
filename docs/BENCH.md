@@ -110,7 +110,73 @@ at ubatch 1024 (215.8 t/s prefill, 13.5 t/s decode).
 For reference, measured llama.cpp on this box: 45-86 t/s prefill steady state, 11-14 t/s decode,
 243 t/s prefill when the expert set is fully cache-resident.
 
-## 6. Open questions this bench raised
+## 6. amp vs llama-server, head to head
+
+`scripts/head2head.sh` — identical prompt (52,713 bytes = 18,265 tokens), identical quant, identical
+box, page cache warmed first so both engines start from the same state. llama-server runs the best
+config from `../RUN.md` (`-ncmoe 38 -ub 2048`); amp uses the planner's choice (6 expert layers on the
+GPU, ubatch 1024).
+
+| | amp | llama-server | speedup |
+|---|---|---|---|
+| prefill, 18,265 tokens | 175.0 s = **104.4 t/s** | 535.4 s = **34.1 t/s** | **3.1x** |
+| decode, 128 tokens | 5.01 s = **25.6 t/s** | 26.9 s = **4.76 t/s** | **5.4x** |
+
+For reference, the best llama.cpp number ever observed on this box was 243 t/s prefill with the whole
+expert set page-cache resident and 45-86 t/s in the steady state the user actually runs in.
+
+### What actually produces the win
+
+Not the prefetcher, at least not for prefill — the *plan*. Putting 6 expert layers on the GPU instead
+of 2 shrinks the CPU-resident expert set from 11.54 GiB to 10.25 GiB, which is the difference between
+a working set that thrashes a 9-11 GiB cache and one that mostly fits. The prefetcher then covers the
+remainder.
+
+### The decode cliff (10x, and it is a memory-planning decision)
+
+| CPU-resident expert bytes | page cache | decode |
+|---|---|---|
+| 10.25 GiB (6 GPU layers) | 11.4 GiB — fits | **25.6-29.9 t/s** |
+| 11.54 GiB (2 GPU layers) | 9-11 GiB — does not fit | **2.8-4.8 t/s** |
+
+Because the working set is scanned cyclically, exceeding the cache by 1.3 GiB does not degrade decode
+gracefully, it collapses it ~10x. The cost model now models this as a cliff
+(`cache_overflow_tolerance`, `decode_fault_latency_us = 28 us`) instead of a linear penalty, and
+`amp-plan` prints the "tg now" column next to "tg t/s" so the effect of other RAM users is visible.
+
+## 7. Quality parity (`scripts/parity.py`)
+
+amp runs llama.cpp's own ggml kernels on the same weights with the same KV dtypes (q8_0/q4_0), the same
+flash-attention setting and the same sampler. There is no algorithmic difference to find. The harness
+measures what *is* allowed to differ, in three parts:
+
+| test | top-1 agreement | max abs logprob delta | generated text |
+|---|---|---|---|
+| amp g=6 twice (determinism) | 24/24 | **0.000000** | identical |
+| amp g=6 vs amp g=0 (experts on GPU vs all on CPU) | 24/24 | 0.470572 | identical |
+| amp g=6 vs llama-server `-ncmoe 34` (same placement) | 22/24 | 2.413935 | diverges after position 22 |
+
+Interpretation:
+
+* amp is bit-deterministic run to run.
+* Moving expert weights between CPU and GPU shifts tail logprobs by up to ~0.5 and does not change
+  the output. llama.cpp has exactly the same property between its own `-ngl` values, so this is
+  floating-point non-associativity, not a difference in what is computed.
+* The single cross-engine argmax flip happens at a position where the top-1/top-2 gap is 0.37 — inside
+  the same drift band. The second "flip" (position 23) is meaningless because the contexts had already
+  diverged at 22.
+
+Protocol traps found while building this, all of which first looked like numerical bugs:
+
+* Passing `top_k`/`top_p` together with `n_probs` makes the server renormalise the reported
+  logprobs (it filters the distribution first). Differences of ~2.4 logprob appear that are pure
+  protocol error. `temperature 0` alone is greedy and leaves the distribution intact.
+* `--jinja` on a raw `/completion` request applies the chat template, changing the prompt.
+* A genuine bug this harness caught: `generate()` originally decoded a spurious token before the
+  first sample, shifting every generation by one. Text diffing alone did not make that obvious;
+  comparing logprobs position by position did.
+
+## 8. Open questions this bench raised
 
 1. **How much of the working set can actually be pinned?** The 12.19 GiB set does not fit under the
    ~9.6 GiB practical cache ceiling while other processes hold ~5 GiB. amp needs to decide which
@@ -118,6 +184,13 @@ For reference, measured llama.cpp on this box: 45-86 t/s prefill steady state, 1
    statistics (M3+) so the pinned set is the hot one.
 2. **Does explicit 440 KiB prefetch beat readahead on the fault path?** Both sit near 1.8-2.0 GiB/s;
    the win would have to come from overlap with compute, not bandwidth. Needs a real benchmark (M5).
-3. **Is decode I/O-bound or compute-bound?** The model predicts ~1.79 ms per CPU layer per token
-   (13.4 t/s at 38 CPU layers), which matches the measured 11-14 t/s with almost no I/O contribution,
-   but that measurement was made with a warm-ish cache. Needs a controlled cold/warm decode bench (M7).
+3. **Decode is now cache-bound, so the next win is hiding its misses.** At 25-30 t/s the working set
+   fits and decode is compute-bound (~1.79 ms per CPU layer predicts 13-16 t/s, measured 25-30 t/s,
+   so the model is conservative). The interesting case is the *overflow* regime: 2.8 t/s at 357 ms per
+   token is ~12,600 page faults serialising. Prefetching the 8 active experts per layer needs router
+   output, which the llama.h path does not expose — that argues for amp building its own graph (M3b)
+   rather than driving llama.h.
+4. **Prefill regression to 104 t/s** in the head-to-head versus 166-170 t/s measured earlier for the
+   same config. The difference is page-cache state: after warming 12.19 GiB only ~4.5 GiB stayed
+   resident because other processes hold ~4 GiB, so the head-to-head was run in a partially cold
+   state. Needs a controlled cold/warm matrix before quoting either number.

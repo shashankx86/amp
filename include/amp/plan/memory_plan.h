@@ -25,6 +25,8 @@ struct DeviceBudget {
     uint64_t vram_reserved = 0;   // desktop / other processes
     uint64_t ram_total     = 0;
     uint64_t os_reserve    = 2ull * 1024 * 1024 * 1024;  // RAM we refuse to plan to use
+    uint64_t cache_potential = 0;   // RAM minus OS reserve: what we could hold if idle
+    uint64_t cache_realistic = 0;   // what is actually achievable right now
     uint64_t cache_free_now = 0;  // page cache headroom detected right now
     uint64_t cache_budget  = 0;   // what planning assumes (potential, not momentary)
     uint32_t n_cpu_threads = 8;
@@ -73,7 +75,10 @@ struct CandidatePlan {
     int64_t   expert_bytes_stream = 0;
     double    predicted_prefill_tps = 0.0;              // with amp's prefetching
     double    predicted_prefill_tps_faults = 0.0;      // llama.cpp-equivalent (page faults)
-    double    predicted_decode_tps  = 0.0;
+    double    predicted_decode_tps  = 0.0;   // at the planned cache budget
+    double    predicted_decode_tps_now = 0.0; // at the cache free *right now*
+    int64_t   cpu_expert_bytes_planned = 0;
+    int64_t   cache_needed        = 0;   // page cache this candidate requires for fast decode
     double    score               = 0.0;
     bool      fits                = false;
     std::string reject_reason;
@@ -96,7 +101,9 @@ struct ExecutionPlan {
     int64_t   decode_bytes_stream = 0;   // per generated token
 
     double    predicted_prefill_tps = 0.0;
-    double    predicted_decode_tps  = 0.0;
+    double    predicted_decode_tps  = 0.0;      // at the planned cache budget
+    double    predicted_decode_tps_now = 0.0;   // with the cache free right now
+    int64_t   cache_needed          = 0;       // page cache this plan wants for fast decode
 
     std::vector<RangePlan> resident;   // warm these at start-up / keep them hot
     std::vector<RangePlan> stream;     // fetch these per ubatch (or per token for decode)

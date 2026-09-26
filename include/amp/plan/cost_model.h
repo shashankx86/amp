@@ -40,8 +40,24 @@ struct CostModelConstants {
     double io_overlap              = 0.75;
     // Decode: measured 11-14 t/s with 38 of 40 layers' experts on the CPU.
     double decode_ms_per_cpu_layer = 1.79;
-    // Compute buffer cost per ubatch token (measured: 1513 MiB at ub 2048).
+    // Decode fault latency when misses are *not* hidden. Measured: 2.8 t/s (357 ms/token) with
+    // the CPU expert set exceeding the page cache, against 30 t/s (33 ms/token) when it fits.
+    // That is ~28 us per 4 KiB fault: once the working set stops fitting, decode is
+    // fault-latency-bound, not bandwidth-bound.
+    double decode_fault_latency_us = 28.0;
+    // The working set is scanned cyclically, so once it exceeds the cache, LRU reuse collapses
+    // instead of degrading linearly. This cliff is what makes "how many expert layers go on the
+    // GPU" a decode decision and not merely a VRAM one.
+    double cache_overflow_tolerance = 0.03;  // up to 3% over is still fine
+    // Compute buffer cost per ubatch token (measured: 1513 MiB at ubatch 2048 with 2-6 expert
+    // layers on the GPU, 1992 MiB with 8 - the MoE gather/scatter intermediates grow with the
+    // number of GPU-resident expert layers).
     double vram_bytes_per_ubatch_token = 0.72 * 1024 * 1024;
+    // Extra compute-buffer bytes per GPU-resident expert layer (~80 MiB/layer at ubatch 2048).
+    double vram_bytes_per_gpu_expert_layer = 80.0 * 1024 * 1024;
+    // Never plan right up to the edge: the allocator fragments, and a failed context init costs
+    // far more than a slightly smaller ubatch.
+    double vram_safety = 0.92;
     // Score weights for the planner.
     double weight_prefill = 0.65;
     double weight_decode  = 0.35;

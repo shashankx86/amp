@@ -78,11 +78,14 @@ double CostModel::prefill_tps(int64_t n_tokens, int64_t ubatch, uint64_t stream_
 
 double CostModel::decode_ms(int64_t n_cpu_layers, uint64_t bytes_per_token) const {
     const double t_compute = c_.decode_ms_per_cpu_layer * (double) std::max<int64_t>(0, n_cpu_layers);
-    double       t_io      = 0.0;
-    if (bytes_per_token > 0) {
-        t_io = (double) bytes_per_token / c_.bandwidth_fault_bps * 1e3 * (1.0 - c_.io_overlap);
+    if (bytes_per_token == 0) {
+        return t_compute;
     }
-    // CPU compute and I/O overlap only partially during decode (single token, serial).
+    // bytes_per_token is the *missing* byte count, already scaled by the reuse factor the caller
+    // derived. Cost it as page faults rather than bandwidth: a 4 KiB synchronous fault costs
+    // ~28 us of latency, and that is what actually dominates decode once the cache is exceeded.
+    const double t_faults = ((double) bytes_per_token / 4096.0) * c_.decode_fault_latency_us / 1e3;
+    const double t_io     = t_faults * (1.0 - 0.5 * c_.io_overlap);  // half hides behind compute
     return std::max(t_compute, t_io) + 0.25 * std::min(t_compute, t_io);
 }
 

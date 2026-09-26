@@ -38,7 +38,17 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
   bandwidth problem.
 - KV cache is **8320 B/token** at k=q8_0/v=q4_0 → 1.55 GiB at 200k, 0.51 GiB at 65k.
 - The planner independently reproduces the measured llama.cpp optimum (large ubatch beats GPU
-  expert residency) and predicts **225 t/s prefill / 12.4 t/s decode** at 200k with prefetching.
+  expert residency) and predicts **240 t/s prefill / 16.4 t/s decode** at 200k with prefetching.
+- **Head-to-head vs llama-server (best config, same prompt, same cache state): 3.1x prefill
+  (104.4 vs 34.1 t/s) and 5.4x decode (25.6 vs 4.76 t/s).** The win is the plan (6 expert layers on
+  the GPU -> 10.25 GiB CPU set that fits the cache), amplified by the prefetcher.
+- **Decode has a 10x cliff, not a slope**: 10.25 GiB of CPU experts -> 25.6-29.9 t/s, 11.54 GiB ->
+  2.8-4.8 t/s. Cyclic scan + LRU means exceeding the cache by 1.3 GiB collapses reuse. Modelled as a
+  cliff, and `amp-plan` prints "tg now" next to "tg t/s".
+- **Quality: amp is bit-deterministic (max logprob delta 0.000000 run to run).** Moving experts
+  between CPU and GPU shifts tail logprobs by up to ~0.5 and did not change the output; llama.cpp has
+  the same property between its own -ngl settings. No algorithmic difference exists to find: same
+  ggml kernels, same weights, same KV dtypes, same sampler.
 
 ## Architecture decisions already made
 
@@ -67,6 +77,15 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - `/tmp` is **tmpfs**. Never put I/O benchmark files there — they land in RAM and give false results.
 - Keep the model file's extents contiguous (+16% read bandwidth). If it is ever re-copied, use
   `cp --reflink=never --sparse=never`, `sync`, then swap the name.
+
+## Parity protocol traps (do not re-learn these)
+
+- `n_probs` together with `top_k`/`top_p` makes llama-server renormalise the reported logprobs.
+  Differences of ~2.4 logprob appear that are pure protocol error. `temperature 0` alone is greedy
+  and leaves the distribution intact.
+- `--jinja` on a raw `/completion` request applies the chat template and changes the prompt, so a
+  parity comparison against `amp-infer --prompt` becomes meaningless.
+- Greedy argmax flips are only meaningful next to the top-1/top-2 gap. Report the gap.
 
 ## Reference material
 

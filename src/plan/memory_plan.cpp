@@ -107,7 +107,13 @@ DeviceBudget detect_device_budget() {
     const uint64_t realistic = mi.cached_bytes + (mi.mem_total_bytes - mi.mem_available_bytes > mi.cached_bytes
                                                       ? mi.mem_total_bytes - mi.mem_available_bytes - mi.cached_bytes
                                                       : 0);
-    b.cache_budget = std::min(potential, realistic > 0 ? realistic : potential);
+    // Plan for the *achievable* cache (RAM minus OS reserve), not for whatever happens to be free
+    // this second: the operating mode we are planning for has other RAM users closed. The
+    // momentary reading is still reported, as the "tg now" column, so the cost of not closing
+    // them is visible rather than silently baked into the ranking.
+    b.cache_budget    = potential;
+    b.cache_potential = potential;
+    b.cache_realistic = realistic;
 
     uint64_t total_mib = nvidia_smi_mem("memory.total");
     if (total_mib == 0) {
@@ -134,6 +140,31 @@ std::vector<CandidatePlan> MemoryPlanner::rank(const ModelGeometry & geo, const 
     const uint64_t            vram_cap = budget.vram_usable();
     const CostModelConstants  cc       = cost.constants();
 
+    // Decode prediction as a function of the page cache we assume. Evaluated twice: once for
+    // the budget we plan against, once for what is free right now, because the difference between
+    // those two numbers is exactly the "close the browser" advice.
+    auto predict_decode = [&](int64_t cpu_experts, int64_t cpu_layers, int64_t cache_avail) -> double {
+        const double overflow = cpu_experts > 0
+            ? std::max(0.0, (double) (cpu_experts - cache_avail) / (double) cpu_experts)
+            : 0.0;
+        const double tolerance = cc.cache_overflow_tolerance;
+        double       resident_frac;
+        if (overflow <= 0.0) {
+            resident_frac = 1.0;
+        } else if (overflow <= tolerance) {
+            resident_frac = 1.0 - (overflow / tolerance) * 0.25;
+        } else {
+            const double t = (overflow - tolerance) / (1.0 - tolerance);
+            resident_frac = 0.75 * (1.0 - std::min(1.0, t));
+        }
+        const uint64_t per_token_total = (uint64_t) ((double) cpu_experts *
+                                                     (double) geo.n_expert_used() /
+                                                     (double) std::max<int64_t>(1, geo.n_expert()));
+        const uint64_t per_token_miss  = (uint64_t) ((double) per_token_total * (1.0 - resident_frac));
+        return cost.decode_tps(cpu_layers, per_token_miss);
+    };
+
+
     std::vector<int64_t> ubatches;
     for (int64_t ub = opts.ubatch_min; ub <= opts.ubatch_max; ub *= 2) {
         ubatches.push_back(ub);
@@ -158,14 +189,15 @@ std::vector<CandidatePlan> MemoryPlanner::rank(const ModelGeometry & geo, const 
             c.ubatch              = ub;
             c.expert_bytes_cpu    = cpu_experts;
             c.kv_bytes            = geo.kv_bytes(opts.n_ctx, opts.cache_k, opts.cache_v);
-            c.compute_bytes       = (int64_t) (cc.vram_bytes_per_ubatch_token * (double) ub);
+            c.compute_bytes = (int64_t) (cc.vram_bytes_per_ubatch_token * (double) ub) +
+                                (int64_t) (cc.vram_bytes_per_gpu_expert_layer * (double) g);
             c.vram_bytes          = fixed + gpu_experts + c.compute_bytes;
 
-            if ((uint64_t) c.vram_bytes > vram_cap) {
+            if ((uint64_t) ((double) c.vram_bytes * cc.vram_safety) > vram_cap) {
                 c.fits          = false;
-                c.reject_reason = format("vram %s > usable %s",
-                                         human_bytes((uint64_t) c.vram_bytes).c_str(),
-                                         human_bytes(vram_cap).c_str());
+                c.reject_reason = format("vram %s > usable %s (with safety %.0f%%)",
+                                         human_bytes((uint64_t) ((double) c.vram_bytes * cc.vram_safety)).c_str(),
+                                         human_bytes(vram_cap).c_str(), cc.vram_safety * 100.0);
                 cands.push_back(c);
                 continue;
             }
@@ -182,15 +214,12 @@ std::vector<CandidatePlan> MemoryPlanner::rank(const ModelGeometry & geo, const 
             c.predicted_prefill_tps_faults =
                 cost.prefill_tps(2048, ub, (uint64_t) c.expert_bytes_stream, IoMode::kPageFault);
 
-            // Decode: the CPU handles (n_layer - g) layers; per generated token it touches
-            // n_expert_used experts in each, and the non-resident share may hit NVMe.
-            const int64_t  cpu_layers    = n_layer - g;
-            const double   resident_frac = cpu_experts > 0 ? (double) resident / (double) cpu_experts : 1.0;
-            const uint64_t per_token_total =
-                (uint64_t) ((double) cpu_experts * (double) geo.n_expert_used() /
-                            (double) std::max<int64_t>(1, geo.n_expert()));
-            const uint64_t per_token_miss = (uint64_t) ((double) per_token_total * (1.0 - resident_frac));
-            c.predicted_decode_tps = cost.decode_tps(cpu_layers, per_token_miss);
+            const int64_t cpu_layers = n_layer - g;
+            c.predicted_decode_tps     = predict_decode(cpu_experts, cpu_layers, resident);
+            c.predicted_decode_tps_now = predict_decode(cpu_experts, cpu_layers,
+                                                        (int64_t) budget.cache_free_now);
+            c.cpu_expert_bytes_planned = cpu_experts;
+            c.cache_needed             = cpu_experts;
 
             c.score = cc.weight_prefill * std::log(std::max(0.01, c.predicted_prefill_tps)) +
                       cc.weight_decode * std::log(std::max(0.01, c.predicted_decode_tps));
@@ -258,6 +287,8 @@ Result<ExecutionPlan> MemoryPlanner::plan(const ModelGeometry & geo, const Devic
     p.predicted_prefill_tps = best->predicted_prefill_tps;
     p.predicted_decode_tps  = best->predicted_decode_tps;
 
+    p.cache_needed = p.expert_bytes_cpu;
+    p.predicted_decode_tps_now = best->predicted_decode_tps_now;
     const double resident_frac =
         p.expert_bytes_cpu > 0 ? (double) p.resident_bytes / (double) p.expert_bytes_cpu : 1.0;
     p.decode_bytes_stream = (uint64_t) ((double) p.expert_bytes_cpu *
@@ -293,6 +324,13 @@ Result<ExecutionPlan> MemoryPlanner::plan(const ModelGeometry & geo, const Devic
     p.notes.push_back(format("resident %s, stream %s per ubatch",
                              human_bytes((uint64_t) p.resident_bytes).c_str(),
                              human_bytes((uint64_t) p.stream_bytes).c_str()));
+    if (p.predicted_decode_tps_now + 0.5 * p.predicted_decode_tps < p.predicted_decode_tps) {
+        p.notes.push_back(format(
+            "DECODE IS CACHE-BOUND RIGHT NOW: this plan needs %s of page cache and only %s is "
+            "free; close the browser (or anything else holding RAM) to go from %.1f to %.1f t/s",
+            human_bytes((uint64_t) p.cache_needed).c_str(), human_bytes(budget.cache_free_now).c_str(),
+            p.predicted_decode_tps_now, p.predicted_decode_tps));
+    }
     p.notes.push_back(format("ubatch %lld, compute buffer %s, total VRAM %s of %s usable",
                              (long long) p.ubatch, human_bytes((uint64_t) p.compute_bytes).c_str(),
                              human_bytes((uint64_t) p.vram_total).c_str(),

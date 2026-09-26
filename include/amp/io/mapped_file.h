@@ -31,6 +31,11 @@ public:
     // Blocking read into a caller buffer (used for synchronous warm-up and tests).
     Status pread_exact(uint64_t offset, void * dst, size_t len) const;
 
+    // Fraction of pages in [offset, offset+len) currently resident in the page cache.
+    // This is how amp avoids re-issuing readahead for data it already has: one mincore()
+    // syscall per range is far cheaper than re-reading 1.3 MiB to find out.
+    Result<double> resident_fraction(uint64_t offset, uint64_t length) const;
+
     // Hint the kernel that [offset, offset+len) will be read soon.
     Status advise_willneed(uint64_t offset, uint64_t len) const;
     Status advise_random(uint64_t offset, uint64_t len) const;

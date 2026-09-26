@@ -225,9 +225,10 @@ int main(int argc, char ** argv) {
     printf("  ssm state         %s per sequence\n", human_bytes((uint64_t) geo.ssm_state_bytes()).c_str());
 
     printf("\n== box ==\n");
-    printf("  ram               %s (page-cache target %s%s)\n",
-           human_bytes(budget.ram_total).c_str(),
-           human_bytes(budget.cache_budget).c_str(), budget_overridden ? ", overridden" : ", detected");
+    printf("  ram               %s\n", human_bytes(budget.ram_total).c_str());
+    printf("  page cache        plan against %s (potential), %s achievable now, %s free right now%s\n",
+           human_bytes(budget.cache_budget).c_str(), human_bytes(budget.cache_realistic).c_str(),
+           human_bytes(budget.cache_free_now).c_str(), budget_overridden ? " [override]" : "");
     printf("  vram              %s total, %s in use, %s usable\n",
            human_bytes(budget.vram_total).c_str(), human_bytes(budget.vram_reserved).c_str(),
            human_bytes(budget.vram_usable()).c_str());
@@ -249,20 +250,20 @@ int main(int argc, char ** argv) {
     printf("  streamed tail     %s across %zu ranges (%.1f MiB/token worst case)\n",
            human_bytes((uint64_t) plan.stream_bytes).c_str(), plan.stream.size(),
            plan.decode_bytes_stream / (1024.0 * 1024.0));
-    printf("  predicted         prefill %.0f t/s, decode %.1f t/s\n",
-           plan.predicted_prefill_tps, plan.predicted_decode_tps);
+    printf("  predicted         prefill %.0f t/s, decode %.1f t/s (%.1f t/s with the cache free right now)\n",
+           plan.predicted_prefill_tps, plan.predicted_decode_tps, plan.predicted_decode_tps_now);
     for (const auto & n : plan.notes) {
         printf("    - %s\n", n.c_str());
     }
 
     printf("\n== candidate ranking ==\n");
-    printf("  %4s %8s %10s %6s %10s %9s %8s\n", "g", "ubatch", "vram", "fits", "stream/ub",
-           "pp t/s", "tg t/s");
+    printf("  %4s %8s %10s %6s %10s %9s %8s %8s\n", "g", "ubatch", "vram", "fits", "stream/ub",
+           "pp t/s", "tg t/s", "tg now");
     for (const auto & c : plan.top_candidates) {
-        printf("  %4d %8lld %10s %6s %10s %9.1f %8.1f%s\n", c.n_expert_layers_gpu,
+        printf("  %4d %8lld %10s %6s %10s %9.1f %8.1f %8.1f%s\n", c.n_expert_layers_gpu,
                (long long) c.ubatch, human_bytes((uint64_t) c.vram_bytes).c_str(),
                c.fits ? "yes" : "NO", human_bytes((uint64_t) c.expert_bytes_stream).c_str(),
-               c.predicted_prefill_tps, c.predicted_decode_tps,
+               c.predicted_prefill_tps, c.predicted_decode_tps, c.predicted_decode_tps_now,
                c.reject_reason.empty() ? "" : ("  (" + c.reject_reason + ")").c_str());
     }
     return 0;

@@ -4,10 +4,14 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <vector>
 #include <cstring>
 #include <utility>
 
@@ -98,6 +102,40 @@ Status MappedFile::pread_exact(uint64_t offset, void * dst, size_t len) const {
         done += (size_t) n;
     }
     return Status::OK();
+}
+
+Result<double> MappedFile::resident_fraction(uint64_t offset, uint64_t length) const {
+    if (!data_ || length == 0) {
+        return 0.0;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) {
+        return 0.0;
+    }
+    const uint64_t start = (offset / (uint64_t) page) * (uint64_t) page;
+    const uint64_t end   = std::min<uint64_t>(size_, ((offset + length + page - 1) / page) * page);
+    if (end <= start) {
+        return 0.0;
+    }
+    const uint64_t chunk = 4ull * 1024 * 1024;
+    const size_t   npages_chunk = (size_t) (chunk / (uint64_t) page);
+    std::vector<unsigned char> vec(npages_chunk);
+    uint64_t resident = 0, total = 0;
+    for (uint64_t off = start; off < end; off += chunk) {
+        const uint64_t len = std::min<uint64_t>(chunk, end - off);
+        const size_t   n   = (size_t) (len / (uint64_t) page);
+        const auto *   addr = (const uint8_t *) data_ + off;
+        if (mincore(const_cast<void *>((const void *) addr), len, vec.data()) != 0) {
+            return resident / (double) std::max<uint64_t>(1, total);
+        }
+        for (size_t i = 0; i < n; i++) {
+            total++;
+            if (vec[i] & 1u) {
+                resident++;
+            }
+        }
+    }
+    return total ? (double) resident / (double) total : 0.0;
 }
 
 Status MappedFile::advise_willneed(uint64_t offset, uint64_t len) const {

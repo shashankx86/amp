@@ -28,6 +28,7 @@ find_library(AMP_LIBGGML      NAMES ggml      PATHS "${AMP_GGML_BIN_DIR}" NO_DEF
 find_library(AMP_LIBGGML_BASE NAMES ggml-base PATHS "${AMP_GGML_BIN_DIR}" NO_DEFAULT_PATH)
 find_library(AMP_LIBGGML_CPU  NAMES ggml-cpu  PATHS "${AMP_GGML_BIN_DIR}" NO_DEFAULT_PATH)
 find_library(AMP_LIBGGML_CUDA NAMES ggml-cuda PATHS "${AMP_GGML_BIN_DIR}" NO_DEFAULT_PATH)
+find_library(AMP_LIBLLAMA      NAMES llama      PATHS "${AMP_GGML_BIN_DIR}" NO_DEFAULT_PATH)
 if(NOT AMP_LIBGGML OR NOT AMP_LIBGGML_BASE)
   message(FATAL_ERROR "libggml*.so not found in ${AMP_GGML_BIN_DIR}; build llama.cpp first")
 endif()
@@ -73,6 +74,14 @@ target_include_directories(amp_model PUBLIC ${AMP_GGML_INCLUDE_DIR})
 target_link_libraries(amp_model PUBLIC amp_util ${AMP_LIBGGML} ${AMP_LIBGGML_BASE})
 target_compile_options(amp_model PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
+# runtime: the forward path, built on llama.cpp's public API so the arithmetic is identical
+add_library(amp_runtime STATIC
+  src/runtime/model_runtime.cpp
+)
+target_include_directories(amp_runtime PUBLIC ${AMP_LLAMA_ROOT}/include)
+target_link_libraries(amp_runtime PUBLIC amp_io amp_plan ${AMP_LIBLLAMA} ${AMP_LIBGGML} ${AMP_LIBGGML_BASE})
+target_compile_options(amp_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
 # plan: memory/device planning
 add_library(amp_plan STATIC
   src/plan/memory_plan.cpp
@@ -82,10 +91,14 @@ target_link_libraries(amp_plan PUBLIC amp_model amp_io)
 target_compile_options(amp_plan PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 if(AMP_BUILD_TOOLS)
-  foreach(tool amp-plan amp-warm)
+  foreach(tool amp-plan amp-warm amp-infer)
     string(REPLACE "-" "_" tool_src ${tool})
     add_executable(${tool} tools/${tool_src}.cpp)
-    target_link_libraries(${tool} PRIVATE amp_plan)
+    if(${tool} STREQUAL "amp-infer")
+      target_link_libraries(${tool} PRIVATE amp_runtime)
+    else()
+      target_link_libraries(${tool} PRIVATE amp_plan)
+    endif()
     target_compile_options(${tool} PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endforeach()
 endif()

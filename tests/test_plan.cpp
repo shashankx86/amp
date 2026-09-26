@@ -94,9 +94,12 @@ AMP_TEST(planner_prefers_large_ubatch_over_gpu_experts) {
     AMP_CHECK(plan_res.ok());
     const ExecutionPlan & plan = *plan_res;
 
-    // the chosen plan must actually fit
-    AMP_CHECK_MSG((uint64_t) plan.vram_total <= budget.vram_usable(),
-                  format("vram %s > usable %s", human_bytes((uint64_t) plan.vram_total).c_str(),
+    // the chosen plan must fit *with the safety margin applied*, since the allocator fragments
+    const double safe = (double) plan.vram_total * CostModel::for_this_machine().constants().vram_safety;
+    AMP_CHECK_MSG((uint64_t) safe <= budget.vram_usable(),
+                  format("vram %s (x%.2f safety) > usable %s",
+                         human_bytes((uint64_t) plan.vram_total).c_str(),
+                         CostModel::for_this_machine().constants().vram_safety,
                          human_bytes(budget.vram_usable()).c_str()));
 
     // and it should land on the large-ubatch end, which is the measured optimum
