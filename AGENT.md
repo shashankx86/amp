@@ -181,10 +181,12 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
   every prompt over the ubatch with "prefill batch full at token 2048" — i.e. every real conversation,
   since an agent client resends the whole history each turn.
 - **To get a non-reasoning answer, use the template's switch, not a forced close.**
-  `chat_template_kwargs: {"enable_thinking": false}` (llama.cpp's passthrough field) makes the template
-  drop the think block from the generation prompt. Forcing a close with the reasoning budget works, but
-  this quant tends to loop (`2+2 = 4. </think> 2+2 = 4. </think> ...`) after a forced close, so the
-  budget is opt-in and off by default.
+  `chat_template_kwargs: {"enable_thinking": false}` makes the template pre-close the think block.
+  The reasoning budget (`reasoning_budget_tokens`) also works and is effective — measured 100
+  completion tokens down to 12 — but forcing a close mid-thought alters generation, and at a very
+  tight budget (8 tokens) 1 sample in 3 returned a visibly doubled answer (`4\n</think>\n\n4`).
+  4 of 4 samples at 16-32 were clean. The severe looping in older notes was on the deleted server's
+  sampling path and did not reproduce. It stays opt-in; see docs/BENCH.md.
 - **The reasoning budget is llama.cpp's `common_reasoning_budget_init`** and it arms itself by
   *replaying the prefill tokens* through the sampler — no template special-casing. Feed it with
   `llama_sampler_accept` before the first generated token.

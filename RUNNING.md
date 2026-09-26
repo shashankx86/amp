@@ -82,13 +82,14 @@ This is a reasoning model, and its template renders the generation prompt alread
 | reasoning split in responses | automatic | `reasoning_content` separate from `content` |
 | `reasoning_format` | `none` / `auto` / `deepseek` / `deepseek-legacy` | works, upstream's implementation |
 | structured `tool_calls` | `tools` + `tool_choice` | works, with a real id and parsed `arguments` |
-| thinking budget | `reasoning_budget_tokens` | upstream's sampler; **left off by default**, see below |
+| thinking budget | `reasoning_budget_tokens` | works (100 -> 12 completion tokens); **opt-in**, see below |
 | `reasoning_effort` | request field | accepted and **ignored**: this template has no such capability |
 
 `enable_thinking: false` is the supported way to get a direct answer. It is a large win on short
 requests: the same question costs **104 completion tokens thinking and 2 not thinking**, same answer.
-The reasoning budget forces a `</think>` mid-thought, and this quant tends to loop after a forced
-close (`2+2 = 4. </think> 2+2 = 4. </think> ...`), so it stays opt-in.
+The reasoning budget also works and is effective (100 -> 12 tokens), but it forces a `</think>`
+mid-thought, and at a very tight budget (8 tokens) 1 sample in 3 returned a doubled answer. It stays
+opt-in; `docs/BENCH.md` has the table.
 
 Always inspect `POST /apply-template` when a turn misbehaves — it shows the exact prompt the server
 will evaluate, for free.

@@ -567,3 +567,29 @@ Two things worth recording from the timings:
 
 This is the acceptance test the project's goals ask for: a real agentic client holding multi-turn
 conversations with tool calls, which is how the server is actually used.
+
+### Reasoning budget: measured, and the old "it loops" note needs qualifying
+
+The reasoning budget is llama.cpp's sampler (`common_reasoning_budget_init`), reached through
+`reasoning_budget_tokens`. It counts tokens spent inside the reasoning block and forces the end tag
+when the budget runs out, so a short request cannot spend its whole allowance thinking.
+
+Same question ("What is 2+2? Answer with just the number."), thinking on, `max_tokens` 100-120:
+
+| budget | completion tokens | answer | samples |
+|---|---|---|---|
+| unrestricted (default) | 100 | `4` | 1, clean |
+| 32 | 36 | `4` | 3, all clean |
+| 16 | 20 | `4` | 1, clean |
+| 8 | 12 | `4` | 2 clean, **1 returned `4\n</think>\n\n4`** |
+
+So the mechanism works and is effective — 100 tokens down to 12 — but a **very** tight budget is
+genuinely risky: at 8 tokens, one sample in three came back with a visibly doubled answer. The
+severe looping described in earlier notes (`2+2 = 4. </think> 2+2 = 4. </think> ...`) was measured on
+the deleted hand-rolled server's sampling path and did **not** reproduce here; 4 of 4 samples at
+16-32 were clean.
+
+**Decision: it stays opt-in, off by default.** Not because it is broken, but because forcing a close
+mid-thought alters generation for every request that sets it, and at tight budgets it can visibly
+degrade the answer. `enable_thinking: false` remains the supported way to get a direct answer — it is
+free of that risk because the template pre-closes the block instead of the sampler forcing it.
