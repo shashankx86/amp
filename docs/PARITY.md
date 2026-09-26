@@ -889,3 +889,38 @@ otherwise the kwarg is ignored with a warning (`server-context.cpp:1499-1509`).
 15. **Tools:** `/tools` (if `--tools` or MCP).
 16. **CORS proxy:** `/cors-proxy` (if `--ui-mcp-proxy`).
 17. **CLI surface:** ~140 server-relevant flags vs. the old amp server's ~10.
+
+---
+
+## Verification status (added 2026-09-27)
+
+This document is a description of llama.cpp's server. This section records what is actually
+*verified*, so the two cannot drift apart silently.
+
+| | count |
+|---|---|
+| route registrations in `tools/server/server.cpp` (`ctx_http.get/post/del/put`) | 54 |
+| distinct routes reachable (with `/v1` and legacy aliases) | 62 in section 7.1's testable list |
+| CLI flags exposed by `amp-server --help` | 399 |
+| `scripts/parity_test.py` sections | 17 |
+| sections passing against a real server | 16 |
+| section that reports what cannot be tested here | 1 (8 features, each with a reason) |
+
+`amp-server` is llama.cpp's server with an ~90-line preflight, so route and flag coverage is
+inherited rather than reimplemented. The parity claim rests on three things, each verified:
+
+1. **The link is real.** `amp-server` is built from `tools/amp_server.cpp` (90 lines) calling the
+   exported `llama_server()` (`tools/server/server.cpp:43`), linking `llama-server-impl`. Build
+   commit `d354cd9`; the link itself was proven earlier in `5975bd7`.
+2. **The behaviour is llama.cpp's.** `parity_test.py` asserts response key sets, `finish_reason`
+   values, the `include_usage` trailing chunk, error `type` strings and the non-OpenAI status codes
+   against a running server. It found two real defects in itself (a 120 s default timeout that a cold
+   first generation exceeds, and a 32-token tool-call budget that a *thinking* model cannot meet).
+3. **The arithmetic is unchanged.** With placement held fixed, `amp-server` and `llama-server`
+   produce bit-identical output distributions: KL = 0.000000e+00 in both directions, JS = 0,
+   max abs delta logprob = 0, 512/512 top-1 agreement. See `docs/BENCH.md`.
+
+**What this document does not claim.** It describes upstream behaviour, including things upstream
+itself does not implement: `POST /props` is a no-op, `t_max_prompt_ms` and `speculative.*` are
+accepted and ignored, and `reasoning_effort` has no effect on a template without that capability.
+Section 7.3 lists them. A test must not assert them.
