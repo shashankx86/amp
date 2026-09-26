@@ -289,7 +289,7 @@ def capture(args):
     print(f"  n_probs: {args.n_probs}")
     print(f"  n_tokens:{args.n_tokens}")
     print(f"  prompt:  {len(prompt)} chars")
-    print(f"  out:     {args.output}")
+    print(f"  out:     {args.out}")
     print()
 
     # Try /v1/completions first, fall back to /completion
@@ -353,7 +353,7 @@ def capture(args):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(capture_record, f, indent=2)
-        os.rename(tmp_path, args.output)
+        os.rename(tmp_path, args.out)
     except Exception:
         os.unlink(tmp_path)
         raise
@@ -374,7 +374,7 @@ def capture(args):
     if mean_mass < 0.99:
         print(f"  WARNING: captured mass {mean_mass:.4f} < 0.99 -- KL will understate true divergence.")
         print(f"  Consider increasing --n-probs beyond {args.n_probs}.")
-    print(f"  written:  {args.output}")
+    print(f"  written:  {args.out}")
     return 0
 
 

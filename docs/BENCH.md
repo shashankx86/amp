@@ -333,3 +333,46 @@ ubatch 1024, 10.90 GiB warmed in 3.7 s):
 
 Against the `llama-server` baseline's 4.76 t/s on the same prompt and cache state, that is **7.4x**.
 Report a sequence, never a single request.
+
+## 2026-09-26 — quality baseline: the measurement noise floor is exactly zero
+
+Before the server swap can be claimed lossless, two things have to be true: there must be a
+reference to compare against, and the *measurement itself* must have a known noise floor.
+Otherwise a non-zero KL afterwards is uninterpretable.
+
+Captured with `scripts/kl_parity.py`, 512 greedy tokens, `n_probs=32`, no `top_k`/`top_p`
+(filtering makes a server renormalise the reported logprobs and manufactures fake divergence).
+Config: `-c 16384 --parallel 1 -fa on -ctk q8_0 -ctv q4_0 -ngl 41 -ncmoe 38 -b 2048 -ub 2048
+-t 8 -tb 8 --jinja`.
+
+| capture | server | elapsed | positions | mean captured mass |
+|---|---|---|---|---|
+| `llama-ref` | `llama-server` :8099 | 93.0 s | 512 | 0.998430 |
+| `llama-ref-2` | same server, same flags, second run | 44.8 s | 512 | 0.998430 |
+
+Comparing the two runs of the **same** server with the **same** flags:
+
+| metric | value |
+|---|---|
+| top-1 agreement | 512/512 (100.00 %) |
+| KL(A‖B) | mean 0.000000e+00, max 0.000000e+00 |
+| KL(B‖A) | mean 0.000000e+00, max 0.000000e+00 |
+| Jensen-Shannon | mean 0.000000e+00 |
+| max abs Δ logprob on shared tokens | 0.000000e+00 |
+
+**The noise floor is exactly zero, not "small".** llama.cpp at `temperature 0` is bit-identical
+run to run through the HTTP API, on this model, with this quant. So the acceptance threshold for
+the post-swap capture is not "below some tolerance" — it is *exactly zero*, and any deviation is
+a real finding rather than jitter. This is a stronger and cheaper test than a statistical one.
+
+`min` captured mass is 0.935363 at one position: a flatter-than-usual distribution where the top 32
+tokens hold less mass. Harmless here because both sides are truncated identically and renormalised
+over the joint support, but it is why the tool reports captured mass rather than only KL.
+
+### The pre-swap server cannot be captured this way
+
+The hand-rolled `amp-server` set `logprobs` to `null` unconditionally
+(`src/server/openai_api.cpp:516`) — it never implemented `n_probs` at all. So a KL reference from
+the engine being replaced is not obtainable over HTTP, and that capability is one of the things
+the swap gains. The pre-swap engine's own quality evidence remains the top-5 logprob parity in
+`scripts/parity.py` and the determinism result in the table above.
