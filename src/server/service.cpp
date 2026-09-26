@@ -477,15 +477,31 @@ Result<RenderedChat> InferenceService::render_chat(const std::vector<ChatMessage
     common_chat_templates_inputs in;
     in.add_generation_prompt = true;
     in.use_jinja             = true;
+    // Thinking on by default: this template renders the generation prompt as `<think>\n`, so the model
+    // reasons before answering. A request can turn it off, and it has to go through *this field* — the
+    // autoparser helper does `extra_context["enable_thinking"] = params.enable_thinking`
+    // (common/chat-auto-parser-helpers.cpp:322), which overwrites whatever a chat_template_kwargs
+    // passthrough put there. A kwarg named enable_thinking is silently ignored.
     in.enable_thinking       = true;
     // The whole point: keep the assistant's own reasoning in the rendered prompt so the next turn's
     // prefix matches. Without this, a thinking model re-evaluates the tail of every turn.
+    //
+    // This is llama.cpp's *logical* name. The jinja capability layer maps it onto whatever the template
+    // actually reads (preserve_thinking, clear_thinking, truncate_history_thinking, drop_thinking — see
+    // jinja::caps_apply_preserve_reasoning), which is why setting the raw name is not enough.
     in.chat_template_kwargs["preserve_reasoning"] = "true";
-    // Caller-supplied kwargs win, so enable_thinking=false actually takes effect.
     if (!template_kwargs.empty()) {
         if (auto parsed = json::Value::parse(template_kwargs); parsed.ok() && parsed->is_object()) {
             for (const auto & kv : parsed->as_object()) {
                 const json::Value & v = kv.second;
+                if (kv.first == "enable_thinking" && v.is_bool()) {
+                    in.enable_thinking = v.as_bool();
+                    continue;
+                }
+                if (kv.first == "preserve_reasoning" && v.is_bool()) {
+                    in.chat_template_kwargs[kv.first] = v.as_bool() ? "true" : "false";
+                    continue;
+                }
                 if (v.is_string()) {
                     in.chat_template_kwargs[kv.first] = v.as_string();
                 } else if (v.is_bool()) {
