@@ -1,0 +1,5 @@
+# amp's vendored dependencies. Fetch with: scripts/fetch_deps.sh
+#
+# llama.cpp is vendored (not referenced from outside this tree) so that amp is standalone:
+# one clone, one build directory, no LD_LIBRARY_PATH, no external llama.cpp checkout.
+llama.cpp https://github.com/ggml-org/llama.cpp 1ab7e5ad2d4e7295c94c3b966a3e0b70fa365865

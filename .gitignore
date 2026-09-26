@@ -7,3 +7,6 @@ compile_commands.json
 prompts*/
 *.log
 core
+
+# vendored deps are fetched by scripts/fetch_deps.sh, pinned in third_party/DEPS.lock
+third_party/llama.cpp/
