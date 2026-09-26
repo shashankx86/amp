@@ -216,6 +216,10 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
   (it stalled ~50 min on one prompt). The preflight now sets `n_parallel = 1` unless `--parallel N`
   is passed. General rule: **on a model whose decode is bound by a working set larger than cache,
   "parallel" slots divide a fixed resource and the default must be 1.**
+  **The cost, which is a real capability loss:** `n > 1` (several choices in one response) is bounded
+  by the slot count, so with one slot it returns a typed 400. Stock llama-server can serve it. We
+  traded that for the 44x. `parity_test.py` section 19 asserts the typed 400 rather than pretending
+  the feature works, and RUNNING.md states the trade so it is the user's call.
 - **A stream must always end with `finish_reason`, then `[DONE]`.** Otherwise the Vercel AI SDK
   reports "OpenAI Chat stream ended without finish_reason" and retries forever, which presents as a
   mysterious hang rather than an error. On failure amp now sends the error object *and* a proper
