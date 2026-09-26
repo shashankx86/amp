@@ -209,7 +209,9 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
         note("cannot build geometry: " + geo_res.message() + " - skipping plan");
         return notes;
     }
-    const ModelGeometry & geo = *geo_res;
+    // ModelGeometry::build yields a Result<unique_ptr<ModelGeometry>>, so the geometry itself is
+    // the second dereference (same shape as the old service.cpp's `**geo_res`).
+    const ModelGeometry & geo = **geo_res;
 
     const CostModel     cost   = CostModel::from_environment();
     const DeviceBudget  budget = detect_device_budget(cost.constants());
@@ -217,7 +219,20 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
     // An explicit -ub pins the ubatch the planner may choose, so the VRAM estimate
     // matches what the context will actually be created with.
     PlannerOptions po;
-    po.n_ctx   = opts.n_ctx;
+    // Plan against the context the server will really create, not opts.n_ctx. params.n_ctx is
+    // the resolved truth at this point: common_params_parse has already folded in -c/--ctx-size
+    // and LLAMA_ARG_CTX_SIZE. It is 0 when neither was given, which means "use the model's
+    // native context" rather than "a context of zero", hence the fallback.
+    //
+    // This is not cosmetic. Planning for 200k while the user asked for 32k reserves 1.55 GiB of
+    // KV that will never be allocated, which costs GPU expert layers and shrinks the ubatch:
+    // the planner ends up optimising against a budget that does not exist.
+    const int64_t plan_ctx = params.n_ctx > 0 ? (int64_t) params.n_ctx : opts.n_ctx;
+    if (plan_ctx != opts.n_ctx) {
+        note("plan against the requested context: " + std::to_string(plan_ctx) +
+             " tokens (not the " + std::to_string(opts.n_ctx) + " default)");
+    }
+    po.n_ctx   = plan_ctx;
     po.cache_k = opts.cache_k;
     po.cache_v = opts.cache_v;
     if (f.ub) {

@@ -111,6 +111,16 @@ add_library(amp_plan STATIC
 target_link_libraries(amp_plan PUBLIC amp_model amp_io)
 target_compile_options(amp_plan PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
+# preflight: the whole of amp's contribution to amp-server. Its own library rather than part of
+# amp_plan, because it needs llama + llama-common (common_params, tensor_buft_overrides) and
+# amp-plan/amp-warm should not have to link either of those just to print a plan.
+add_library(amp_preflight STATIC
+  src/plan/preflight.cpp
+)
+target_include_directories(amp_preflight PUBLIC "${AMP_VENDOR_DIR}/common" "${AMP_VENDOR_DIR}/include")
+target_link_libraries(amp_preflight PUBLIC amp_plan llama llama-common)
+target_compile_options(amp_preflight PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
 # runtime: the forward path, built on llama.cpp's own kernels so the arithmetic is identical
 add_library(amp_runtime STATIC
   src/runtime/model_runtime.cpp
@@ -120,17 +130,6 @@ add_library(amp_runtime STATIC
 target_include_directories(amp_runtime PUBLIC "${AMP_VENDOR_DIR}/include")
 target_link_libraries(amp_runtime PUBLIC amp_io amp_plan llama llama-common)
 target_compile_options(amp_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
-
-# server: HTTP + OpenAI-compatible API on top of the runtime
-add_library(amp_server STATIC
-  src/server/http_server.cpp
-  src/server/task_queue.cpp
-  src/server/service.cpp
-  src/server/openai_api.cpp
-)
-target_include_directories(amp_server PUBLIC "${AMP_VENDOR_DIR}/common" "${AMP_VENDOR_DIR}/include")
-target_link_libraries(amp_server PUBLIC amp_runtime llama-common)
-target_compile_options(amp_server PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 if(AMP_BUILD_TOOLS)
   foreach(tool amp-plan amp-warm amp-infer)
@@ -144,10 +143,15 @@ if(AMP_BUILD_TOOLS)
     target_compile_options(${tool} PRIVATE -Wall -Wextra -Wno-unused-parameter)
   endforeach()
 
-  # Build spike: prove llama.cpp's server links into an amp binary. Removed by the next commit.
-  add_executable(amp-server-spike EXCLUDE_FROM_ALL tools/amp_server_spike.cpp)
-  target_link_libraries(amp-server-spike PRIVATE llama-server-impl)
-  target_compile_options(amp-server-spike PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  # amp-server: llama.cpp's tools/server, with amp's memory plan applied as a preflight.
+  # llama-server-impl is the static library tools/server/CMakeLists.txt documents as
+  # "reusable by app"; it is where the exported llama_server() lives. amp_plan supplies the
+  # planner that becomes common_params fields. The old hand-rolled server library is gone:
+  # its sources stay on disk for one commit as a fallback, but nothing builds them.
+  add_executable(amp-server tools/amp_server.cpp)
+  target_include_directories(amp-server PRIVATE "${AMP_VENDOR_DIR}/common" "${AMP_VENDOR_DIR}/include")
+  target_link_libraries(amp-server PRIVATE amp_preflight llama-server-impl)
+  target_compile_options(amp-server PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(AMP_BUILD_TESTS)
