@@ -214,6 +214,47 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
         return notes;
     }
 
+    // -- Safety clamps, applied BEFORE the plan on purpose.
+    //
+    //    These do not depend on the plan, and the plan can fail: MemoryPlanner::plan returns
+    //    "no configuration fits" when VRAM is contended, and that path returns early. When the
+    //    clamps sat after the plan, a planner failure meant serving with llama.cpp's defaults of
+    //    32 context checkpoints and 8 GiB of anonymous prompt cache - precisely the OOM-prone
+    //    configuration, on the one occasion the box is already under pressure. Found by
+    //    tests/test_preflight.cpp, which is the only reason it was caught at all.
+    //
+    //    They stay *after* the --fit check, so an explicit --fit on remains a total no-op.
+
+    //    fit_params belongs with them. Default is true (common/common.h:476), and the fitter
+    //    would fight whatever layout we set (fit.cpp:463-486, with the failure ignored at
+    //    common.cpp:1320). Disabling it even when OUR plan fails is deliberate: the fitter also
+    //    silently reduces n_ctx to whatever fits (fit.cpp:393-457), and a quietly shrunk context
+    //    is a worse outcome than a clean, predictable default. The user can always ask for --fit.
+    if (!f.fit_on && params.fit_params) {
+        params.fit_params = false;
+        note("fit_params: off (amp's planner replaces llama.cpp's fitter)");
+    }
+    // -- Safety clamps. These are not layout choices; they only ever REDUCE llama.cpp server
+    //    defaults that are dangerous on this machine, and they never override a flag the user set.
+    //    n_ctx_checkpoints: default 32 (common/common.h:629). Each checkpoint stores the full
+    //    memory state at its position - ~1.6 GiB at 200k ctx (KV plus the 62.81 MiB recurrent
+    //    state) - so the default ring can reach ~50 GiB.
+    if (!f.ctxcp && params.n_ctx_checkpoints > opts.n_ctx_checkpoints) {
+        note("n_ctx_checkpoints: " + std::to_string(opts.n_ctx_checkpoints) +
+             " (clamped from " + std::to_string(params.n_ctx_checkpoints) +
+             "; each is ~1.6 GiB at 200k ctx)");
+        params.n_ctx_checkpoints = opts.n_ctx_checkpoints;
+    }
+    //    cache_ram_mib: default 8192 (common/common.h:632). The prompt cache is anonymous RAM
+    //    (tools/server/server-task.cpp:1711-1758) that evicts the model's page cache - the decode
+    //    cliff, AGENT.md.
+    if (!f.cram && params.cache_ram_mib > opts.cache_ram_mib) {
+        note("cache_ram_mib: " + std::to_string(opts.cache_ram_mib) +
+             " (clamped from " + std::to_string(params.cache_ram_mib) +
+             "; the prompt cache evicts the model's page cache)");
+        params.cache_ram_mib = opts.cache_ram_mib;
+    }
+
     // -- Open the model and plan. Without a local GGUF there is nothing to plan; the
     //    server downloads HF repos later (tools/server/server.cpp:395), after us.
     if (params.model.path.empty()) {
@@ -281,19 +322,30 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
         }
         po.ubatch_min = po.ubatch_max = std::max<int64_t>(32, std::atoll(v));
     }
-    auto plan_res = MemoryPlanner::plan(geo, budget, po, cost);
-    if (!plan_res.ok()) {
-        note("planner failed: " + plan_res.message() + " - continuing with llama.cpp defaults");
-        return notes;
+    //
+    // A plan failure is NOT a reason to skip the rules that do not depend on the plan. Only
+    // Rules 1 and 4 consume it; context, KV dtypes, flash-attn and threads are all decided
+    // without it, and they are what make the server behave predictably on a box too small for
+    // the plan. So the plan is optional and only the two consumers are guarded.
+    auto               plan_res = MemoryPlanner::plan(geo, budget, po, cost);
+    const bool         have_plan = plan_res.ok();
+    // Only meaningful when have_plan; both consumers below are guarded on it.
+    static const ExecutionPlan kNoPlan{};
+    const ExecutionPlan &      plan = have_plan ? *plan_res : kNoPlan;
+    if (!have_plan) {
+        note("planner failed: " + plan_res.message() +
+             " - keeping llama.cpp's device layout, applying the rest of the safe configuration");
     }
-    const ExecutionPlan & plan = *plan_res;
 
     // -- Rule 1: the layout. The user's explicit layout wins; otherwise the plan's
     //    n_expert_layers_gpu becomes tensor_buft_overrides (-ncmoe's public equivalent,
     //    amp/runtime/buft_overrides.cpp). n_gpu_layers stays -1 so llama.cpp assigns
     //    every non-overridden tensor to the GPU - the configuration BENCH.md was
     //    measured with (the old server did the same, src/server/service.cpp:333-345).
-    if (user_set_layout(params)) {
+    if (!have_plan) {
+        note("no plan: leaving n_gpu_layers=" + std::to_string(params.n_gpu_layers) +
+             " and tensor_buft_overrides untouched");
+    } else if (user_set_layout(params)) {
         note("user set a device layout (-ngl/-ncmoe/-ot): leaving n_gpu_layers=" +
              std::to_string(params.n_gpu_layers) + " and tensor_buft_overrides untouched");
     } else {
@@ -302,19 +354,6 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
         note("layout: " + std::to_string(plan.n_expert_layers_gpu) + " expert layers on GPU, " +
              std::to_string(n_cpu) + " pinned to CPU (" +
              human_bytes((uint64_t) plan.expert_bytes_cpu) + " CPU expert set)");
-    }
-
-    // -- Rule 2: fit_params. Default is true (common/common.h:476). The fitter throws
-    //    on any layout it did not create (common/fit.cpp:463-465, 484-486) and the
-    //    caller ignores the failure (common/common.cpp:1320), so leaving it on would
-    //    only burn a full no_alloc model load at startup (common/fit.cpp:264). amp's
-    //    planner replaces it. An explicit "-fit off" is already false; we only change
-    //    the default.
-    if (params.fit_params) {
-        params.fit_params = false;
-        note("fit_params: off (amp's planner replaces llama.cpp's fitter)");
-    } else {
-        note("fit_params: already off");
     }
 
     // -- Rule 3: context size. The planner's KV/VRAM numbers are at opts.n_ctx (200k,
@@ -334,12 +373,16 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
     //    which is impossible before a context exists. Tradeoff: if the estimate is
     //    wrong, llama_init_from_model fails loudly (common/common.cpp:1398-1402)
     //    instead of backing off - see docs/PREFLIGHT.md "what could still go wrong".
-    if (!f.ub) {
+    if (f.ub) {
+        note("n_ubatch: leaving user's -ub " + std::to_string(params.n_ubatch));
+    } else if (have_plan) {
         params.n_ubatch = (int32_t) plan.ubatch;
         note("n_ubatch: " + std::to_string(plan.ubatch) +
              " (largest ubatch that fits the measured VRAM budget)");
     } else {
-        note("n_ubatch: leaving user's -ub " + std::to_string(params.n_ubatch));
+        // ExecutionPlan::ubatch defaults to 0, so without this guard a planner failure would
+        // set n_ubatch = 0 - worse than leaving llama.cpp's default in place.
+        note("n_ubatch: leaving llama.cpp's default (no plan)");
     }
     // llama.cpp clamps n_ubatch to n_batch (src/llama-context.cpp:248). The default
     // n_batch (2048) already covers the planner's range; only raise it for consistency
@@ -388,28 +431,6 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
     } else {
         note("n_threads: leaving user's -t " +
              std::to_string(params.cpuparams.n_threads));
-    }
-
-    // -- Rule 8: safety guards. These are not layout choices; they only ever REDUCE
-    //    llama.cpp server defaults that are dangerous on this machine, and they never
-    //    override a flag the user set.
-    //    n_ctx_checkpoints: default 32 (common/common.h:629). Each checkpoint stores
-    //    the full memory state at its position - ~1.6 GiB at 200k ctx (KV plus the
-    //    62.81 MiB recurrent state) - so the default ring can reach ~50 GiB.
-    if (!f.ctxcp && params.n_ctx_checkpoints > opts.n_ctx_checkpoints) {
-        note("n_ctx_checkpoints: " + std::to_string(opts.n_ctx_checkpoints) +
-             " (clamped from " + std::to_string(params.n_ctx_checkpoints) +
-             "; each is ~1.6 GiB at 200k ctx)");
-        params.n_ctx_checkpoints = opts.n_ctx_checkpoints;
-    }
-    //    cache_ram_mib: default 8192 (common/common.h:632). The prompt cache is
-    //    anonymous RAM (tools/server/server-task.cpp:1711-1758) that evicts the
-    //    model's page cache - the decode cliff, AGENT.md.
-    if (!f.cram && params.cache_ram_mib > opts.cache_ram_mib) {
-        note("cache_ram_mib: " + std::to_string(opts.cache_ram_mib) +
-             " (clamped from " + std::to_string(params.cache_ram_mib) +
-             "; the prompt cache evicts the model's page cache)");
-        params.cache_ram_mib = opts.cache_ram_mib;
     }
 
     // -- Rule 9: the page-cache warm. llama.cpp's model load performs a full sequential

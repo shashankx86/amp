@@ -156,8 +156,12 @@ if(AMP_BUILD_TESTS)
     tests/test_main.cpp
     tests/test_gguf.cpp
     tests/test_plan.cpp
+    tests/test_preflight.cpp
   )
-  target_link_libraries(amp_tests PRIVATE amp_plan)
+  # amp_preflight, not just amp_plan: the "never override an explicit flag" guarantee is a hard
+  # constraint and needs a test. It pulls in llama-common, which the test binary needs anyway to
+  # construct a common_params the way common_params_parse would leave one.
+  target_link_libraries(amp_tests PRIVATE amp_preflight)
   target_include_directories(amp_tests PRIVATE tests)
   target_compile_options(amp_tests PRIVATE -Wall -Wextra -Wno-unused-parameter)
   add_test(NAME amp_tests COMMAND amp_tests)
