@@ -44,17 +44,55 @@ It plans its own memory layout, warms the page cache (about 5 s for 9.6 GiB), th
 Aliases without the `/v1` prefix are registered too. `--api-key KEY` (or `--api-key-file`) requires
 `Authorization: Bearer`. Useful flags: `--parallel N` (extra sequences, costs KV), `--gpu-layers N` /
 `--ubatch N` (override the plan), `--no-warm` (start fast, first request slow), `--n-predict N`
-(default `max_tokens`).
+(default `max_tokens`), `--reasoning-budget N` (see below).
+
+### Thinking models: what this one supports
+
+It is a reasoning model, and its template is unusual in a way that breaks naive servers. The rendered
+generation prompt ends **inside** a think block — `<|im_start|>assistant\n<think>\n` — so the model
+reasons before answering and *never emits the opening tag*. `GET`/`POST /apply-template` shows you
+exactly what will be evaluated; use it whenever a turn misbehaves.
+
+| capability | how | status in amp |
+|---|---|---|
+| thinking on/off | `chat_template_kwargs: {"enable_thinking": false}` | wired, **but not taking effect** — see below |
+| preserve reasoning in history | `preserve_thinking` (llama.cpp calls it `preserve_reasoning` and maps it) | current turn is preserved automatically by the template; older turns need the flag |
+| reasoning field names accepted from a client | `reasoning_content`, `reasoning_text`, `reasoning` | all three |
+| thinking budget | `--reasoning-budget N`, or `reasoning_budget_tokens` per request: `-1` unrestricted (default), `0` close immediately, `N` tokens | works, off by default |
+| `reasoning_format` (`none`/`auto`/`deepseek`/`deepseek-legacy`) | request field | **not implemented**; amp always behaves like `deepseek` |
+| `reasoning_effort` | request field | template does not implement it |
+| tool calls | the template renders `tool_calls` | rendered into the prompt; **no structured `tool_calls` in responses yet** |
+
+`--reasoning-budget` is llama.cpp's mechanism (`common_reasoning_budget_init`), armed by replaying the
+prefill tokens through the sampler. It is off by default on purpose: forcing a close mid-thought makes
+this quant loop (`2+2 = 4. </think> 2+2 = 4. </think> ...`), so it would trade a parsing bug for a
+generation bug. `--reasoning-budget -1` restores unrestricted thinking.
+
+**Known issue:** `enable_thinking: false` does not currently change the rendered prompt — it stays
+`<|im_start|>assistant\n<think>\n`. It is routed through the field llama.cpp reads
+(`common_chat_templates_inputs::enable_thinking`, because `chat-auto-parser-helpers.cpp:322` overwrites
+the kwarg), so the remaining cause is the autoparser's reasoning-mode detection pinning the open tag.
+Verified with `/apply-template`, not assumed.
+
+### Concurrency
+
+One generation at a time, by design: a `llama_context` is not reentrant, and OpenCode issues a side
+request (conversation title) while the main stream runs. Requests queue instead of racing — see
+section 7 of `smoke_server.py`. On the pre-task-queue build, four concurrent streams returned zero bytes
+each and the process died.
 
 Point OpenCode at it by setting `baseURL` to `http://127.0.0.1:8081/v1` in
 `~/.config/opencode/opencode.json`.
 
 Check a running server end to end — health, raw completion, chat, the agentic prefix-cache pattern,
-divergence, streaming, error handling:
+divergence, streaming, errors, **a prompt longer than the ubatch**, **the reasoning split**, and
+**four concurrent streams**:
 
 ```bash
 ./scripts/smoke_server.py --url http://127.0.0.1:8081
 ```
+
+Seven sections; the last three are regression tests for bugs that reached real use.
 
 Every answer carries `amp_timings`, including `prompt_cached` and `cache_rewound_exactly`, so you can
 tell a cache hit from a re-evaluation instead of guessing from a pause. `GET /props` shows the

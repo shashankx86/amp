@@ -78,12 +78,46 @@ The `IoMode` distinction is deliberate and load-bearing:
 5. **Bounded everything.** Queues, in-flight bytes, and thread pools all have explicit limits;
    unbounded prefetch on a 6 GB box is how you get an OOM instead of a speedup.
 
-## Planned modules (not yet written)
+### amp_runtime
 
-- `amp_backend` — compute backend abstraction over ggml (CPU, CUDA), with the VRAM planner feeding
-  buffer placement decisions.
-- `amp_runtime` — tokenization, the 40-block forward (attention + SSM + MoE), KV/SSM state,
-  expert-major scheduling, sampler.
-- `amp_server` — OpenAI-compatible HTTP API, slot prompt cache (token-level prefix matching),
-  context checkpoints, and the `reasoning_content` / `reasoning_text` alias fix that makes OpenCode
-  clients stop re-evaluating whole tool-call turns.
+The forward path (`amp-infer`) and the two pieces of state that make a server viable.
+
+- `model_runtime.cpp` — tokenize, embed, 40 blocks (30 recurrent + 10 attention), sample. Uses the
+  legacy `llama_batch` API; the prefetcher walks expert ranges ahead of the compute thread.
+- `buft_overrides.{h,cpp}` — builds the null-terminated `tensor_buft_overrides` array that pins
+  `ffn_*_exps.weight` to the CPU for the layers the plan left there (the `-ncmoe` equivalent).
+  One helper, because a missing sentinel is a segfault and two call sites had it.
+- `prefix_cache.{h,cpp}` — token-level longest-common-prefix matching across sequences, with
+  **prompt-boundary checkpoints**: the sequence state is snapshotted at the end of the prompt and
+  restored after generation, because 30 of this model's 40 layers are recurrent and cannot be rewound.
+
+### amp_server
+
+The HTTP layer, the engine, and the OpenAI translation.
+
+- `http_server.cpp` — HTTP/1.1 with chunked framing, a small thread pool, SSE. Written from scratch;
+  ~400 lines is cheaper than a dependency in a project that vendors exactly one C++ library.
+- `task_queue.cpp` — **one worker, FIFO**. A `llama_context` is not reentrant, and agentic clients put
+  two requests in flight at once (OpenCode asks for a conversation title while the main stream runs).
+  Serialization lives inside `InferenceService::generate()` so no handler path can bypass it.
+- `service.cpp` — owns the model, the context, the sequences, the prefix cache and the chat templates.
+  Runs one generation at a time, warms the page cache at start-up, verifies VRAM after context init and
+  backs the ubatch off until it fits.
+- `openai_api.cpp` — request/response translation. Shapes are copied field for field from
+  `tools/server/server-task.cpp`: the chunk envelope including `system_fingerprint`, the
+  `stream_options.include_usage` trailing chunk with empty `choices`, and OpenAI's error `type`
+  strings. A stream always ends with a `finish_reason` and then `[DONE]`, including on failure.
+
+### amp_util additions
+
+- `json.{h,cpp}` — minimal JSON, with every converting constructor explicit (see AGENT.md for the bug
+  that forced it).
+- `text.{h,cpp}` — `normalize_reasoning`, so a client that echoes a tagged `<think>...</think>` block
+  cannot make the re-rendered prompt diverge on every turn.
+
+## Known duplication
+
+`ModelRuntime` (CLI) and `InferenceService` (server) are two implementations of the same forward loop:
+the CLI has the prefetcher, the server has the cache and the task queue. Deliberate — the server was
+built against the reference implementation rather than by refactoring a benchmark harness — and it is
+the first thing to fix now that both are proven.

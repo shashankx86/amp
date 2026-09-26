@@ -28,9 +28,23 @@ changing the numbers.
 | M3b quality parity | done — bit-deterministic, no algorithmic difference |
 | M4 GPU offload of dense + N expert layers | done — expressed through `tensor_buft_overrides` |
 | M5 page-cache warm at start-up | done — 9.6 GiB in ~4 s, 2-3 GiB/s |
-| M6 server (OpenAI API, prefix cache, checkpoints) | done — `amp-server` |
+| M6 server (OpenAI API, prefix cache, checkpoints) | done — `amp-server`, 35 t/s decode at 200k |
+| M6b concurrency + streaming correctness | done — one-worker task queue, always-finished streams |
 | M3c own graph (observable router) | next — needed to prefetch the 8 active experts per layer |
 | M7 decode optimization | planned |
+
+## Thinking models
+
+This is a reasoning model: the chat template's generation prompt ends *inside* a `<think>` block, so
+the model reasons before answering and never emits the opening tag. amp therefore
+
+- reads the client's reasoning from `reasoning_content`, `reasoning_text` **and** `reasoning` — the
+  alias llama.cpp ignores, which makes OpenCode re-evaluate whole tool-call turns;
+- separates reasoning from content with tags matched whitespace-tolerantly, in responses and streams;
+- offers llama.cpp's reasoning budget (`--reasoning-budget`, `reasoning_budget_tokens`), off by
+  default because this quant tends to loop after a forced close.
+
+What the model's template supports, and what amp does not implement yet, is listed in `RUNNING.md`.
 
 ## Tools
 

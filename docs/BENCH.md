@@ -257,3 +257,79 @@ prompt with the same cache state: **35.25 t/s is 7.4x that.**
    predicted decode than g=4 (10.90 GiB, fully resident).
 4. **The ubatch backoff stopped at its floor while VRAM was still over budget**, accepting a context
    with 119 MiB free. It now says so explicitly and names the flags that would fix it.
+
+## 2026-09-26 — serving correctness, measured
+
+Reproduce: `./scripts/build.sh`, start `amp-server`, then `python3 scripts/smoke_server.py --url ...`.
+Sections 6b, 6c and 7 are the regression tests; each fails on the build that preceded its fix.
+
+### Concurrency: the failure and the fix
+
+A `llama_context` is not reentrant. Before the task queue, four concurrent requests produced:
+
+| stream | bytes | finish_reason | `[DONE]` | server |
+|---|---|---|---|---|
+| main (150 tok) | 0 | 0 | 0 | dead |
+| side ×3 | 0 | 0 | 0 | dead |
+
+After, one worker with a FIFO queue:
+
+| stream | chunks | finish_reason | `[DONE]` |
+|---|---|---|---|
+| main (120 tok) | 123 | `length` | yes |
+| side0/1/2 (10 tok) | 10 each | `length` | yes |
+
+Queue stats afterwards: `posted=10 done=10 failed=0 depth=0`. The process stayed up. Cost of
+serialization: a side request waits for the main stream, same as `llama-server --parallel 1`.
+
+### Prefill across ubatches
+
+`llama_process()` asserts a batch is no larger than `n_ubatch`; unsplit, every prompt over the ubatch
+failed with `prefill batch full at token 2048` and a 500. After splitting in `n_ubatch`-sized chunks:
+
+| request | prompt tokens | result |
+|---|---|---|
+| `/v1/completions`, 4000-word prompt | 4001 | 807 t/s prefill |
+| `/v1/chat/completions`, 4000-word history | 4010 | 825 t/s prefill |
+
+(The rate is high because the prompt is one repeated word — almost no real compute. The number that
+matters here is that 4000+ tokens complete at all.)
+
+### Reasoning split, and the thinking budget
+
+Same request, three configurations, 200k-capable server at `--ctx 32768`:
+
+| configuration | content | reasoning_content |
+|---|---|---|
+| default (thinking on), 200 tokens | `"\n\n4"` | 141 chars — the model thought, then answered |
+| default, 32-token "title" request | `""` | 13 chars — spent the budget thinking, no content |
+| `enable_thinking: false`, 24 tokens | `"Fixing a Segmentation Fault"` | `""` |
+
+Two findings:
+
+- **The split must start "inside" the block.** The template's generation prompt ends with `<think>\n`,
+  so the model never emits the opening tag and a tag-triggered split never fires. That is how a
+  conversation title came back as *"The user said \"hi\". This is a short, conversational greeting.
+  According to the rules, I should cr..."* — a chain of thought delivered as the answer.
+- **The closing tag arrives with variable whitespace**: `\n</think>` naturally, `</think>` when the
+  budget forces it. Matching only the exact string silently puts the answer in `reasoning_content`.
+
+**Forcing a close makes this quant loop.** With `reasoning_budget_tokens` at 16 or 75, a 150-token
+answer came back as `2+2 = 4.\n</think>\n\n2+2 = 4.\n</think>\n\n2+2 = 4...` repeated. The budget is
+therefore implemented (llama.cpp's sampler, armed by replaying the prefill) but **off by default**, and
+`enable_thinking: false` is the supported way to get a direct answer. Measured cost of the decision:
+one wasted iteration each way, versus shipping a generation change that alters every answer.
+
+### Steady state at 200k, warm requests
+
+Three identical requests on one server (`--ctx 200000`, planner's choice: 4 expert layers on the GPU,
+ubatch 1024, 10.90 GiB warmed in 3.7 s):
+
+| request | decode | prefill | prefix cached |
+|---|---|---|---|
+| 1st | 11.35 t/s | 2.3 t/s | 0 |
+| 2nd | 32.90 t/s | 22.4 t/s | 17 |
+| 3rd | 35.25 t/s | 27.3 t/s | 17 |
+
+Against the `llama-server` baseline's 4.76 t/s on the same prompt and cache state, that is **7.4x**.
+Report a sequence, never a single request.

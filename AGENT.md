@@ -115,6 +115,30 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
       two copies of the same loop today: the CLI has the prefetcher, the server has the cache. This is
       known duplication, deliberately left until the server is proven, and it is the first thing to fix.
 
+## What this model's reasoning surface actually is
+
+From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/server-task.cpp`:
+
+- **Generation starts inside a think block.** `{%- if enable_thinking is defined and enable_thinking is
+  false %}` → `<think>\n\n</think>\n\n` (pre-closed, answer directly); else `<think>\n`.
+- **`preserve_thinking`** decides whether an assistant turn's reasoning is re-rendered; the template
+  *also* preserves anything after `ns.last_query_index` automatically, so the current turn needs no flag.
+  llama.cpp's public name for this is `preserve_reasoning`, mapped onto the real variable names by
+  `jinja::caps_apply_preserve_reasoning` (which also derives `clear_thinking`,
+  `truncate_history_thinking`, `drop_thinking`). Setting the raw name as a kwarg skips that mapping.
+- **`reasoning_content`** is accepted on assistant messages; if absent, the template splits it out of
+  `content` itself on `</think>`. Both conventions round-trip.
+- **Not supported by the template:** `reasoning_effort` / `reasoning_strength`.
+- **Tool calls** are rendered by the template; amp does not yet emit structured `tool_calls`.
+- **API-level variants** (llama.cpp): `reasoning_format` ∈ `none` | `auto` | `deepseek` |
+  `deepseek-legacy`; `reasoning_budget_tokens` / `thinking_budget_tokens` / `--reasoning-budget`
+  (`-1` unrestricted, `0` immediate, `N`); `reasoning_budget_message`; `reasoning_control`.
+- **Unresolved:** `enable_thinking: false` does not change the render even when routed through
+  `common_chat_templates_inputs::enable_thinking` (which is the field the value comes from, since
+  `chat-auto-parser-helpers.cpp:322` overwrites the kwarg). The specialized-template path is not
+  involved — it only handles Ministral Large 3 and GPT-OSS — so it is the autoparser's reasoning-mode
+  detection. Do not retry the kwargs route; check the autoparser.
+
 ## Thinking-model rules learned the hard way (this template, this quant)
 
 - **The generation prompt ends *inside* a reasoning block.** `/apply-template` shows the rendered
