@@ -1,0 +1,32 @@
+{
+  "tag": "amp-server 200k",
+  "url": "http://127.0.0.1:8081",
+  "prompt_file": "/tmp/opencode/amp_bench_prompt.txt",
+  "n_predict": 64,
+  "rows": [
+    {
+      "request": 1,
+      "wall_s": 53.26,
+      "prompt_tokens": 18265,
+      "prefill_tps": 359.10699164699247,
+      "generated": 64,
+      "decode_tps": 28.103972206509773
+    },
+    {
+      "request": 2,
+      "wall_s": 2.46,
+      "prompt_tokens": 4,
+      "prefill_tps": 27.338463851716174,
+      "generated": 64,
+      "decode_tps": 28.85182116816902
+    },
+    {
+      "request": 3,
+      "wall_s": 2.23,
+      "prompt_tokens": 4,
+      "prefill_tps": 30.014481987558995,
+      "generated": 64,
+      "decode_tps": 30.432239237976734
+    }
+  ]
+}

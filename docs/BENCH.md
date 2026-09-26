@@ -438,3 +438,65 @@ llama.cpp's default layout" is guaranteed to diverge and is not a quality test. 
 first, then compare. The 0.012 at position 0 is also the right order of magnitude for placement
 drift, which is a useful sanity check that the two captures differ for the stated reason and no
 other.
+
+## 2026-09-26 — post-swap benchmark: the 7.4x decode claim does not reproduce
+
+The goal was explicit about this: re-measure decode on the new server rather than assume the
+previously recorded 35.25 t/s carried over. It does not, and neither does the 7.4x.
+
+`scripts/bench_server.py`, 52,442-char prompt (18,265 tokens), `n_predict=64`, `temperature 0`,
+5 identical requests per engine, same machine, same session, alternating which engine went first.
+Rates are the server's own `timings` object.
+
+| engine | request 1 | steady decode (requests 2-5) | plan |
+|---|---|---|---|
+| `amp-server` | 26.01 t/s | **28.39 t/s** (29.18 / 28.70 / 28.09 / 28.04) | g=4, ubatch 1024, 10.90 GiB CPU set |
+| `llama-server` (documented best) | **1.96 t/s** | **30.05 t/s** (29.05 / 30.12 / 30.10 / 29.99) | `-ncmoe 38`, ubatch 2048, ~11.5 GiB CPU set |
+
+### The correction
+
+**At steady state the two engines are the same, within noise** — amp 28.39 t/s vs llama-server
+30.05 t/s, and llama-server is if anything ~6 % ahead on this particular run. The previously
+recorded "35.25 t/s vs 4.76 t/s = 7.4x" compared **amp's warm state against llama-server's cold
+one**. That is precisely the mistake this file's own methodology section warns against, and it
+was committed anyway. `28.39 t/s` is inside the range `AGENT.md` already recorded for this box
+("10.25 GiB of CPU experts -> 25.6-29.9 t/s"); the 35.25 figure was the outlier, not the norm.
+
+### What amp's plan actually buys
+
+Not raw steady-state decode. **Graceful degradation, and a working set that fits.**
+
+`llama-server`'s documented best config puts ~11.5 GiB of expert weights on the CPU, which does
+not fit the ~10.9 GiB the page cache can actually hold, so it thrashes: **1.96 t/s** on its first
+request, then recovers once the OS has pulled the set in. amp's plan keeps the CPU expert set at
+10.90 GiB, inside the budget, and never collapses — 26.01 t/s on its very first request, then
+28-29 t/s.
+
+That difference is worth having: a cold or contended cache costs llama-server 15x on the first
+request and costs amp nothing. It is also the *whole* mechanism behind the "10x decode cliff" in
+`AGENT.md`, now observed directly rather than inferred.
+
+The honest summary: **amp is not faster than a correctly-configured llama-server at steady state.
+It is faster when the page cache is under pressure, which on a 14 GiB box is most of the time.**
+
+### Two preflight bugs this benchmark exposed
+
+Both were invisible until the plan was run at 200k and compared against `amp-plan`:
+
+1. **The plan ignored the user's `-c`** (fixed earlier): planning for 200k while serving 32k
+   reserved 1.55 GiB of KV for a 260 MiB cache. Cost 4 GPU expert layers at `-c 32768`.
+
+2. **The plan computed KV at f16 while the server ran q8_0/q4_0.** llama.cpp's field default is
+   F16 (`common/common.h:587-588`), the preflight read `params.cache_type_*` for planning, and
+   only later overwrote them with the measured q8_0/q4_0 baseline (Rule 5). f16 KV is **2.46x**
+   the bytes, so at 200k the plan reserved 3.81 GiB for a 1.55 GiB cache. Measured at `-c 200000`:
+
+       before   g=0  ubatch 384  kv=3.81 GiB (planned)  predicted 1.9 t/s decode
+       after    g=4  ubatch 1024 kv=1.55 GiB (actual)   predicted 15.5 t/s decode
+
+   That is a 2.7x smaller ubatch and all four GPU expert layers, from a planning input that
+   disagreed with the configuration being applied. The rule now plans with the dtypes that will
+   actually be in effect, using the same user-intent test as the rule that applies them.
+
+Both bugs made the plan *pessimistic*, so they cost performance without ever causing a wrong
+answer — which is the dangerous class of bug, because nothing fails loudly.

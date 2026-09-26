@@ -256,16 +256,23 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
              " tokens (not the " + std::to_string(opts.n_ctx) + " default)");
     }
     po.n_ctx   = plan_ctx;
-    // Likewise the KV dtypes: params.cache_type_{k,v} is what the context will really be
-    // created with, having folded in -ctk/-ctv and LLAMA_ARG_CACHE_TYPE_K/V. Planning with
-    // the defaults instead would under- or over-state the KV budget - and for a request as
-    // ordinary as "-ctv q8_0" that is the difference between fitting and not.
-    po.cache_k = from_ggml(params.cache_type_k);
-    po.cache_v = from_ggml(params.cache_type_v);
-    if (po.cache_k != opts.cache_k || po.cache_v != opts.cache_v) {
+    // The KV dtypes must be the ones that will ACTUALLY be in effect after every rule has run,
+    // not the ones currently sitting in params. Rule 5 (below) overwrites params.cache_type_{k,v}
+    // with q8_0/q4_0 unless the user pinned them, and llama.cpp's field default is F16
+    // (common/common.h:587-588) - so reading params before Rule 5 plans against f16.
+    //
+    // That is not a rounding error. f16 KV is 2.46x the bytes of q8_0/q4_0, so at 200k context
+    // the plan reserved 3.81 GiB of VRAM for a cache that is really 1.55 GiB. Measured cost at
+    // -c 200000: 4 GPU expert layers and a 2.7x smaller ubatch (g=4/ubatch 1024 -> g=0/ubatch 384).
+    //
+    // So: honour the user's -ctk/-ctv when present, otherwise plan with the default we are about
+    // to apply. This is the same user-intent test Rule 5 uses, deliberately, so the plan and the
+    // applied configuration cannot disagree.
+    po.cache_k = f.ctk ? from_ggml(params.cache_type_k) : opts.cache_k;
+    po.cache_v = f.ctv ? from_ggml(params.cache_type_v) : opts.cache_v;
+    if (f.ctk || f.ctv) {
         note("plan against the requested KV dtypes: " + std::string(ggml_type_name(params.cache_type_k)) +
-             "/" + std::string(ggml_type_name(params.cache_type_v)) + " (not the " +
-             to_string(opts.cache_k) + "/" + to_string(opts.cache_v) + " default)");
+             "/" + std::string(ggml_type_name(params.cache_type_v)));
     }
     if (f.ub) {
         const char * v = argv_value(argv, "-ub");

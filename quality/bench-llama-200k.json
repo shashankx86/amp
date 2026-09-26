@@ -1,0 +1,32 @@
+{
+  "tag": "llama-server 200k (documented best config)",
+  "url": "http://127.0.0.1:8099",
+  "prompt_file": "/tmp/opencode/amp_bench_prompt.txt",
+  "n_predict": 64,
+  "rows": [
+    {
+      "request": 1,
+      "wall_s": 115.66,
+      "prompt_tokens": 18265,
+      "prefill_tps": 219.25267524575838,
+      "generated": 64,
+      "decode_tps": 1.9578206497683543
+    },
+    {
+      "request": 2,
+      "wall_s": 5.07,
+      "prompt_tokens": 4,
+      "prefill_tps": 3.104009138202903,
+      "generated": 64,
+      "decode_tps": 17.231843790874343
+    },
+    {
+      "request": 3,
+      "wall_s": 2.31,
+      "prompt_tokens": 4,
+      "prefill_tps": 30.320027894425667,
+      "generated": 64,
+      "decode_tps": 29.237377806324186
+    }
+  ]
+}
