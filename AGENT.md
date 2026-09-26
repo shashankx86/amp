@@ -121,9 +121,14 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
       prefetched during decode (the only remaining decode win; impossible through `llama.h`)
 - [ ] M7 close the gap between amp's decode and the measured ceiling (25.6 t/s was with a plan chosen
       for 6 GPU expert layers; the server currently plans 8 at short ctx)
-- [ ] Fold `InferenceService`'s forward path and `ModelRuntime`'s into one implementation. They are
-      two copies of the same loop today: the CLI has the prefetcher, the server has the cache. This is
-      known duplication, deliberately left until the server is proven, and it is the first thing to fix.
+- [x] Fold the two forward paths into one — resolved by deletion rather than refactoring. The server
+      (`InferenceService`) is gone; `amp-server` is llama.cpp's server. `ModelRuntime` survives as
+      `amp-infer`, the measurement harness, because it has the prefetcher and can be A/B'd against
+      the server without a network round trip. The duplication was a symptom of maintaining our own
+      server, and it went away with it.
+- [x] Server: replace the hand-rolled one with llama.cpp's. 40+ routes, 100% of the flag surface,
+      `docs/PARITY.md` as the contract, `scripts/parity_test.py` as the test (15 sections pass,
+      8 features honestly skipped). Measured bit-identical to upstream at matched placement.
 
 ## What this model's reasoning surface actually is
 
@@ -193,11 +198,22 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
 - **A `llama_context` is not reentrant.** Two generations on one context corrupt the KV and the
   sampler, and the process dies inside `ggml_abort` — every in-flight stream returns zero bytes. This
   is not hypothetical: OpenCode issues a side request (conversation title) while the main stream is
-  running, on a second connection, and my HTTP layer happily served both on one context. Fixed with
-  `amp::TaskQueue` (one worker, FIFO), and `InferenceService::generate()` is now serialized *inside*
-  the service so no handler path can forget. Reproduce with section 7 of
-  section 14 of `scripts/parity_test.py`; before the fix all four streams were empty and the
-  server was dead.
+  running, on a second connection. Our HTTP layer happily served both on one context; four concurrent
+  streams returned zero bytes each and the process died.
+
+  Fixed in the hand-rolled server with `amp::TaskQueue` (one worker, FIFO), which no longer exists.
+  What handles it now is llama.cpp's slot model plus our `n_parallel = 1` default — see the next
+  bullet, which is the more important half of the lesson. Regression test: section 14 of
+  `scripts/parity_test.py`.
+- **Concurrent slots are not free, and on this model they are actively destructive.**
+  `llama-server` defaults `n_parallel = -1` ("auto", `common/arg.cpp:1400`), which
+  `tools/server/server.cpp:156-159` expands to **four** concurrent slots with `kv_unified`. Every
+  concurrent generation wants the same shared ~10.9 GiB CPU expert set, and on a box with ~10.9 GiB
+  of usable page cache that is not sharing, it is thrashing: measured **0.64 t/s** with two slots
+  active against 28.4 t/s with one — a 44x collapse, found only by running the OpenCode harness
+  (it stalled ~50 min on one prompt). The preflight now sets `n_parallel = 1` unless `--parallel N`
+  is passed. General rule: **on a model whose decode is bound by a working set larger than cache,
+  "parallel" slots divide a fixed resource and the default must be 1.**
 - **A stream must always end with `finish_reason`, then `[DONE]`.** Otherwise the Vercel AI SDK
   reports "OpenAI Chat stream ended without finish_reason" and retries forever, which presents as a
   mysterious hang rather than an error. On failure amp now sends the error object *and* a proper
@@ -230,8 +246,10 @@ These are llama.cpp's own defaults, not amp's, and each is a way to OOM or thras
 - **A recurrent state cannot be partially erased.** `llama_memory_seq_rm` only rewinds one through a
   bounded snapshot ring (`n_rs_seq`, 62.81 MiB of VRAM *per snapshot*, 0 by default) and for M-RoPE
   models the position check then aborts the decode outright. Any design that assumes "truncate the KV
-  to the common prefix" is broken on this model — see the prompt-boundary checkpoint in
-  `include/amp/runtime/prefix_cache.h`.
+  to the common prefix" is broken on this model. Our prompt-boundary checkpoint was a workaround and
+  is deleted; llama.cpp solves it properly by asking the model what it supports via
+  `common_context_seq_rm_type` (`common/common.h:989-992`) and falling back to a full re-process
+  (`tools/server/server-context.cpp:3379`).
 - **`llama_memory_seq_pos_max` returns a position index, not a count.** 25 cached tokens report 24.
   Verifying a rewind against a token count silently "succeeds" on a rewind that never happened; this
   cost a real position-continuity abort before it was found.
