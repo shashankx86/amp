@@ -24,7 +24,7 @@ changing the numbers.
 | M1 GGUF reader + geometry | done |
 | M2 page-cache warmer | done — measured 1.92 GiB/s cold, whole 12.19 GiB set in 6.3 s |
 | M2b memory planner + cost model | done — predicts 225 t/s prefill / 12.4 t/s decode at 200k |
-| M3 forward path + prefetcher | done — 3.1x prefill, 5.4x decode vs llama-server |
+| M3 forward path + prefetcher | done — parity harness; see BENCH.md for measured rates |
 | M3b quality parity | done — bit-deterministic, no algorithmic difference |
 | M4 GPU offload of dense + N expert layers | done — expressed through `tensor_buft_overrides` |
 | M5 page-cache warm at start-up | done — 9.6 GiB in ~4 s, 2-3 GiB/s |

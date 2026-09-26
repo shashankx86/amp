@@ -39,9 +39,19 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - KV cache is **8320 B/token** at k=q8_0/v=q4_0 → 1.55 GiB at 200k, 0.51 GiB at 65k.
 - The planner independently reproduces the measured llama.cpp optimum (large ubatch beats GPU
   expert residency) and predicts **240 t/s prefill / 16.4 t/s decode** at 200k with prefetching.
-- **Head-to-head vs llama-server (best config, same prompt, same cache state): 3.1x prefill
-  (104.4 vs 34.1 t/s) and 5.4x decode (25.6 vs 4.76 t/s).** The win is the plan (6 expert layers on
-  the GPU -> 10.25 GiB CPU set that fits the cache), amplified by the prefetcher.
+- **Head-to-head vs llama-server, MEASURED AGAIN 2026-09-26 and CORRECTED.** The old claim was
+  3.1x prefill and 5.4x decode (25.6 vs 4.76 t/s). Re-measured with 5 identical requests per
+  engine, alternating order, rates from each server's own `timings`:
+
+  | engine | request 1 | steady decode |
+  |---|---|---|
+  | amp-server | 26.01 t/s | **28.39 t/s** |
+  | llama-server (documented best) | **1.96 t/s** | **30.05 t/s** |
+
+  **At steady state they are the same, within noise.** The old 5.4x compared amp's warm state
+  against llama-server's cold one. 28.39 t/s is inside the 25.6-29.9 t/s range already recorded
+  below; 35.25 t/s was the outlier. Do not quote a speedup over llama-server — it does not
+  reproduce. See docs/BENCH.md, "the 7.4x decode claim does not reproduce".
 - **Decode has a 10x cliff, not a slope**: 10.25 GiB of CPU experts -> 25.6-29.9 t/s, 11.54 GiB ->
   2.8-4.8 t/s. Cyclic scan + LRU means exceeding the cache by 1.3 GiB collapses reuse. Modelled as a
   cliff, and `amp-plan` prints "tg now" next to "tg t/s".
