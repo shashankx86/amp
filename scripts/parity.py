@@ -54,7 +54,7 @@ def load_logprobs(path):
 
 def run_amp(tag, g=6, ubatch=1024):
     lp, txt = f"{OUT}/amp_{tag}.tsv", f"{OUT}/amp_{tag}.txt"
-    subprocess.run([os.path.join(ROOT, "build/amp-infer"), "--model", MODEL, "--prompt", PROMPT,
+    subprocess.run([os.path.join(ROOT, "build/bin/amp-infer"), "--model", MODEL, "--prompt", PROMPT,
                     "--n-predict", str(N), "--ctx", "16384", "--temp", "0",
                     "--ubatch", str(ubatch), "--gpu-layers", str(g),
                     "--dump-logprobs", lp, "--dump-output", txt],

@@ -52,9 +52,11 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 
 ## Architecture decisions already made
 
-1. **Reuse ggml kernels from the local llama.cpp build** (`../llama.cpp/build/bin/libggml*.so`). This makes
-   "zero quality loss" structurally guaranteed: the math is literally the same code. amp replaces the
-   *runtime*, not the arithmetic.
+1. **Reuse ggml kernels by vendoring llama.cpp** (`third_party/llama.cpp`, pinned in
+   `third_party/DEPS.lock`, fetched by `scripts/fetch_deps.sh`, built from source and linked
+   statically into `build/bin`). This makes "zero quality loss" structurally guaranteed: the math is
+   literally the same code. amp replaces the *runtime*, not the arithmetic. Static linking also means
+   no RPATH into someone else's build tree and no `LD_LIBRARY_PATH`.
 2. **Memory planning is the product.** The bottleneck is not FLOPs, it is that a 12.19 GiB expert working
    set is cyclically scanned through a ~11.5 GiB page cache. Wins come from residency control and
    I/O-compute overlap, not from new math.
@@ -100,8 +102,40 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - [x] M1 GGUF header reader + geometry (validated against measured byte counts)
 - [x] M2 page-cache warmer (measured: 1.92 GiB/s, 12.19 GiB in 6.3 s)
 - [x] M2b cost model + memory planner (predicts 225 t/s / 12.4 t/s at 200k)
-- [ ] M3 forward path: tokenize -> embed -> 40 blocks -> output, CPU-only, bit-comparable to llama.cpp
-- [ ] M4 GPU offload of attention/SSM + N expert layers, with the VRAM planner
-- [ ] M5 expert-major async prefetch overlapping I/O with compute
-- [ ] M6 server: OpenAI-compatible API, slot prompt cache, context checkpoints, reasoning alias fix
-- [ ] M7 decode optimization (the other half of the product: 11-14 t/s today)
+- [x] M3 forward path + prefetcher + VRAM verification (`amp-infer`)
+- [x] M4 GPU offload expressed through the public `tensor_buft_overrides` API (= `-ncmoe`)
+- [x] M5 page-cache warming at start-up; decode-time prefetch of active experts **removed** on purpose
+- [x] M6 server: OpenAI-compatible API, SSE, token-level prefix cache, prompt-boundary checkpoints,
+      reasoning alias fix — `amp-server`, driven by `scripts/smoke_server.py`
+- [ ] M3c amp's own ggml graph, so the router is observable and the 8 active experts per layer can be
+      prefetched during decode (the only remaining decode win; impossible through `llama.h`)
+- [ ] M7 close the gap between amp's decode and the measured ceiling (25.6 t/s was with a plan chosen
+      for 6 GPU expert layers; the server currently plans 8 at short ctx)
+- [ ] Fold `InferenceService`'s forward path and `ModelRuntime`'s into one implementation. They are
+      two copies of the same loop today: the CLI has the prefetcher, the server has the cache. This is
+      known duplication, deliberately left until the server is proven, and it is the first thing to fix.
+
+## Facts about this model that are easy to get wrong
+
+- **30 of the 40 layers are recurrent** (linear attention / SSM), only 10 use the KV cache. That is
+  why the KV is 8320 B/token and why the recurrent state is a flat 62.81 MiB (40 layers, f32, 1 cell).
+- **A recurrent state cannot be partially erased.** `llama_memory_seq_rm` only rewinds one through a
+  bounded snapshot ring (`n_rs_seq`, 62.81 MiB of VRAM *per snapshot*, 0 by default) and for M-RoPE
+  models the position check then aborts the decode outright. Any design that assumes "truncate the KV
+  to the common prefix" is broken on this model — see the prompt-boundary checkpoint in
+  `include/amp/runtime/prefix_cache.h`.
+- **`llama_memory_seq_pos_max` returns a position index, not a count.** 25 cached tokens report 24.
+  Verifying a rewind against a token count silently "succeeds" on a rewind that never happened; this
+  cost a real position-continuity abort before it was found.
+- **BPE merges across the prompt boundary.** The next turn's rendering splits the cached prompt's last
+  token differently, so the common prefix is routinely *one* token short of the prompt end. The
+  checkpoint therefore sits one token before the end and recomputes that token.
+- **The chat template owns the thinking tags** and renders `<think>
+` as the generation prompt, so the
+  model reasons by default. The value stored for an assistant turn is the *inner* text; see
+  `include/amp/util/text.h` for why accepting the tagged form matters.
+- **The extended batch API does not produce logits unless asked.** `llama_batch_ext_set_output_logits`
+  per token, then `llama_sampler_sample(smpl, ctx, idx)` with that idx. Passing `-1` with no output
+  token aborts inside `ggml_abort`.
+- **`tensor_buft_overrides` is walked until `pattern == nullptr`.** A missing sentinel reads past the
+  array end: a segfault in the tensor loader, or silent garbage in the CLI. One helper builds it now.

@@ -10,6 +10,8 @@ NPRED=${3:-48}
 MODEL=../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
 OUT=/tmp/opencode/quality
 PORT=8098
+# Only the llama-server *baseline* needs this; amp's own binaries are statically linked against the
+# vendored llama.cpp and have no shared-library dependencies.
 export LD_LIBRARY_PATH=../llama.cpp/build/bin
 mkdir -p "$OUT"
 
@@ -20,7 +22,7 @@ echo "### greedy, n_predict=$NPRED"
 echo
 
 echo "--- amp"
-./build/amp-infer --model "$MODEL" --prompt "$(cat "$OUT/prompt.txt")" --n-predict "$NPRED" \
+./build/bin/amp-infer --model "$MODEL" --prompt "$(cat "$OUT/prompt.txt")" --n-predict "$NPRED" \
   --ctx 32768 --temp 0 --top-k 0 --top-p 1.0 --ubatch 1024 --gpu-layers 6 \
   --dump-output "$OUT/amp.txt" 2>/dev/null | grep -E "prefill |decode "
 echo

@@ -5,6 +5,7 @@
 //   GET  /v1/models           model list
 //   GET  /props               amp diagnostics: the plan, the cache, VRAM/cache state
 //   POST /tokenize            token ids for a prompt (diagnostics and parity work)
+//   POST /apply-template      the rendered prompt for a set of messages
 //   POST /v1/completions       text completion   (alias: /completion)
 //   POST /v1/chat/completions chat completion    (alias: /chat/completions)
 #pragma once
@@ -31,6 +32,8 @@ private:
     static Status props(const http::Request & req, http::ResponseWriter & w,
                               InferenceService & svc);
     static Status tokenize(const http::Request & req, http::ResponseWriter & w,
+                                 InferenceService & svc);
+    static Status apply_template(const http::Request & req, http::ResponseWriter & w,
                                  InferenceService & svc);
     static Status completions(const http::Request & req, http::ResponseWriter & w,
                                     InferenceService & svc, const ServerConfig & cfg);

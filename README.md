@@ -26,24 +26,24 @@ changing the numbers.
 | M2b memory planner + cost model | done — predicts 225 t/s prefill / 12.4 t/s decode at 200k |
 | M3 forward path + prefetcher | done — 3.1x prefill, 5.4x decode vs llama-server |
 | M3b quality parity | done — bit-deterministic, no algorithmic difference |
-| M3c own graph (observable router) | next |
-| M4 GPU offload | planned |
-| M5 async expert prefetch | planned |
-| M6 server | planned |
+| M4 GPU offload of dense + N expert layers | done — expressed through `tensor_buft_overrides` |
+| M5 page-cache warm at start-up | done — 9.6 GiB in ~4 s, 2-3 GiB/s |
+| M6 server (OpenAI API, prefix cache, checkpoints) | done — `amp-server` |
+| M3c own graph (observable router) | next — needed to prefetch the 8 active experts per layer |
 | M7 decode optimization | planned |
 
 ## Tools
 
 ```bash
 # what the model is, what the box can do, and which configuration is predicted fastest
-./build/amp-plan --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
+./build/bin/amp-plan --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
 
 # head-to-head against llama-server on the same prompt, plus a logit-level quality diff
 ./scripts/head2head.sh /tmp/opencode/amp_bench_prompt.txt 128
 ./scripts/parity.py
 
 # make the hot bytes actually resident, and measure whether it worked
-./build/amp-warm --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf \
+./build/bin/amp-warm --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf \
                  --what experts --drop-cache --verify
 ```
 
@@ -53,13 +53,14 @@ Working rules and hard constraints: `AGENT.md`.
 ## Build and run
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DAMP_LLAMA_ROOT=../llama.cpp
+./scripts/fetch_deps.sh          # vendored llama.cpp at the pinned commit
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
 M=/home/e0u/localhost/models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-./build/amp-plan  --model $M                    # what the planner decided, and why
-./build/amp-warm  --model $M --what plan        # pull the expert set into the page cache
-./build/amp-infer --model $M --prompt "hi" -n 128
+./build/bin/amp-plan  --model $M                    # what the planner decided, and why
+./build/bin/amp-warm  --model $M --what plan        # pull the expert set into the page cache
+./build/bin/amp-infer --model $M --prompt "hi" -n 128
 ./scripts/head2head.sh                          # amp vs llama-server on the same prompt
 ./scripts/parity.py                             # quality parity, three ways
 ```

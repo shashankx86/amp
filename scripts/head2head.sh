@@ -7,6 +7,8 @@ cd "$(dirname "$0")/.."
 PROMPT=${1:-/tmp/opencode/amp_bench_prompt.txt}
 NPRED=${2:-64}
 MODEL=../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
+# Only the llama-server *baseline* needs this; amp's own binaries are statically linked against the
+# vendored llama.cpp and have no shared-library dependencies.
 export LD_LIBRARY_PATH=../llama.cpp/build/bin
 PORT=8099
 
@@ -15,12 +17,12 @@ echo
 
 # Both engines must face the same page-cache reality, so warm it first and say so.
 echo "--- warming the page cache (both engines get the same starting point)"
-./build/amp-warm --model "$MODEL" --what experts 2>/dev/null | grep -E "warmed|cache"
+./build/bin/amp-warm --model "$MODEL" --what experts 2>/dev/null | grep -E "warmed|cache"
 echo
 
 # ---------------------------------------------------------------- amp
 echo "--- amp (planner-chosen split, prefetch on)"
-./build/amp-infer --model "$MODEL" --prompt-file "$PROMPT" --n-predict "$NPRED" --ctx 200000 \
+./build/bin/amp-infer --model "$MODEL" --prompt-file "$PROMPT" --n-predict "$NPRED" --ctx 200000 \
   2>/dev/null | grep -E "plan:|prefill |decode "
 echo
 
