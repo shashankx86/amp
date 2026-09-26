@@ -90,6 +90,29 @@ UserFlags scan_user_flags(const std::vector<std::string> & argv) {
     return f;
 }
 
+// The planner budgets VRAM from CacheType, but the authoritative resolved value after
+// common_params_parse is a ggml_type. This is the reverse of to_ggml, and it must exist:
+// without it the planner sizes the KV cache with the default dtypes while the context is
+// actually created with whatever the user asked for, and the estimate is silently wrong.
+CacheType from_ggml(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F32:   return CacheType::kF32;
+        case GGML_TYPE_F16:   return CacheType::kF16;
+        case GGML_TYPE_BF16:  return CacheType::kBF16;
+        case GGML_TYPE_Q8_0:  return CacheType::kQ8_0;
+        case GGML_TYPE_Q5_1:  return CacheType::kQ5_1;
+        case GGML_TYPE_Q5_0:  return CacheType::kQ5_0;
+        case GGML_TYPE_Q4_1:  return CacheType::kQ4_1;
+        case GGML_TYPE_Q4_0:  return CacheType::kQ4_0;
+        case GGML_TYPE_Q4_K:  return CacheType::kQ4_K;
+        case GGML_TYPE_IQ4_NL:return CacheType::kIQ4_NL;
+        case GGML_TYPE_Q3_K:  return CacheType::kQ3_K;
+        case GGML_TYPE_Q2_K:  return CacheType::kQ2_K;
+        case GGML_TYPE_Q6_K:  return CacheType::kQ6_K;
+        default:              return CacheType::kF16;   // fp types have no fixed width
+    }
+}
+
 ggml_type to_ggml(CacheType t) {
     switch (t) {
         case CacheType::kF32:    return GGML_TYPE_F32;
@@ -233,8 +256,17 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
              " tokens (not the " + std::to_string(opts.n_ctx) + " default)");
     }
     po.n_ctx   = plan_ctx;
-    po.cache_k = opts.cache_k;
-    po.cache_v = opts.cache_v;
+    // Likewise the KV dtypes: params.cache_type_{k,v} is what the context will really be
+    // created with, having folded in -ctk/-ctv and LLAMA_ARG_CACHE_TYPE_K/V. Planning with
+    // the defaults instead would under- or over-state the KV budget - and for a request as
+    // ordinary as "-ctv q8_0" that is the difference between fitting and not.
+    po.cache_k = from_ggml(params.cache_type_k);
+    po.cache_v = from_ggml(params.cache_type_v);
+    if (po.cache_k != opts.cache_k || po.cache_v != opts.cache_v) {
+        note("plan against the requested KV dtypes: " + std::string(ggml_type_name(params.cache_type_k)) +
+             "/" + std::string(ggml_type_name(params.cache_type_v)) + " (not the " +
+             to_string(opts.cache_k) + "/" + to_string(opts.cache_v) + " default)");
+    }
     if (f.ub) {
         const char * v = argv_value(argv, "-ub");
         if (!v) {

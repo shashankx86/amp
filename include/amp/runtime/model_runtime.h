@@ -94,7 +94,9 @@ public:
     uint64_t total_bytes() const;
     uint64_t bytes_issued() const { return bytes_issued_; }
     uint64_t calls() const { return calls_; }
-    const WarmStats & warm_stats() const { return sched_->warm_stats(); }
+    // By value, not by reference: IReadScheduler::warm_stats() returns a WarmStats by value
+    // (stream_reader.h:61), so returning a const& to it would dangle.
+    WarmStats        warm_stats() const { return sched_->warm_stats(); }
 
 private:
     void submit(const ReadRange & r);

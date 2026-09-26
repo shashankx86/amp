@@ -2,6 +2,7 @@
 //
 //   ./build/amp-plan --model /path/to/model.gguf
 //   ./build/amp-plan --model ... --ctx 65536 --json
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,8 +56,10 @@ int main(int argc, char ** argv) {
     PlannerOptions opts;
     DeviceBudget   budget;
     bool           budget_overridden = false;
-    size_t         top              = 8;
     bool           json             = false;
+    // Rows of the candidate table to print. Was parsed from --top and then never read, so the
+    // documented flag silently did nothing.
+    size_t         top              = 8;
 
     const char * cache_k_str = nullptr;
     const char * cache_v_str = nullptr;
@@ -182,14 +185,15 @@ int main(int argc, char ** argv) {
         printf("    \"predicted_decode_tps\": %.2f\n", plan.predicted_decode_tps);
         printf("  },\n");
         printf("  \"candidates\": [\n");
-        for (size_t i = 0; i < plan.top_candidates.size(); i++) {
+        const size_t n_json = std::min(top, plan.top_candidates.size());
+        for (size_t i = 0; i < n_json; i++) {
             const auto & c = plan.top_candidates[i];
             printf("    {\"g\": %d, \"ubatch\": %lld, \"vram\": %lld, \"fits\": %s, "
                    "\"stream\": %lld, \"pp_tps\": %.1f, \"tg_tps\": %.1f, \"score\": %.3f}%s\n",
                    c.n_expert_layers_gpu, (long long) c.ubatch, (long long) c.vram_bytes,
                    c.fits ? "true" : "false", (long long) c.expert_bytes_stream,
                    c.predicted_prefill_tps, c.predicted_decode_tps, c.score,
-                   i + 1 < plan.top_candidates.size() ? "," : "");
+                   i + 1 < n_json ? "," : "");
         }
         printf("  ]\n}\n");
         return 0;
@@ -259,7 +263,9 @@ int main(int argc, char ** argv) {
     printf("\n== candidate ranking ==\n");
     printf("  %4s %8s %10s %6s %10s %9s %8s %8s\n", "g", "ubatch", "vram", "fits", "stream/ub",
            "pp t/s", "tg t/s", "tg now");
-    for (const auto & c : plan.top_candidates) {
+    const size_t n_show = std::min(top, plan.top_candidates.size());
+    for (size_t i = 0; i < n_show; i++) {
+        const auto & c = plan.top_candidates[i];
         printf("  %4d %8lld %10s %6s %10s %9.1f %8.1f %8.1f%s\n", c.n_expert_layers_gpu,
                (long long) c.ubatch, human_bytes((uint64_t) c.vram_bytes).c_str(),
                c.fits ? "yes" : "NO", human_bytes((uint64_t) c.expert_bytes_stream).c_str(),

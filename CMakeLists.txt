@@ -80,9 +80,6 @@ add_library(amp_util STATIC
 target_include_directories(amp_util PUBLIC include)
 target_compile_options(amp_util PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
-# util also owns the JSON layer used by the API
-target_sources(amp_util PRIVATE src/util/json.cpp src/util/text.cpp)
-
 # io: mmap + page-cache warming + streaming reads
 add_library(amp_io STATIC
   src/io/mapped_file.cpp
@@ -124,7 +121,6 @@ target_compile_options(amp_preflight PRIVATE -Wall -Wextra -Wno-unused-parameter
 # runtime: the forward path, built on llama.cpp's own kernels so the arithmetic is identical
 add_library(amp_runtime STATIC
   src/runtime/model_runtime.cpp
-  src/runtime/prefix_cache.cpp
   src/runtime/buft_overrides.cpp
 )
 target_include_directories(amp_runtime PUBLIC "${AMP_VENDOR_DIR}/include")
@@ -160,8 +156,6 @@ if(AMP_BUILD_TESTS)
     tests/test_main.cpp
     tests/test_gguf.cpp
     tests/test_plan.cpp
-    tests/test_json.cpp
-    tests/test_text.cpp
   )
   target_link_libraries(amp_tests PRIVATE amp_plan)
   target_include_directories(amp_tests PRIVATE tests)

@@ -180,9 +180,9 @@ Result<std::unique_ptr<ModelRuntime>> ModelRuntime::create(const RuntimeConfig &
                  geo.n_layer() - plan.n_expert_layers_gpu - 1, ")");
     }
 
-    rt->model_ = llama_load_model_from_file(cfg.model_path.c_str(), mparams);
+    rt->model_ = llama_model_load_from_file(cfg.model_path.c_str(), mparams);
     if (!rt->model_) {
-        return Status::Errorf("llama_load_model_from_file('%s') failed", cfg.model_path.c_str());
+        return Status::Errorf("llama_model_load_from_file('%s') failed", cfg.model_path.c_str());
     }
     rt->vocab_ = llama_model_get_vocab(rt->model_);
 
