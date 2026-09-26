@@ -1,9 +1,12 @@
 #include "amp/log.h"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
+#include <unistd.h>
 
 #include "amp/format.h"
 
@@ -55,13 +58,7 @@ const char * log_level_name(LogLevel lvl) {
     return "?";
 }
 
-void log_write(LogLevel lvl, const char * file, int line, const char * fmt, ...) {
-    char    msg[4096];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
-
+void log_line(LogLevel lvl, const char * file, int line, const std::string & msg) {
     const char * base = strrchr(file, '/');
     base             = base ? base + 1 : file;
 
@@ -72,10 +69,16 @@ void log_write(LogLevel lvl, const char * file, int line, const char * fmt, ...)
     char stamp[32];
     strftime(stamp, sizeof(stamp), "%H:%M:%S", &tmv);
 
-    std::lock_guard<std::mutex> lock(g_log_mutex);
-    fprintf(stderr, "%s.%03ld %-5s amp/%s:%d: %s\n", stamp, ts.tv_nsec / 1000000,
-            log_level_name(lvl), base, line, msg);
-    fflush(stderr);
+    // One write() so interleaved worker threads cannot split a line.
+    char    line_buf[4600];
+    const int n = snprintf(line_buf, sizeof(line_buf), "%s.%03ld %-5s amp/%s:%d: %s\n", stamp,
+                           (long) (ts.tv_nsec / 1000000), log_level_name(lvl), base, line,
+                           msg.c_str());
+    if (n <= 0) {
+        return;
+    }
+    const ssize_t ignored = write(STDERR_FILENO, line_buf, (size_t) std::min<int>(n, (int) sizeof(line_buf) - 1));
+    (void) ignored;
 }
 
 } // namespace amp
