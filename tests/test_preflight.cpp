@@ -144,19 +144,30 @@ AMP_TEST(preflight_terminates_the_override_array) {
     AMP_CHECK_MSG(!ov.empty(), "override array must not be empty");
     AMP_CHECK_MSG(ov.back().pattern == nullptr, "the array must end with a null sentinel");
 
+    // The real invariant: the non-null entries form a CONTIGUOUS PREFIX and everything from
+    // the first null onwards is null. Asserting "the first non-null is followed by a null"
+    // instead - which is what this test did - is only true when exactly one override is
+    // written, so it passed for the wrong reason: whenever the planner failed (VRAM held by a
+    // running server) it wrote nothing and the loop never ran. It only failed once VRAM was
+    // free and the planner actually chose a layout, writing 3 x n_gpu_layers entries.
     size_t n_real = 0;
-    for (size_t i = 0; i < ov.size(); i++) {
-        if (ov[i].pattern == nullptr) {
-            continue;
-        }
+    while (n_real < ov.size() && ov[n_real].pattern != nullptr) {
         n_real++;
-        AMP_CHECK_MSG(i + 1 < ov.size(), "a non-null entry must be followed by more entries");
-        AMP_CHECK_MSG(ov[i + 1].pattern == nullptr,
-                      "overrides must be contiguous: a non-null entry is followed by another");
-        break;
     }
-    // Expert overrides are written in groups of 3 (gate/up/down) per layer.
-    AMP_CHECK_MSG(n_real % 3 == 0, "expert overrides come in groups of 3, got " + std::to_string(n_real));
+    for (size_t i = n_real; i < ov.size(); i++) {
+        if (ov[i].pattern != nullptr) {
+            AMP_CHECK_MSG(false,
+                          "override entries must be a contiguous prefix: entry " +
+                              std::to_string(i) + " is non-null after " +
+                              std::to_string(n_real) + " nulls");
+            break;
+        }
+    }
+    // Expert overrides are written in groups of 3 (gate/up/down) per layer, so the count is
+    // either 0 (no plan, or a user-set layout) or a positive multiple of 3.
+    AMP_CHECK_MSG(n_real % 3 == 0,
+                  "expert overrides come in groups of 3, got " + std::to_string(n_real));
+    AMP_CHECK_MSG(n_real < ov.size(), "the prefix must leave room for the null sentinel");
 }
 
 AMP_TEST(preflight_clamps_the_dangerous_defaults) {
