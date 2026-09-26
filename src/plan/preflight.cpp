@@ -61,6 +61,7 @@ struct UserFlags {
     bool ctk = false, ctv = false, fa = false;
     bool t = false, tb = false;
     bool ctxcp = false, cms = false, cram = false, lzm = false;
+    bool np = false;   // explicit --parallel/-np: the user wants N concurrent slots
 };
 
 UserFlags scan_user_flags(const std::vector<std::string> & argv) {
@@ -76,6 +77,7 @@ UserFlags scan_user_flags(const std::vector<std::string> & argv) {
     f.ctxcp = argv_has(argv, "-ctxcp") || argv_has(argv, "--ctx-checkpoints") || argv_has(argv, "--swa-checkpoints");
     f.cms   = argv_has(argv, "-cms") || argv_has(argv, "--checkpoint-min-step");
     f.cram  = argv_has(argv, "-cram") || argv_has(argv, "--cache-ram");
+    f.np    = argv_has(argv, "-np") || argv_has(argv, "--parallel");
     f.lzm   = argv_has(argv, "-lzm") || argv_has(argv, "--lazy-mode");
     if (argv_has(argv, "-fit") || argv_has(argv, "--fit")) {
         const char * v = argv_value(argv, "-fit");
@@ -224,6 +226,25 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
     //    tests/test_preflight.cpp, which is the only reason it was caught at all.
     //
     //    They stay *after* the --fit check, so an explicit --fit on remains a total no-op.
+
+    //    n_parallel is the same kind of trap, and a much bigger one. The server example sets
+    //    params.n_parallel = -1 ("auto", common/arg.cpp:1400), which server.cpp:156-159 expands
+    //    to FOUR concurrent slots with kv_unified. Four concurrent generations each want the same
+    //    shared ~10.9 GiB CPU expert working set, and on this box that thrashes rather than
+    //    shares: measured 0.64 t/s with two slots active, against 28.4 t/s with one.
+    //
+    //    This is not hypothetical and not a corner case. An agentic client has two requests open
+    //    by design - OpenCode asks for a conversation title while the main answer streams - so
+    //    the default is a guaranteed slowdown for the exact workload this server exists for.
+    //    The deleted hand-rolled server serialised generations for this reason.
+    //
+    //    Overridable with --parallel N, because someone batching independent prompts may want
+    //    the throughput and accept the memory cost.
+    if (!f.np && params.n_parallel != 1) {
+        note("n_parallel: 1 (llama-server defaults to 4 concurrent slots, which thrashes the "
+             "shared CPU expert set on this box; use --parallel N to override)");
+        params.n_parallel = 1;
+    }
 
     //    fit_params belongs with them. Default is true (common/common.h:476), and the fitter
     //    would fight whatever layout we set (fit.cpp:463-486, with the failure ignored at

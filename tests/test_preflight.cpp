@@ -216,6 +216,41 @@ AMP_TEST(preflight_plan_failure_still_leaves_a_usable_config) {
     AMP_CHECK_MSG(p.n_ctx > 0, "n_ctx must be set even without a plan, got " + std::to_string(p.n_ctx));
 }
 
+AMP_TEST(preflight_forces_one_slot_unless_asked) {
+    // The server example sets n_parallel = -1 ("auto", arg.cpp:1400), which server.cpp:156-159
+    // expands to FOUR concurrent slots. On this box that is a 44x decode collapse, because every
+    // concurrent generation wants the same shared ~10.9 GiB CPU expert set. An agentic client
+    // has two requests open by design, so the default is a guaranteed slowdown.
+    const char * m = model_path();
+    if (!m) {
+        return;
+    }
+    {
+        common_params   p = parsed_like_llama_cpp();
+        p.model.path    = m;
+        p.n_parallel    = -1;   // what common_params_parse leaves for the server example
+        PreflightOptions o;
+        o.n_ctx = 4096;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{ "amp-server", "-m", m });
+        AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
+        AMP_CHECK_EQ(p.n_parallel, 1);
+    }
+    {
+        // ...unless the user asked for more.
+        common_params   p = parsed_like_llama_cpp();
+        p.model.path    = m;
+        // As common_params_parse would leave it: the flag's VALUE is already applied, and the
+        // preflight only needs to detect that the user supplied the flag at all.
+        p.n_parallel    = 3;
+        PreflightOptions o;
+        o.n_ctx = 4096;
+        const auto r = apply_preflight(o, p,
+                                       std::vector<std::string>{ "amp-server", "-m", m, "--parallel", "3" });
+        AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
+        AMP_CHECK_EQ(p.n_parallel, 3);
+    }
+}
+
 AMP_TEST(preflight_applies_the_measured_kv_dtypes) {
     // The regression test for the worst of the two planning bugs. llama.cpp's field default is
     // F16; the preflight previously planned at F16 and then applied q8_0/q4_0, so the plan

@@ -500,3 +500,35 @@ Both were invisible until the plan was run at 200k and compared against `amp-pla
 
 Both bugs made the plan *pessimistic*, so they cost performance without ever causing a wrong
 answer — which is the dangerous class of bug, because nothing fails loudly.
+
+### Concurrency: llama-server's 4 default slots cost 44x on this model
+
+Found while running the OpenCode harness, not by reading code. The harness stalled on its first
+prompt for ~50 minutes, and the server log explained why:
+
+    slot 1 | task 479 | prompt processing, n_tokens = 3756, t = 195.55 s / 19.21 tokens per second
+    slot 2 | task 335 | n_gen = 138, tg = 0.64 t/s, tg_3s = 0.02 t/s
+
+**`n_slots = 4`.** The server example sets `params.n_parallel = -1` ("auto", `common/arg.cpp:1400`),
+which `tools/server/server.cpp:156-159` expands to four concurrent slots with `kv_unified = true`.
+Every concurrent generation wants the same shared ~10.9 GiB CPU expert working set, and on a box
+with ~10.9 GiB of usable page cache that is not sharing, it is thrashing. Decode fell from 28.4 t/s
+to **0.64 t/s**, a 44x collapse, and prefill from 45 t/s to 19 t/s.
+
+This is not a corner case. An agentic client has two requests open *by design* — OpenCode asks for a
+conversation title while the main answer is streaming — so the default is a guaranteed slowdown for
+exactly the workload this server exists for. The deleted hand-rolled server serialised generations
+for this reason; llama.cpp's server does not.
+
+The preflight now sets `n_parallel = 1` unless `--parallel N` is passed. Same 3-concurrent-request
+test, after:
+
+| | before | after |
+|---|---|---|
+| slots created | 4 | 1 |
+| decode under 3 concurrent requests | 0.64 t/s | 21.26 / 29.87 / 33.46 t/s |
+| requests completed | stalling | 3/3, all `finish_reason: length` |
+| slot ids used | 0 and 2 concurrently | 0 only — they queued |
+
+Requests now take turns instead of interfering, which is what `--parallel 1` has always meant.
+`--parallel N` still works for anyone who wants the batching and accepts the memory cost.
