@@ -1,0 +1,9 @@
+build/
+compile_commands.json
+.cache/
+*.o
+*.so
+*.gguf
+prompts*/
+*.log
+core
