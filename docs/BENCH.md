@@ -593,3 +593,43 @@ the deleted hand-rolled server's sampling path and did **not** reproduce here; 4
 mid-thought alters generation for every request that sets it, and at tight budgets it can visibly
 degrade the answer. `enable_thinking: false` remains the supported way to get a direct answer — it is
 free of that risk because the template pre-closes the block instead of the sampler forcing it.
+
+## 2026-09-27 — where decode is *not* bound: expert placement is worth 3.4%
+
+`README.md` and `AGENT.md` have carried M3c — amp's own ggml graph, so the router is observable
+and the 8 active experts per layer can be prefetched during decode — as "the only remaining decode
+win" for months. Its thesis is that decode is bound by **CPU memory latency** on the expert reads.
+That is testable without writing a graph: if it is true, moving expert layers from the CPU to the
+GPU should help substantially, because VRAM is both faster and lower-latency than RAM.
+
+`llama-server`, 200k context, identical flags apart from `-ncmoe`, page cache warmed with
+`amp-warm --what plan` before each run, 3 requests each, steady state = median of requests 2-3:
+
+| `-ncmoe` | expert layers on GPU | CPU expert set | steady decode |
+|---|---|---|---|
+| 40 | 0 | 12.19 GiB | **30.39 t/s** |
+| 36 | 4 (amp's plan) | 10.90 GiB | **31.44 t/s** |
+| 32 | 8 | 9.61 GiB | **OOM** — exceeds 6 GB VRAM |
+| 28 | 12 | 8.32 GiB | **OOM** |
+
+**Moving four of forty layers' experts from RAM to VRAM buys 3.4 %.** It also shrinks the CPU
+working set by 1.3 GiB, so this is not placement-neutral in either direction.
+
+**What this does and does not say.** It is a bound, not a proof: if decode were dominated by the CPU
+expert-memory path, g=4 versus g=0 would have shown a large gap, and it shows 3 %. So the CPU memory
+path is not the dominant cost, which substantially lowers the expected value of M3c — prefetching
+hides the latency of a path that is not where the time goes. It does not prove prefetch is worthless
+(latency inside the CPU path could still matter), and it says nothing about a better *kernel
+schedule*, which M3c would also allow. But building a graph on the strength of a hypothesis this
+size would be betting on an unmeasured guess, and the honest next step is a per-layer decode profile
+before any of it.
+
+It also fixes the VRAM ceiling with a measurement rather than an estimate: **g=4 is the maximum at
+200k context** — g=8 does not fit. That matches the planner's choice and `AGENT.md`'s earlier note.
+
+### The page cache cannot hold the CPU expert set
+
+`amp-warm --what plan` after warming: `cache after 7.27 GiB (cached 10.99 GiB, available 11.20 GiB)`
+against a 12.19 GiB CPU expert working set. **Roughly 4 GiB of it always streams from NVMe** on this
+box. That is the structural reason decode sits at ~31 t/s rather than higher, and it is not
+fixable by scheduling: it is 14 GiB of RAM against a 12.19 GiB cyclically-scanned working set.
