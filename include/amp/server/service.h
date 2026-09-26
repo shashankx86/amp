@@ -44,6 +44,11 @@ struct ServerConfig {
     float       temperature = 0.6f;
     float       top_p       = 0.95f;
     int32_t     top_k       = 20;
+    // Thinking budget, llama.cpp semantics: -1 unrestricted, 0 close immediately, N>0 token budget.
+    // -2 means "derive from the request", which is what lets a 32-token title request return a title
+    // instead of a chain of thought.
+    int32_t     reasoning_budget = -2;
+    std::string reasoning_budget_message;
     uint32_t    seed        = 0xFFFFFFFFu;
     int32_t     n_predict   = 256;         // default when the request omits max_tokens
 };
@@ -75,6 +80,13 @@ struct GenerateParams {
     // assuming <think>. Empty falls back to <think>.
     std::string             think_start = "<think>";
     std::string             think_end   = "</think>";
+    bool                    thinking_open_at_start = false;
+    // Reasoning budget in tokens; -1 = unrestricted, 0 = close the block immediately. Same knob and
+    // same semantics as llama.cpp's --reasoning-budget / reasoning_budget_tokens.
+    int32_t                 reasoning_budget = -2;   // -2 = not specified by the request
+    std::string             reasoning_budget_message;
+    // Additional closing tags the model might use, beyond think_end.
+    std::vector<std::string> think_end_alternatives;
     // Split the answer into reasoning/content at all? /v1/completions wants the raw text, because
     // that endpoint never applied a chat template in the first place.
     bool                    split_thinking = true;
@@ -128,6 +140,11 @@ struct RenderedChat {
     bool        supported_thinking = false;
     std::string thinking_start      = "<think>";
     std::string thinking_end        = "</think>";
+    // True when the rendered prompt ends inside a reasoning block, i.e. the template already opened
+    // the think tag and the model continues from inside it.
+    bool        thinking_open_at_start = false;
+    // Every closing tag the template declares, for the reasoning-budget sampler.
+    std::vector<std::string> thinking_end_alternatives;
 };
 
 struct ChatTemplates;   // holds llama-common's common_chat_templates, defined in the .cpp
@@ -139,8 +156,14 @@ public:
     static Result<std::unique_ptr<InferenceService>> create(const ServerConfig & cfg);
 
     // Renders a chat with the model's own jinja template, with preserve_reasoning enabled.
+    // `template_kwargs` is passed straight to the template, the way llama.cpp's
+    // `chat_template_kwargs` request field is. It is the only clean way to ask a thinking model for a
+    // non-reasoning answer: {"enable_thinking": false} makes the template drop the think block from
+    // the generation prompt entirely, so the model answers directly. Forcing a close mid-block (the
+    // reasoning budget) works too, but this quant tends to loop after a forced close.
     Result<RenderedChat> render_chat(const std::vector<ChatMessage> & messages,
-                                     const std::string & tools_json = "");
+                                     const std::string & tools_json  = "",
+                                     const std::string & template_kwargs = "");
 
     // Prompt tokens -> completion, with an optional streaming callback.
     //

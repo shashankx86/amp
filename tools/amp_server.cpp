@@ -57,6 +57,9 @@ usage: amp-server --model PATH [options]
   --top-k N               default top-k (default 20)
   --seed N                default seed
   --n-predict N           default max_tokens when a request omits it (default 256)
+  --reasoning-budget N    thinking budget: -1 unrestricted, 0 close immediately, N>0 tokens
+                          (default: derived - short requests get half their budget, long ones none)
+  --reasoning-budget-message S  forced before the closing think tag when the budget runs out
   --api-key KEY           require Authorization: Bearer KEY
   --model-id NAME         model name reported by /v1/models (default amp)
   --no-prefetch           disable the page-cache prefetcher
@@ -96,6 +99,8 @@ int main(int argc, char ** argv) {
         else if (a == "--top-k") cfg.top_k = atoi(next("--top-k").c_str());
         else if (a == "--seed") cfg.seed = (uint32_t) strtoul(next("--seed").c_str(), nullptr, 10);
         else if (a == "--n-predict" || a == "-n") cfg.n_predict = atoi(next("--n-predict").c_str());
+        else if (a == "--reasoning-budget") cfg.reasoning_budget = atoi(next("--reasoning-budget").c_str());
+        else if (a == "--reasoning-budget-message") cfg.reasoning_budget_message = next("--reasoning-budget-message");
         else if (a == "--api-key") cfg.api_key = next("--api-key");
         else if (a == "--api-key-file") api_key_file = next("--api-key-file");
         else if (a == "--model-id") cfg.model_id = next("--model-id");

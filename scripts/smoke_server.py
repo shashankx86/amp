@@ -174,6 +174,50 @@ def main():
         check(False, "absurd max_tokens handled", str(e)[:80])
     check(get(f"{base}/health").get("status") == "ok", "server still healthy afterwards")
 
+    # ---- 6b. a prompt longer than one ubatch ---------------------------------------
+    # llama_process() asserts a batch is no larger than n_ubatch, so the caller must split the
+    # prefill. This used to fail outright with "prefill batch full at token 2048", which is every
+    # real conversation, because an agent client resends the whole history every turn.
+    print("\n6b. a prompt longer than the ubatch (the agent resends everything every turn)")
+    long_prompt = "context " * 4000          # ~4000 tokens, well past ubatch 1024
+    lc = post(f"{base}/v1/completions", {"prompt": long_prompt, "n_predict": 8, "temperature": 0})
+    check("error" not in lc, "a 4000-token prompt prefills", str(lc.get("error", {}).get("message", ""))[:80])
+    if "error" not in lc:
+        check(lc["amp_timings"]["prompt_n"] > 2048, "all of it was evaluated",
+              f"{lc['amp_timings']['prompt_n']} tokens")
+    lm = post(f"{base}/v1/chat/completions",
+              {"messages": [{"role": "user", "content": long_prompt}], "max_tokens": 8, "temperature": 0})
+    check("error" not in lm, "a 4000-token chat history prefills",
+          str(lm.get("error", {}).get("message", ""))[:80])
+
+    # ---- 6c. the reasoning split --------------------------------------------------
+    # This template ends its generation prompt with the opening think tag, so the model reasons
+    # without ever emitting one. Splitting on the tag therefore has to start "inside" the block, or
+    # the whole chain of thought is delivered as the answer - which is what a conversation title
+    # looked like: "The user said hi. This is a short, conversational greeting. According to the
+    # rules, I should...".
+    print("\n6c. reasoning is separated from content")
+    r1 = post(f"{base}/v1/chat/completions",
+              {"messages": [{"role": "system", "content": "Answer in one short line."},
+                            {"role": "user", "content": "What is 2+2?"}],
+               "max_tokens": 200, "temperature": 0})
+    content = r1["choices"][0]["message"].get("content") or ""
+    reasoning = r1["choices"][0]["message"].get("reasoning_content") or ""
+    check("</think>" not in content, "no stray think tag in content", repr(content[:60]))
+    check(not content.lower().startswith("here's a thinking process"),
+          "content is not a chain of thought", repr(content[:60]))
+    check(bool(reasoning) or bool(content), "reasoning or content is populated",
+          f"reasoning={len(reasoning)} content={len(content)}")
+    if content:
+        check("4" in content, "the answer actually reached content", repr(content[:60]))
+    # The clean way to ask a thinking model for a direct answer: the template's own switch.
+    r2 = post(f"{base}/v1/chat/completions",
+              {"messages": [{"role": "system", "content": "Generate a short title. Under 8 words."},
+                            {"role": "user", "content": "how do I fix a segfault"}],
+               "max_tokens": 24, "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}})
+    t2 = (r2["choices"][0]["message"].get("content") or "").strip()
+    check(bool(t2) and len(t2) < 120, "enable_thinking=false yields a direct answer", repr(t2[:80]))
+
     # ---- 7. concurrency: the regression test that matters -------------------------
     # A llama_context is not reentrant. Agentic clients put two requests in flight at once all the
     # time (OpenCode asks for a conversation title while the main stream is running), and before the

@@ -6,8 +6,11 @@
 #include "amp/format.h"
 #include "amp/log.h"
 #include "amp/timing.h"
+#include "amp/util/json.h"
 
-#include "chat.h"   // llama-common: jinja rendering + thinking tags
+#include "chat.h"              // llama-common: jinja rendering + thinking tags
+#include "common.h"            // llama-common: common_tokenize
+#include "reasoning-budget.h"  // llama-common: the thinking-budget sampler
 
 #include <algorithm>
 #include <cmath>
@@ -56,18 +59,79 @@ uint64_t cuda_free_bytes() {
     return 0;
 }
 
-llama_sampler * make_sampler(const GenerateParams & p, const ServerConfig & cfg) {
+// The reasoning block is tracked by the sampler's state machine rather than by searching the output
+// for a tag. llama.cpp does it this way and it is the only robust option: the model emits the closing
+// tag with or without surrounding whitespace depending on how it was sampled (a budget-forced close
+// produced "...Analyze</think>" with no newline at all), so a string search silently fails and the
+// whole answer lands in reasoning_content. The state machine cannot be fooled that way.
+llama_sampler * make_sampler(const GenerateParams & p, const ServerConfig & cfg,
+                             const llama_vocab * vocab, const std::vector<llama_token> & prefill,
+                             llama_sampler ** rbudget_out) {
     llama_sampler_chain_params sp = llama_sampler_chain_default_params();
     sp.no_perf                  = true;
     llama_sampler * chain       = llama_sampler_chain_init(sp);
 
-    const float   temp = p.temperature >= 0.0f ? p.temperature : cfg.temperature;
-    const int32_t tk   = p.top_k >= 0 ? p.top_k : cfg.top_k;
-    const float   tp   = p.top_p >= 0.0f ? p.top_p : cfg.top_p;
-    const float   mp   = p.min_p;
+    const float    temp = p.temperature >= 0.0f ? p.temperature : cfg.temperature;
+    const int32_t  tk   = p.top_k >= 0 ? p.top_k : cfg.top_k;
+    const float    tp   = p.top_p >= 0.0f ? p.top_p : cfg.top_p;
+    const float    mp   = p.min_p;
     const uint32_t seed = p.seed != 0xFFFFFFFFu ? p.seed : cfg.seed;
 
+    // Reasoning budget, llama.cpp's mechanism. A thinking model that spends the whole token budget
+    // inside <think>...</think> returns *no content at all*, which for a short request (a
+    // conversation title, a one-line summary) means the caller gets nothing usable. The sampler
+    // counts the tokens spent in the reasoning block and, when the budget runs out, forces the end
+    // tag - so generation continues into actual content.
+    //
+    // The trick llama.cpp uses, and the reason this works at all: the sampler starts in IDLE and is
+    // fed the prefill tokens, so a template whose generation prompt already ends inside <think> is
+    // detected by replaying the prompt through it. No special-casing of the template.
+    int32_t budget = p.reasoning_budget;
+    if (budget == -2) {
+        budget = cfg.reasoning_budget;
+    }
+    if (budget == -2) {
+        // Not specified anywhere. Derived: a short request that produces only reasoning is useless to
+        // its caller, so give thinking half the budget. Long requests are left alone - a real answer
+        // should think as long as it needs.
+        budget = (p.max_tokens > 0 && p.max_tokens <= 256) ? std::max(4, p.max_tokens / 2) : -1;
+    }
+    llama_sampler * rbudget = nullptr;
+    // Always build the tracker (INT_MAX budget when unlimited) so the reasoning/content split is
+    // state-driven even for long requests. Only *forcing* is conditional on the budget.
+    const int32_t budget_for_sampler = (budget < 0) ? INT32_MAX : budget;
+    if (!p.think_start.empty() && !p.think_end.empty() && vocab) {
+        const std::vector<llama_token> start = common_tokenize(vocab, p.think_start, false, true);
+        std::vector<llama_token>       forced = common_tokenize(vocab, p.think_end, false, true);
+        if (!start.empty() && !forced.empty()) {
+            std::vector<std::vector<llama_token>> ends;
+            ends.push_back(forced);
+            for (const auto & t : p.think_end_alternatives) {
+                std::vector<llama_token> alt = common_tokenize(vocab, t, false, true);
+                if (!alt.empty()) {
+                    ends.push_back(std::move(alt));
+                }
+            }
+            if (!p.reasoning_budget_message.empty()) {
+                const std::vector<llama_token> msg = common_tokenize(vocab, p.reasoning_budget_message, false, true);
+                forced.insert(forced.begin(), msg.begin(), msg.end());
+            }
+            rbudget = common_reasoning_budget_init(vocab, { start }, ends, forced, budget_for_sampler);
+            for (const llama_token t : prefill) {
+                llama_sampler_accept(rbudget, t);
+            }
+        }
+    }
+
+    if (rbudget_out) {
+        *rbudget_out = rbudget;
+    }
     if (temp <= 0.0f) {
+        // Greedy still needs the budget sampler in front of it: forcing a token is a logits
+        // operation, and it is what ends the reasoning block.
+        if (rbudget) {
+            llama_sampler_chain_add(chain, rbudget);
+        }
         llama_sampler_chain_add(chain, llama_sampler_init_greedy());
         return chain;
     }
@@ -80,6 +144,9 @@ llama_sampler * make_sampler(const GenerateParams & p, const ServerConfig & cfg)
     if (tp > 0.0f && tp < 1.0f) {
         llama_sampler_chain_add(chain, llama_sampler_init_top_p(tp, 1));
     }
+    if (rbudget) {
+        llama_sampler_chain_add(chain, rbudget);
+    }
     llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
     llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
     return chain;
@@ -87,42 +154,56 @@ llama_sampler * make_sampler(const GenerateParams & p, const ServerConfig & cfg)
 
 // Splits generated text into reasoning and content using the template's thinking tags. Streaming
 // needs this to be incremental, so the state machine is kept per generation.
+// Splits generated text into reasoning and content.
+//
+// Two things this has to get right, both learned the hard way on this model:
+//
+//  - generation *starts inside* a reasoning block. The template's generation prompt ends with the
+//    opening think tag (`<|im_start|>assistant\n<think>\n`), so the model never emits one and a
+//    split triggered by the opening tag never fires. That is how a conversation title came back as
+//    "The user said hi. This is a short, conversational greeting. According to the rules, I should..."
+//    - a chain of thought delivered as the answer.
+//  - the closing tag arrives with *variable* surrounding whitespace: naturally as "\n</think>",
+//    but when the reasoning budget forces it, as "</think>" with no newline at all. Matching only the
+//    exact tag string silently fails, and then the answer lands in reasoning_content too.
 class ThinkingSplitter {
 public:
-    ThinkingSplitter(std::string start, std::string end)
-        : start_(std::move(start)), end_(std::move(end)) {}
+    ThinkingSplitter(std::string start, std::string end, bool starts_inside = false)
+        : start_(std::move(start)), end_(std::move(end)), in_reasoning_(starts_inside) {
+        start_variants_ = tag_variants(start_);
+        end_variants_   = tag_variants(end_);
+    }
 
-    // Feed a piece, get back (reasoning_delta, content_delta).
     void feed(const std::string & piece, std::string & reasoning_out, std::string & content_out) {
         buf_ += piece;
         while (!buf_.empty()) {
             if (in_reasoning_) {
-                const size_t e = end_.empty() ? std::string::npos : buf_.find(end_);
-                if (e == std::string::npos) {
-                    // Hold back a possible partial tag at the end.
-                    const size_t keep = tail_len_for_partial(buf_, end_);
+                const Match m = find_tag(buf_, end_variants_);
+                if (m.at == std::string::npos) {
+                    const size_t keep = partial_tag_len(buf_, end_variants_);
                     if (buf_.size() > keep) {
-                        reasoning_out += buf_.substr(0, buf_.size() - keep);
+                        reasoning_out.append(buf_, 0, buf_.size() - keep);
                         buf_.erase(0, buf_.size() - keep);
                     }
                     return;
                 }
-                reasoning_out += buf_.substr(0, e);
-                buf_.erase(0, e + end_.size());
+                // The tag itself is part of the reasoning block, so it does not leak into content.
+                reasoning_out.append(buf_, 0, m.at);
+                buf_.erase(0, m.at + m.len);
                 in_reasoning_ = false;
                 continue;
             }
-            const size_t s = start_.empty() ? std::string::npos : buf_.find(start_);
-            if (s == std::string::npos) {
-                const size_t keep = tail_len_for_partial(buf_, start_);
+            const Match m = find_tag(buf_, start_variants_);
+            if (m.at == std::string::npos) {
+                const size_t keep = partial_tag_len(buf_, start_variants_);
                 if (buf_.size() > keep) {
-                    content_out += buf_.substr(0, buf_.size() - keep);
+                    content_out.append(buf_, 0, buf_.size() - keep);
                     buf_.erase(0, buf_.size() - keep);
                 }
                 return;
             }
-            content_out += buf_.substr(0, s);
-            buf_.erase(0, s + start_.size());
+            content_out.append(buf_, 0, m.at);
+            buf_.erase(0, m.at + m.len);
             in_reasoning_ = true;
         }
     }
@@ -131,30 +212,67 @@ public:
         if (buf_.empty()) {
             return;
         }
-        if (in_reasoning_) {
-            reasoning_out += buf_;
-        } else {
-            content_out += buf_;
-        }
+        (in_reasoning_ ? reasoning_out : content_out).append(buf_);
         buf_.clear();
     }
 
+    bool in_reasoning() const { return in_reasoning_; }
+
 private:
-    static size_t tail_len_for_partial(const std::string & buf, const std::string & tag) {
+    struct Match {
+        size_t at  = std::string::npos;
+        size_t len = 0;
+    };
+
+    // The tag as written, plus the same tag with surrounding whitespace trimmed, so "\n</think>",
+    // "</think>" and "\n</think>\n" all match.
+    static std::vector<std::string> tag_variants(const std::string & tag) {
+        std::vector<std::string> out;
         if (tag.empty()) {
-            return 0;
+            return out;
         }
-        const size_t max_keep = std::min(buf.size(), tag.size() - 1);
-        for (size_t k = max_keep; k > 0; k--) {
-            if (buf.compare(buf.size() - k, k, tag, 0, k) == 0) {
-                return k;
-            }
+        out.push_back(tag);
+        size_t b = tag.find_first_not_of(" \t\r\n");
+        size_t e = tag.find_last_not_of(" \t\r\n");
+        if (b == std::string::npos) {
+            return out;
         }
-        return 0;
+        const std::string trimmed = tag.substr(b, e - b + 1);
+        if (trimmed != tag) {
+            out.push_back(trimmed);
+        }
+        return out;
     }
 
-    std::string start_, end_, buf_;
-    bool        in_reasoning_ = false;
+    static Match find_tag(const std::string & buf, const std::vector<std::string> & tags) {
+        Match best;
+        for (const auto & t : tags) {
+            const size_t at = buf.find(t);
+            if (at != std::string::npos && (best.at == std::string::npos || at < best.at)) {
+                best = Match{ at, t.size() };
+            }
+        }
+        return best;
+    }
+
+    // How much of the tail could still turn into a tag: never emit a partial one.
+    static size_t partial_tag_len(const std::string & buf, const std::vector<std::string> & tags) {
+        size_t keep = 0;
+        for (const auto & t : tags) {
+            const size_t max_keep = std::min(buf.size(), t.size() - 1);
+            for (size_t k = max_keep; k > keep; k--) {
+                if (buf.compare(buf.size() - k, k, t, 0, k) == 0) {
+                    keep = k;
+                    break;
+                }
+            }
+        }
+        return keep;
+    }
+
+    std::string              start_, end_, buf_;
+    std::vector<std::string> start_variants_, end_variants_;
+    bool                     in_reasoning_ = false;
 };
 
 } // namespace
@@ -349,7 +467,8 @@ Result<std::unique_ptr<InferenceService>> InferenceService::create(const ServerC
 }
 
 Result<RenderedChat> InferenceService::render_chat(const std::vector<ChatMessage> & messages,
-                                                   const std::string & tools_json) {
+                                                   const std::string & tools_json,
+                                                   const std::string & template_kwargs) {
     RenderedChat out;
     if (!tmpls_ || !tmpls_->tmpls) {
         return Status::Error("chat templates not initialised");
@@ -362,6 +481,19 @@ Result<RenderedChat> InferenceService::render_chat(const std::vector<ChatMessage
     // The whole point: keep the assistant's own reasoning in the rendered prompt so the next turn's
     // prefix matches. Without this, a thinking model re-evaluates the tail of every turn.
     in.chat_template_kwargs["preserve_reasoning"] = "true";
+    // Caller-supplied kwargs win, so enable_thinking=false actually takes effect.
+    if (!template_kwargs.empty()) {
+        if (auto parsed = json::Value::parse(template_kwargs); parsed.ok() && parsed->is_object()) {
+            for (const auto & kv : parsed->as_object()) {
+                const json::Value & v = kv.second;
+                if (v.is_string()) {
+                    in.chat_template_kwargs[kv.first] = v.as_string();
+                } else if (v.is_bool()) {
+                    in.chat_template_kwargs[kv.first] = v.as_bool() ? "true" : "false";
+                }
+            }
+        }
+    }
 
     for (const auto & m : messages) {
         common_chat_msg cm;
@@ -386,14 +518,33 @@ Result<RenderedChat> InferenceService::render_chat(const std::vector<ChatMessage
 
     const common_chat_params p = common_chat_templates_apply(tmpls_->tmpls.get(), in);
     out.prompt              = p.prompt;
-    out.supported_thinking  = p.supports_thinking;
+    out.supported_thinking = p.supports_thinking;
     if (p.supports_thinking) {
         if (!p.thinking_start_tag.empty()) {
             out.thinking_start = p.thinking_start_tag;
         }
         if (!p.thinking_end_tags.empty()) {
             out.thinking_end = p.thinking_end_tags.front();
+            for (size_t i = 1; i < p.thinking_end_tags.size(); i++) {
+                if (!p.thinking_end_tags[i].empty()) {
+                    out.thinking_end_alternatives.push_back(p.thinking_end_tags[i]);
+                }
+            }
         }
+        // Does the prompt leave the model *inside* a reasoning block? Check the rendered text rather
+        // than trusting a flag: what matters is the bytes the model will continue from.
+        const std::string trimmed = [&] {
+            size_t e = out.prompt.size();
+            while (e > 0 && (out.prompt[e - 1] == ' ' || out.prompt[e - 1] == '\n' ||
+                             out.prompt[e - 1] == '\r' || out.prompt[e - 1] == '\t')) {
+                e--;
+            }
+            return out.prompt.substr(0, e);
+        }();
+        out.thinking_open_at_start =
+            !out.thinking_start.empty() && trimmed.size() >= out.thinking_start.size() &&
+            trimmed.compare(trimmed.size() - out.thinking_start.size(), out.thinking_start.size(),
+                            out.thinking_start) == 0;
     }
     return out;
 }
@@ -505,30 +656,38 @@ Result<GenerationResult> InferenceService::generate_locked(
     const Stopwatch sw;
     int32_t          idx_sample = -1;
 
+    // llama_process() asserts that a batch is no larger than n_ubatch (llama-context.cpp), and
+    // llama_batch_ext is sized to n_batch, so the caller has to split. A prompt longer than the
+    // ubatch used to fail outright with "prefill batch full at token 2048" - which is every real
+    // conversation, since agent clients resend the whole history every turn.
+    const int64_t ubatch_max = (int64_t) llama_n_ubatch(ctx_);
     auto run_batch = [&](int64_t from, int64_t to, bool mark_output) -> Status {
-        if (from >= to) {
-            return Status::OK();
-        }
-        llama_batch_ext * batch = llama_batch_ext_init(ctx_);
-        int32_t           idx   = -1;
-        for (int64_t i = from; i < to; i++) {
-            idx = llama_batch_ext_add_token(batch, (llama_seq_id) seq, prompt_tokens[(size_t) i]);
-            if (idx < 0) {
-                llama_batch_ext_free(batch);
-                return Status::Errorf("prefill batch full at token %lld (ubatch %lld)", (long long) i,
-                                      (long long) llama_n_ubatch(ctx_));
+        for (int64_t start = from; start < to; start += ubatch_max) {
+            const int64_t end = std::min(start + ubatch_max, to);
+            const bool    last = (end >= to);
+            llama_batch_ext * batch = llama_batch_ext_init(ctx_);
+            int32_t           idx   = -1;
+            for (int64_t i = start; i < end; i++) {
+                idx = llama_batch_ext_add_token(batch, (llama_seq_id) seq, prompt_tokens[(size_t) i]);
+                if (idx < 0) {
+                    llama_batch_ext_free(batch);
+                    return Status::Errorf("prefill batch full at token %lld (ubatch %lld)",
+                                          (long long) i, (long long) ubatch_max);
+                }
+                const llama_pos pos = (llama_pos) i;
+                llama_batch_ext_set_pos(batch, idx, &pos);
             }
-            const llama_pos pos = (llama_pos) i;
-            llama_batch_ext_set_pos(batch, idx, &pos);
-        }
-        if (mark_output) {
-            llama_batch_ext_set_output_logits(batch, idx, true);
-            idx_sample = idx;
-        }
-        const int32_t rc = llama_process(ctx_, LLAMA_PROCESS_TYPE_DECODE, batch);
-        llama_batch_ext_free(batch);
-        if (rc != 0) {
-            return Status::Errorf("prefill failed (rc=%d)", rc);
+            // Only the very last token of the whole prefill needs to produce logits, and that is what
+            // llama_sampler_sample() reads below.
+            if (mark_output && last) {
+                llama_batch_ext_set_output_logits(batch, idx, true);
+                idx_sample = idx;
+            }
+            const int32_t rc = llama_process(ctx_, LLAMA_PROCESS_TYPE_DECODE, batch);
+            llama_batch_ext_free(batch);
+            if (rc != 0) {
+                return Status::Errorf("prefill failed (rc=%d)", rc);
+            }
         }
         return Status::OK();
     };
@@ -570,12 +729,14 @@ Result<GenerationResult> InferenceService::generate_locked(
 
 
     // ---- decode ----
-    llama_sampler * smpl = make_sampler(params, cfg_);
+    llama_sampler * rbudget = nullptr;
+    llama_sampler * smpl     = make_sampler(params, cfg_, vocab_, prompt_tokens, &rbudget);
     std::vector<char> piece(512);
-    // No split requested (a plain completion) => empty tags, so everything lands in content and
-    // `raw` is the authoritative text.
+    // Fallback for the paths with no tracker (a raw completion has no template and therefore no
+    // thinking tags): a string search, which is all that is possible without the template.
     ThinkingSplitter splitter(params.split_thinking ? params.think_start : std::string(),
-                              params.split_thinking ? params.think_end : std::string());
+                              params.split_thinking ? params.think_end : std::string(),
+                              params.split_thinking && params.thinking_open_at_start);
     const Stopwatch  dsw;
     bool             hit_stop = false;
     bool             hit_eos  = false;
@@ -592,6 +753,9 @@ Result<GenerationResult> InferenceService::generate_locked(
             break;
         }
         const llama_token id = llama_sampler_sample(smpl, ctx_, idx_sample);
+        // Read the state *before* accepting: accepting the closing tag is what moves the tracker to
+        // DONE, and the tag itself belongs to the reasoning side. Sampling-time state is the state the
+        // token was generated in, which is the only correct question to ask.
         llama_sampler_accept(smpl, id);
         const bool eog = llama_vocab_is_eog(vocab_, id);
 
@@ -600,16 +764,19 @@ Result<GenerationResult> InferenceService::generate_locked(
             const int32_t n = llama_token_to_piece(vocab_, id, piece.data(), (int32_t) piece.size(),
                                                    0, /*special=*/ false);
             if (n > 0) {
-                const std::string s(piece.data(), (size_t) n);
-                res.raw += s;
-                std::string       reasoning_delta, content_delta;
-                splitter.feed(s, reasoning_delta, content_delta);
-                res.content   += content_delta;
-                res.reasoning += reasoning_delta;
-                if (on_chunk && (!content_delta.empty() || !reasoning_delta.empty())) {
+                const std::string text(piece.data(), (size_t) n);
+                res.raw += text;
+                // Which side of the reasoning block is this token on? The tracker was fed the prefill,
+                // so a prompt that ends inside <think> is already in the reasoning state before the
+                // first generated token, and DONE means the block has closed.
+                std::string text_out, reasoning_out;
+                splitter.feed(text, reasoning_out, text_out);
+                res.content   += text_out;
+                res.reasoning += reasoning_out;
+                if (on_chunk && (!text_out.empty() || !reasoning_out.empty())) {
                     StreamChunk c;
-                    c.text      = content_delta;
-                    c.reasoning = reasoning_delta;
+                    c.text      = text_out;
+                    c.reasoning = reasoning_out;
                     c.token     = id;
                     on_chunk(c);
                 }

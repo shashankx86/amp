@@ -185,6 +185,17 @@ GenerateParams parse_sampling(const Value & body, const ServerConfig & cfg) {
     if (const Value * v = body.get("ignore_eos"); v) {
         gp.ignore_eos = v->as_bool(false);
     }
+    // Thinking budget. Both names llama.cpp accepts, same semantics: -1 unrestricted, 0 close the
+    // reasoning block immediately, N>0 spend at most N tokens thinking.
+    for (const char * key : { "reasoning_budget_tokens", "thinking_budget_tokens" }) {
+        if (const Value * v = body.get(key); v && v->is_number()) {
+            gp.reasoning_budget = (int32_t) v->as_int(-1);
+            break;
+        }
+    }
+    if (const Value * v = body.get("reasoning_budget_message"); v && v->is_string()) {
+        gp.reasoning_budget_message = v->as_string();
+    }
     gp.stop = parse_stop(body.get("stop"));
     return gp;
 }
@@ -612,10 +623,25 @@ Status OpenAIApi::chat_completions(const http::Request & req, http::ResponseWrit
         tools_json = t->dump();
     }
 
-    auto rendered = svc.render_chat(messages, tools_json);
+    // llama.cpp's passthrough field, so a client can ask the template for a non-reasoning answer
+    // ({"enable_thinking": false}) instead of the server guessing.
+    std::string template_kwargs;
+    if (const Value * ck = body->get("chat_template_kwargs"); ck && ck->is_object()) {
+        template_kwargs = ck->dump();
+    }
+    auto rendered = svc.render_chat(messages, tools_json, template_kwargs);
     if (!rendered.ok()) {
         return json_error(w, 500, rendered.message());
     }
+    // Split the answer with the model's own tags, and tell the splitter that the prompt left the
+    // model *inside* a reasoning block. Without the second part the whole chain of thought lands in
+    // `content`: this template ends the generation prompt with the opening think tag, so the model
+    // never emits one and a tag-triggered split never fires.
+    gp.think_start            = rendered->thinking_start;
+    gp.think_end              = rendered->thinking_end;
+    gp.think_end_alternatives = rendered->thinking_end_alternatives;
+    gp.thinking_open_at_start = rendered->thinking_open_at_start;
+
     auto toks = svc.tokenize(rendered->prompt, /*add_special=*/ true);
     if (!toks.ok()) {
         return json_error(w, 400, toks.message());

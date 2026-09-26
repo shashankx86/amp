@@ -115,6 +115,33 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
       two copies of the same loop today: the CLI has the prefetcher, the server has the cache. This is
       known duplication, deliberately left until the server is proven, and it is the first thing to fix.
 
+## Thinking-model rules learned the hard way (this template, this quant)
+
+- **The generation prompt ends *inside* a reasoning block.** `/apply-template` shows the rendered
+  prompt ending `<|im_start|>assistant\n<think>\n`, so the model reasons without ever emitting an
+  opening tag. Any split triggered by the opening tag never fires and the entire chain of thought is
+  delivered as `content` — that is what a conversation title came out as. The splitter must be told
+  the block is already open, which `render_chat` derives from the rendered text (does it end with the
+  template's thinking start tag?).
+- **The closing tag arrives with variable whitespace.** Naturally `\n</think>`; forced by the
+  reasoning budget, `</think>` with no newline. Match the tag *and* the whitespace-trimmed tag.
+- **`llama_process()` asserts a batch is no larger than `n_ubatch`** (llama-context.cpp), and
+  `llama_batch_ext` is sized to `n_batch`. The caller must split the prefill. Not splitting it failed
+  every prompt over the ubatch with "prefill batch full at token 2048" — i.e. every real conversation,
+  since an agent client resends the whole history each turn.
+- **To get a non-reasoning answer, use the template's switch, not a forced close.**
+  `chat_template_kwargs: {"enable_thinking": false}` (llama.cpp's passthrough field) makes the template
+  drop the think block from the generation prompt. Forcing a close with the reasoning budget works, but
+  this quant tends to loop (`2+2 = 4. </think> 2+2 = 4. </think> ...`) after a forced close, so the
+  budget is opt-in and off by default.
+- **The reasoning budget is llama.cpp's `common_reasoning_budget_init`** and it arms itself by
+  *replaying the prefill tokens* through the sampler — no template special-casing. Feed it with
+  `llama_sampler_accept` before the first generated token.
+- Use `common_tokenize()` for tags, not a hand-rolled "call with a null buffer to count" version: the
+  counting call returns 0 for a bare special token, which silently disables the whole budget path.
+- A short request from a thinking model can legitimately produce **no content at all**. That is the
+  spec-correct answer, not a bug: the budget is the client's lever, or `enable_thinking: false`.
+
 ## Server rules learned the hard way
 
 - **A `llama_context` is not reentrant.** Two generations on one context corrupt the KV and the
