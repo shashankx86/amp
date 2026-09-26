@@ -116,7 +116,7 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - [x] M4 GPU offload expressed through the public `tensor_buft_overrides` API (= `-ncmoe`)
 - [x] M5 page-cache warming at start-up; decode-time prefetch of active experts **removed** on purpose
 - [x] M6 server: OpenAI-compatible API, SSE, token-level prefix cache, prompt-boundary checkpoints,
-      reasoning alias fix — `amp-server`, driven by `scripts/smoke_server.py`
+      reasoning alias fix — `amp-server`, driven by `scripts/parity_test.py`
 - [ ] M3c amp's own ggml graph, so the router is observable and the 8 active experts per layer can be
       prefetched during decode (the only remaining decode win; impossible through `llama.h`)
 - [ ] M7 close the gap between amp's decode and the measured ceiling (25.6 t/s was with a plan chosen
@@ -196,7 +196,8 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
   running, on a second connection, and my HTTP layer happily served both on one context. Fixed with
   `amp::TaskQueue` (one worker, FIFO), and `InferenceService::generate()` is now serialized *inside*
   the service so no handler path can forget. Reproduce with section 7 of
-  `scripts/smoke_server.py`; before the fix all four streams were empty and the server was dead.
+  section 14 of `scripts/parity_test.py`; before the fix all four streams were empty and the
+  server was dead.
 - **A stream must always end with `finish_reason`, then `[DONE]`.** Otherwise the Vercel AI SDK
   reports "OpenAI Chat stream ended without finish_reason" and retries forever, which presents as a
   mysterious hang rather than an error. On failure amp now sends the error object *and* a proper

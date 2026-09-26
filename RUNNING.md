@@ -97,7 +97,7 @@ will evaluate, for free.
 
 llama.cpp's server owns slot scheduling, so a `llama_context` is never reentered. Our old
 hand-rolled server got this wrong and died under four concurrent streams; section 7 of
-`scripts/smoke_server.py` is the regression test for it, and `scripts/parity_test.py` keeps it.
+section 14 of `scripts/parity_test.py` is the regression test for it.
 
 Point OpenCode at it by setting `baseURL` to `http://127.0.0.1:8081/v1` in
 `~/.config/opencode/opencode.json`.

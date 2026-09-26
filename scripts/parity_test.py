@@ -10,7 +10,7 @@ IMPORTANT: the system under test is llama.cpp's stock `tools/server` (40+ routes
 with a ~200-line amp preflight that only applies amp's memory plan. This script
 therefore tests llama.cpp's server, NOT amp's own code. amp-specific behaviour
 (the preflight, the memory plan, the prefix cache) is out of scope here; see
-scripts/smoke_server.py (kept for reference) and scripts/parity.py for that.
+the retired scripts/smoke_server.py and scripts/parity.py for that.
 
 Cheap-request rule: the model is a slow reasoning model (~15-35 tok/s decode,
 and a thinking answer can be 700+ tokens). Every test that only checks response

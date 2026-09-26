@@ -202,7 +202,7 @@ Reproduce with:
 ```bash
 ./scripts/fetch_deps.sh && ./scripts/build.sh          # vendored llama.cpp, static, 31 tests
 ./build/bin/amp-server --model $M --port 8085 --ctx 200000
-python3 scripts/smoke_server.py --url http://127.0.0.1:8085
+python3 scripts/parity_test.py --url http://127.0.0.1:8085   # supersedes smoke_server.py
 ```
 
 Server at the real 200k context, planner's own choice (4 expert layers on the GPU, ubatch 1024),
@@ -260,7 +260,9 @@ prompt with the same cache state: **35.25 t/s is 7.4x that.**
 
 ## 2026-09-26 — serving correctness, measured
 
-Reproduce: `./scripts/build.sh`, start `amp-server`, then `python3 scripts/smoke_server.py --url ...`.
+Reproduce: `./scripts/build.sh`, start `amp-server`, then `python3 scripts/parity_test.py --url ...`
+(sections 6b, 6c and 7 below are the regressions; they are now sections 12, 14 and 15 of
+`parity_test.py`, rewritten for llama.cpp's response shapes).
 Sections 6b, 6c and 7 are the regression tests; each fails on the build that preceded its fix.
 
 ### Concurrency: the failure and the fix

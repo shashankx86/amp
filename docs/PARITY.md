@@ -1,7 +1,7 @@
 # PARITY.md — llama.cpp server functional parity contract
 
 This document defines what "100% functional parity with llama.cpp's server" means for
-`amp-server`. It is written so that `scripts/smoke_server.py` (or any automated smoke
+`amp-server`. It is written so that `scripts/parity_test.py` (or any automated smoke
 test) can be generated directly from it. Every non-obvious claim cites `file:line` in
 the vendored llama.cpp checkout at `third_party/llama.cpp` (pinned commit `1ab7e5a`).
 
