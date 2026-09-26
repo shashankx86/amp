@@ -376,3 +376,65 @@ The hand-rolled `amp-server` set `logprobs` to `null` unconditionally
 the engine being replaced is not obtainable over HTTP, and that capability is one of the things
 the swap gains. The pre-swap engine's own quality evidence remains the top-5 logprob parity in
 `scripts/parity.py` and the determinism result in the table above.
+
+## 2026-09-26 — the server swap is bit-identical (KL = 0)
+
+The hard constraint is zero quality loss, so the swap had to be *proven*, not asserted. Same
+`kl_parity.py` protocol as the noise-floor section above: 512 greedy tokens, `n_probs=32`, no
+`top_k`/`top_p`.
+
+Three captures:
+
+| tag | server | expert layers on GPU | ctx | ubatch |
+|---|---|---|---|---|
+| `llama-ref` | `llama-server` `-ngl 41 -ncmoe 38` | 2 | 16384 | 2048 |
+| `llama-matched` | `llama-server` `-ngl 99 -ncmoe 32` | 8 | 32768 | 1024 |
+| `amp-post-swap` | `amp-server` (preflight chose the layout) | 8 | 32768 | 1024 |
+
+### Matched placement: exactly zero
+
+`llama-matched` vs `amp-post-swap` — same placement, same ctx, same ubatch, same KV dtypes, so the
+only variable is the server:
+
+| metric | value |
+|---|---|
+| top-1 agreement | **512/512 (100.00 %)** |
+| KL(A‖B) | mean 0.000000e+00, max 0.000000e+00 |
+| KL(B‖A) | mean 0.000000e+00, max 0.000000e+00 |
+| Jensen-Shannon | mean 0.000000e+00 |
+| max abs Δ logprob on shared tokens | **0.000000e+00** |
+| captured mass, both sides | mean 0.998339, min 0.906032 (identical) |
+
+**Not "within tolerance" — exactly zero.** Replacing 2,200 lines of hand-rolled server with
+llama.cpp's changed nothing about the arithmetic, which is the expected result given the same
+kernels, weights and sampler, and is now measured rather than argued.
+
+### Mismatched placement: how a correct result looks like a catastrophe
+
+Comparing `llama-ref` (2 expert layers on GPU) against `amp-post-swap` (8) gives what looks like a
+disaster, and is the single most misleading number in this file:
+
+| metric | value |
+|---|---|
+| top-1 agreement | 58/512 (11.33 %) |
+| JS | 0.6118 (bound is 0.6931) |
+| max abs Δ logprob | 22.68 |
+
+It is not a regression. Inspecting the captures position by position:
+
+- the **first 10 tokens are identical**, and position 0's top-1 logprob differs by **0.012**
+  (−0.1196 vs −0.1316)
+- the sequences agree early and diverge later — 58/512 over the full run
+
+That is butterfly amplification from a 0.012 numerical difference caused by a different CPU/GPU
+split of the experts changing summation order. Once one near-tie flips, the contexts differ and
+every subsequent position is a different question. The 11 % figure measures *placement drift*, which
+`AGENT.md` already characterised as shifting tail logprobs by up to ~0.5; it says nothing about the
+swap.
+
+**Method rule this establishes:** a KL comparison between two engines is only meaningful when
+placement is held fixed. amp's preflight *chooses* placement for speed, so "amp vs llama-server with
+llama.cpp's default layout" is guaranteed to diverge and is not a quality test. Match the layout
+first, then compare. The 0.012 at position 0 is also the right order of magnitude for placement
+drift, which is a useful sanity check that the two captures differ for the stated reason and no
+other.
