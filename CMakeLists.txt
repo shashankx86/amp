@@ -113,6 +113,31 @@ target_include_directories(amp_runtime PUBLIC "${AMP_VENDOR_DIR}/include")
 target_link_libraries(amp_runtime PUBLIC amp_io amp_plan llama llama-common)
 target_compile_options(amp_runtime PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
+# server: HTTP + OpenAI-compatible API on top of the runtime
+add_library(amp_server STATIC
+  src/server/http_server.cpp
+  src/server/service.cpp
+  src/server/openai_api.cpp
+)
+target_include_directories(amp_server PUBLIC "${AMP_VENDOR_DIR}/common" "${AMP_VENDOR_DIR}/include")
+target_link_libraries(amp_server PUBLIC amp_runtime llama-common)
+target_compile_options(amp_server PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+if(AMP_BUILD_TOOLS)
+  foreach(tool amp-plan amp-warm amp-infer amp-server)
+    string(REPLACE "-" "_" tool_src ${tool})
+    add_executable(${tool} tools/${tool_src}.cpp)
+    if(${tool} STREQUAL "amp-infer")
+      target_link_libraries(${tool} PRIVATE amp_runtime)
+    elseif(${tool} STREQUAL "amp-server")
+      target_link_libraries(${tool} PRIVATE amp_server)
+    else()
+      target_link_libraries(${tool} PRIVATE amp_plan)
+    endif()
+    target_compile_options(${tool} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endforeach()
+endif()
+
 if(AMP_BUILD_TESTS)
   enable_testing()
   add_executable(amp_tests

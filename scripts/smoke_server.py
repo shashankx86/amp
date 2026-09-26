@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""End-to-end check of amp-server: raw completions, chat + reasoning, SSE streaming, prefix cache.
+
+Not a unit test - it drives a running server the way OpenCode does, including the reasoning
+round-trip that llama.cpp silently drops.
+
+usage: scripts/smoke_server.py [--url http://127.0.0.1:8081] [--max-tokens 96]
+"""
+import argparse
+import json
+import time
+import urllib.request
+
+FAIL = []
+
+
+def check(cond, label, detail=""):
+    mark = "ok  " if cond else "FAIL"
+    if not cond:
+        FAIL.append(label)
+    print(f"  [{mark}] {label}" + (f"  {detail}" if detail else ""))
+
+
+def post(url, payload, stream=False, timeout=900):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    if stream:
+        req.add_header("Accept", "text/event-stream")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        if not stream:
+            return json.loads(r.read())
+        chunks = []
+        for raw in r:
+            line = raw.decode().strip()
+            if not line.startswith("data: "):
+                continue
+            body = line[6:]
+            if body == "[DONE]":
+                chunks.append(None)
+                continue
+            chunks.append(json.loads(body))
+        return chunks
+
+
+def get(url, timeout=30):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default="http://127.0.0.1:8081")
+    ap.add_argument("--max-tokens", type=int, default=96)
+    args = ap.parse_args()
+    base = args.url.rstrip("/")
+
+    print(f"amp-server smoke test against {base}\n")
+
+    # ---- 1. liveness + diagnostics -------------------------------------------------
+    print("1. health and models")
+    h = get(f"{base}/health")
+    check(h.get("status") == "ok", "/health status ok", h.get("detail", "")[:60])
+    m = get(f"{base}/v1/models")
+    check(m.get("object") == "list" and len(m["data"]) == 1, "/v1/models shape")
+    check(m["data"][0].get("id"), "model id present", m["data"][0].get("id", ""))
+
+    # ---- 2. raw completion ---------------------------------------------------------
+    print("\n2. /v1/completions returns the raw generation (think block included)")
+    t0 = time.time()
+    c = post(f"{base}/v1/completions",
+             {"prompt": "Q: What is 17*23? A:", "n_predict": args.max_tokens, "temperature": 0})
+    dt = time.time() - t0
+    text = c["choices"][0]["text"]
+    check(len(c["choices"][0]["text"]) > 8 or c["choices"][0]["finish_reason"] == "length",
+          "completion produced text", repr(text[:60]))
+    check(c["choices"][0]["finish_reason"] in ("stop", "length"), "finish_reason valid",
+          c["choices"][0]["finish_reason"])
+    check(c["usage"]["completion_tokens"] > 0, "usage.completion_tokens",
+          str(c["usage"]["completion_tokens"]))
+    check("prompt_tokens" in c["usage"], "usage.prompt_tokens")
+    t = c.get("amp_timings", {})
+    check(t.get("predicted_per_second", 0) > 0, "timings present",
+          f"prefill {t.get('prompt_per_second', 0):.1f} t/s, decode {t.get('predicted_per_second', 0):.2f} t/s")
+    print(f"       {dt:.1f}s wall for {c['usage']['completion_tokens']} tokens")
+
+    # ---- 3. chat + reasoning split -------------------------------------------------
+    print("\n3. /v1/chat/completions: template rendering and the reasoning split")
+    msgs = [{"role": "user", "content": "What is 17*23? Answer with just the number."}]
+    ch = post(f"{base}/v1/chat/completions",
+              {"messages": msgs, "max_tokens": args.max_tokens, "temperature": 0})
+    msg = ch["choices"][0]["message"]
+    check(msg["role"] == "assistant", "role is assistant")
+    check("content" in msg, "content field present")
+    check("reasoning_content" in msg or len(msg.get("content", "")) > 0,
+          "reasoning or content present",
+          f"reasoning={len(msg.get('reasoning_content',''))} content={len(msg.get('content',''))}")
+
+    # ---- 4. prefix cache: the agentic pattern ---------------------------------------
+    # This is what OpenCode does every turn: resend the whole conversation, including the assistant
+    # turn verbatim. The cached sequence is prompt+completion, so the common prefix should cover
+    # everything and only the new user message needs evaluating.
+    print("\n4a. prefix cache: agentic append (history resent verbatim)")
+    before = get(f"{base}/props")["prefix_cache"]
+    t_a = msg.get("content", "") or "391"
+    follow = msgs + [{"role": "assistant", "content": t_a,
+                      "reasoning_content": msg.get("reasoning_content", "")},
+                     {"role": "user", "content": "Now multiply that by 2. Answer with just the number."}]
+    c2 = post(f"{base}/v1/chat/completions",
+              {"messages": follow, "max_tokens": args.max_tokens, "temperature": 0})
+    t2 = c2["amp_timings"]
+    total = t2["prompt_n"] + t2["prompt_cached"]
+    check(t2["prompt_cached"] > 0, "append reused the cached prefix",
+          f"cached {t2['prompt_cached']}/{total} tokens ({100 * t2['cache_hit_rate']:.0f}%)")
+    check(t2["cache_rewound_exactly"] is True, "no rewind needed for an append")
+    check(c2["usage"]["prompt_tokens_details"]["cached_tokens"] == t2["prompt_cached"],
+          "usage reports the cached count honestly",
+          str(c2["usage"]["prompt_tokens_details"]["cached_tokens"]))
+    check(bool(c2["choices"][0]["message"].get("content")), "answer is non-empty",
+          repr(c2["choices"][0]["message"].get("content", "")[:60]))
+    # Not asserted: the exact wording. This is a base-model quant, and greedy decoding of "multiply
+    # that by 2" can legitimately be conversational. Output *quality* is gated by scripts/parity.py
+    # against llama-server, which is a much stronger check than a string match here.
+
+    # ---- 4b. divergence must be handled, not crash ----------------------------------
+    print("\n4b. divergent prompt: correct answer, no position abort")
+    other = [{"role": "user", "content": "What is the capital of France? One word."}]
+    c3 = post(f"{base}/v1/chat/completions",
+              {"messages": other, "max_tokens": args.max_tokens, "temperature": 0})
+    check(bool(c3["choices"][0]["message"].get("content")), "divergent request answered",
+          repr(c3["choices"][0]["message"].get("content", "")[:40]))
+    t3 = c3["amp_timings"]
+    check(t3["prompt_n"] == c3["usage"]["prompt_tokens"] or t3["prompt_n"] > 0,
+          "divergent prompt was evaluated", f"computed {t3['prompt_n']} tokens")
+    print(f"       cache_rewound_exactly={t3['cache_rewound_exactly']} "
+          f"(false means the recurrent memory cannot rewind, so a full re-prefill is the only "
+          f"correct option)")
+
+    after = get(f"{base}/props")["prefix_cache"]
+    check(after["requests"] > before["requests"], "props cache stats advanced",
+          f"{before['requests']} -> {after['requests']} requests")
+    check(after["rewinds_cleared"] + after.get("rewinds_exact", 0) >= 1,
+          "the divergence was recorded as a rewind",
+          f"exact={after.get('rewinds_exact', 0)} cleared={after['rewinds_cleared']}")
+
+    # ---- 5. streaming --------------------------------------------------------------
+    print("\n5. SSE streaming")
+    chunks = post(f"{base}/v1/chat/completions",
+                  {"messages": [{"role": "user", "content": "Count: 1 2 3"}],
+                   "max_tokens": 24, "temperature": 0, "stream": True}, stream=True)
+    check(chunks and chunks[-1] is None, "stream terminated with [DONE]",
+          f"{len(chunks)} events")
+    check(chunks[0]["choices"][0]["delta"].get("role") == "assistant", "first chunk has the role")
+    finish = [c for c in chunks if c and c["choices"][0].get("finish_reason")]
+    check(bool(finish), "a chunk carries finish_reason",
+          finish[0]["choices"][0]["finish_reason"] if finish else "")
+    text = "".join(c["choices"][0]["delta"].get("content", "")
+                   for c in chunks if c and c["choices"][0].get("delta"))
+    check(len(text) > 0, "streamed deltas reassemble into text", repr(text[:50]))
+    if finish and "usage" in finish[0]:
+        check(finish[0]["usage"]["completion_tokens"] > 0, "final chunk carries usage")
+
+    # ---- 6. error handling ---------------------------------------------------------
+    print("\n6. errors are clean, not crashes")
+    try:
+        post(f"{base}/v1/chat/completions", {"messages": []})
+        check(False, "empty messages rejected")
+    except urllib.error.HTTPError as e:
+        check(e.code == 400, "empty messages -> 400", str(e.code))
+    try:
+        post(f"{base}/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}],
+                                             "max_tokens": 10 ** 9})
+        check(True, "absurd max_tokens does not take the server down")
+    except Exception as e:  # noqa: BLE001
+        check(False, "absurd max_tokens handled", str(e)[:80])
+    check(get(f"{base}/health").get("status") == "ok", "server still healthy afterwards")
+
+    print("\n" + ("FAILED: " + ", ".join(FAIL) if FAIL else "all checks passed"))
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

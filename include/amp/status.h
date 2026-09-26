@@ -67,6 +67,9 @@ public:
     // move the payload out (for move-only types)
     T take() { return std::move(value_); }
 
+    // Allows `return some_operation_returning_Result<T>(...)` in a Status-returning function.
+    operator Status() const { return status_; }
+
     Status status_with_context(const std::string & what) const {
         return ok() ? Status::OK() : status_.context(what);
     }
