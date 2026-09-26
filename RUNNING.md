@@ -27,83 +27,101 @@ Check it:
 
 ```bash
 M=/home/e0u/localhost/models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-./build/bin/amp-server --model $M --port 8081 --ctx 200000
+./build/bin/amp-server --model $M --port 8081 -c 200000
 ```
 
-It plans its own memory layout, warms the page cache (about 5 s for 9.6 GiB), then serves:
+**`amp-server` is llama.cpp's server.** Every flag `llama-server` accepts is accepted here, because
+argv goes straight to `common_params_parse`. The endpoint list is therefore llama.cpp's, not ours:
+`/v1/chat/completions` and `/v1/completions` (with SSE), `/v1/messages` (Anthropic),
+`/v1/responses` (OpenAI Responses), `/v1/embeddings`, `/v1/rerank`, `/infill`, `/tokenize`,
+`/detokenize`, `/apply-template`, the `*/input_tokens` counting routes, `/props`, `/health`,
+`/v1/models`, `/metrics`, `/slots`, `/slots/:id`, `/lora-adapters`. `docs/PARITY.md` is the full
+contract, including which features cannot work on this box and why.
 
-| endpoint | purpose |
-|---|---|
-| `POST /v1/chat/completions` | chat, SSE streaming, `reasoning_content` split out of `<think>` blocks |
-| `POST /v1/completions` | raw text completion, think block included |
-| `POST /apply-template` | the prompt the server will evaluate — use this to debug a cache miss |
-| `POST /tokenize` | token ids for a prompt |
-| `GET /props` | plan, prefix-cache stats, page-cache and VRAM state |
-| `GET /health`, `GET /v1/models` | liveness, model list |
+Note the flag names are llama.cpp's, not amp's old ones: **`-c` / `--ctx-size`, not `--ctx`.**
 
-Aliases without the `/v1` prefix are registered too. `--api-key KEY` (or `--api-key-file`) requires
-`Authorization: Bearer`. Useful flags: `--parallel N` (extra sequences, costs KV), `--gpu-layers N` /
-`--ubatch N` (override the plan), `--no-warm` (start fast, first request slow), `--n-predict N`
-(default `max_tokens`), `--reasoning-budget N` (see below).
+amp's own flags are environment variables, so they cannot collide with upstream's:
 
-### Thinking models: what this one supports
-
-It is a reasoning model, and its template is unusual in a way that breaks naive servers. The rendered
-generation prompt ends **inside** a think block — `<|im_start|>assistant\n<think>\n` — so the model
-reasons before answering and *never emits the opening tag*. `GET`/`POST /apply-template` shows you
-exactly what will be evaluated; use it whenever a turn misbehaves.
-
-| capability | how | status in amp |
+| variable | default | effect |
 |---|---|---|
-| thinking on/off | `chat_template_kwargs: {"enable_thinking": false}` | wired, **but not taking effect** — see below |
-| preserve reasoning in history | `preserve_thinking` (llama.cpp calls it `preserve_reasoning` and maps it) | current turn is preserved automatically by the template; older turns need the flag |
-| reasoning field names accepted from a client | `reasoning_content`, `reasoning_text`, `reasoning` | all three |
-| thinking budget | `--reasoning-budget N`, or `reasoning_budget_tokens` per request: `-1` unrestricted (default), `0` close immediately, `N` tokens | works, off by default |
-| `reasoning_format` (`none`/`auto`/`deepseek`/`deepseek-legacy`) | request field | **not implemented**; amp always behaves like `deepseek` |
-| `reasoning_effort` | request field | template does not implement it |
-| tool calls | the template renders `tool_calls` | rendered into the prompt; **no structured `tool_calls` in responses yet** |
+| `AMP_CTX` | 200000 | context to plan for when you do not pass `-c` |
+| `AMP_WARM` | off | page-cache warm before the model load (see below) |
+| `AMP_VERBOSE` | off | log every preflight decision, not just the plan |
 
-`--reasoning-budget` is llama.cpp's mechanism (`common_reasoning_budget_init`), armed by replaying the
-prefill tokens through the sampler. It is off by default on purpose: forcing a close mid-thought makes
-this quant loop (`2+2 = 4. </think> 2+2 = 4. </think> ...`), so it would trade a parsing bug for a
-generation bug. `--reasoning-budget -1` restores unrestricted thinking.
+### What amp adds, and what it deliberately does not
 
-**Known issue:** `enable_thinking: false` does not currently change the rendered prompt — it stays
-`<|im_start|>assistant\n<think>\n`. It is routed through the field llama.cpp reads
-(`common_chat_templates_inputs::enable_thinking`, because `chat-auto-parser-helpers.cpp:322` overwrites
-the kwarg), so the remaining cause is the autoparser's reasoning-mode detection pinning the open tag.
-Verified with `/apply-template`, not assumed.
+The preflight turns the memory plan into `common_params` before the model loads. It **never
+overrides a flag you passed**, and it is a complete no-op if you pass `--fit` or your own device
+layout (`-ngl`, `-ncmoe`, `-ot`). At start-up it logs every decision it made, for example:
+
+    amp: plan: g=4 ubatch=1024 kv=1.55 GiB predicted 240 t/s prefill / 15 t/s decode
+    amp: layout: 4 expert layers on GPU, 36 pinned to CPU (10.90 GiB CPU expert set)
+    amp: n_ctx_checkpoints: 2 (clamped from 32; each is ~1.6 GiB at 200k ctx)
+    amp: cache_ram_mib: 512 (clamped from 8192; the prompt cache evicts the model's page cache)
+    amp: warm: off (the load's MAP_POPULATE + fadvise(SEQUENTIAL) already reads the whole file)
+
+Those three clamps matter: llama.cpp's own defaults for `n_ctx_checkpoints` and `cache_ram_mib` are
+32 and 8192, and on this box they are a way to exhaust RAM. `docs/AGENT.md` has the reasoning.
+
+**It is not faster than a well-configured `llama-server` at steady state.** Measured with 5
+identical requests per engine: amp 28.39 t/s decode, llama-server 30.05 t/s. What the plan buys is
+that the CPU expert set fits the page cache (10.90 GiB) where llama-server's documented config does
+not (~11.5 GiB), so amp does not collapse — llama-server's first request runs at 1.96 t/s, amp's at
+26 t/s. See `docs/BENCH.md`.
+
+### Thinking models
+
+This is a reasoning model, and its template renders the generation prompt already **inside** a
+`<think>` block, so it reasons before answering and never emits the opening tag.
+
+| capability | how | status |
+|---|---|---|
+| thinking on/off | `chat_template_kwargs: {"enable_thinking": false}` | **works** — verified with `/apply-template` |
+| thinking on/off (server-wide) | `--reasoning off` | works |
+| reasoning field names from a client | `reasoning_content`, `reasoning_text`, `reasoning` | all three, via llama.cpp |
+| reasoning split in responses | automatic | `reasoning_content` separate from `content` |
+| `reasoning_format` | `none` / `auto` / `deepseek` / `deepseek-legacy` | works, upstream's implementation |
+| structured `tool_calls` | `tools` + `tool_choice` | works, with a real id and parsed `arguments` |
+| thinking budget | `reasoning_budget_tokens` | upstream's sampler; **left off by default**, see below |
+| `reasoning_effort` | request field | accepted and **ignored**: this template has no such capability |
+
+`enable_thinking: false` is the supported way to get a direct answer. It is a large win on short
+requests: the same question costs **104 completion tokens thinking and 2 not thinking**, same answer.
+The reasoning budget forces a `</think>` mid-thought, and this quant tends to loop after a forced
+close (`2+2 = 4. </think> 2+2 = 4. </think> ...`), so it stays opt-in.
+
+Always inspect `POST /apply-template` when a turn misbehaves — it shows the exact prompt the server
+will evaluate, for free.
 
 ### Concurrency
 
-One generation at a time, by design: a `llama_context` is not reentrant, and OpenCode issues a side
-request (conversation title) while the main stream runs. Requests queue instead of racing — see
-section 7 of `smoke_server.py`. On the pre-task-queue build, four concurrent streams returned zero bytes
-each and the process died.
+llama.cpp's server owns slot scheduling, so a `llama_context` is never reentered. Our old
+hand-rolled server got this wrong and died under four concurrent streams; section 7 of
+`scripts/smoke_server.py` is the regression test for it, and `scripts/parity_test.py` keeps it.
 
 Point OpenCode at it by setting `baseURL` to `http://127.0.0.1:8081/v1` in
 `~/.config/opencode/opencode.json`.
 
-Check a running server end to end — health, raw completion, chat, the agentic prefix-cache pattern,
-divergence, streaming, errors, **a prompt longer than the ubatch**, **the reasoning split**, and
-**four concurrent streams**:
+### Tests
 
 ```bash
-./scripts/smoke_server.py --url http://127.0.0.1:8081
+# every llama.cpp route and response shape this box can actually exercise
+python3 scripts/parity_test.py --url http://127.0.0.1:8081
+
+# the real client: 3 prompts that use tools, in a pristine workspace each
+./scripts/harness/run.sh --url http://127.0.0.1:8081
+
+# quality: KL divergence and determinism against a reference capture
+python3 scripts/kl_parity.py capture --url http://127.0.0.1:8081 --tag amp --out quality/amp.json
+python3 scripts/kl_parity.py compare --a quality/llama-matched.json --b quality/amp.json
+
+# speed: prefill and decode as a sequence, never a single request
+python3 scripts/bench_server.py --url http://127.0.0.1:8081 --tag amp --n 5
 ```
 
-Seven sections; the last three are regression tests for bugs that reached real use.
-
-Every answer carries `amp_timings`, including `prompt_cached` and `cache_rewound_exactly`, so you can
-tell a cache hit from a re-evaluation instead of guessing from a pause. `GET /props` shows the
-lifetime totals.
-
-### The one behaviour worth knowing
-
-This model has 30 recurrent layers out of 40, so its KV cannot be rewound. amp therefore checkpoints
-the sequence at the *prompt boundary* and restores it after each answer, which is what lets the next
-turn extend the cache. A turn whose history diverges from the cached one is still answered correctly
-— it just re-evaluates the prompt, and says so in `cache_rewound_exactly: false`.
+A KL comparison is only meaningful with **placement held fixed** — amp's plan deliberately chooses a
+different device layout from llama.cpp's default, which on its own produces ~11 % top-1 agreement
+from a 0.012 logprob difference. Match the layout, then compare; see `docs/BENCH.md`.
 
 ## Everyday commands
 

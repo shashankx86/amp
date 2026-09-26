@@ -80,44 +80,62 @@ The `IoMode` distinction is deliberate and load-bearing:
 
 ### amp_runtime
 
-The forward path (`amp-infer`) and the two pieces of state that make a server viable.
+The forward path for `amp-infer` (the benchmark tool), on llama.cpp's kernels.
 
 - `model_runtime.cpp` — tokenize, embed, 40 blocks (30 recurrent + 10 attention), sample. Uses the
   legacy `llama_batch` API; the prefetcher walks expert ranges ahead of the compute thread.
 - `buft_overrides.{h,cpp}` — builds the null-terminated `tensor_buft_overrides` array that pins
   `ffn_*_exps.weight` to the CPU for the layers the plan left there (the `-ncmoe` equivalent).
   One helper, because a missing sentinel is a segfault and two call sites had it.
-- `prefix_cache.{h,cpp}` — token-level longest-common-prefix matching across sequences, with
-  **prompt-boundary checkpoints**: the sequence state is snapshotted at the end of the prompt and
-  restored after generation, because 30 of this model's 40 layers are recurrent and cannot be rewound.
 
-### amp_server
+### amp_preflight — the whole of amp's server contribution
 
-The HTTP layer, the engine, and the OpenAI translation.
+`src/plan/preflight.{h,cpp}`, plus `tools/amp_server.cpp` which is ~90 lines. There is no amp HTTP
+layer, no amp OpenAI translation, no amp slot management, and no amp prompt cache. All of it is
+llama.cpp's `tools/server`, linked in statically, driven through its exported entry point:
 
-- `http_server.cpp` — HTTP/1.1 with chunked framing, a small thread pool, SSE. Written from scratch;
-  ~400 lines is cheaper than a dependency in a project that vendors exactly one C++ library.
-- `task_queue.cpp` — **one worker, FIFO**. A `llama_context` is not reentrant, and agentic clients put
-  two requests in flight at once (OpenCode asks for a conversation title while the main stream runs).
-  Serialization lives inside `InferenceService::generate()` so no handler path can bypass it.
-- `service.cpp` — owns the model, the context, the sequences, the prefix cache and the chat templates.
-  Runs one generation at a time, warms the page cache at start-up, verifies VRAM after context init and
-  backs the ubatch off until it fits.
-- `openai_api.cpp` — request/response translation. Shapes are copied field for field from
-  `tools/server/server-task.cpp`: the chunk envelope including `system_fingerprint`, the
-  `stream_options.include_usage` trailing chunk with empty `choices`, and OpenAI's error `type`
-  strings. A stream always ends with a `finish_reason` and then `[DONE]`, including on failure.
+    common_params params;
+    common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER);  // every upstream flag
+    apply_preflight(opts, params, argv);                            // amp's plan -> common_params
+    llama_server(params, 0, nullptr);                               // upstream's server
 
-### amp_util additions
+What the preflight actually does, and why each part exists:
 
-- `json.{h,cpp}` — minimal JSON, with every converting constructor explicit (see AGENT.md for the bug
-  that forced it).
-- `text.{h,cpp}` — `normalize_reasoning`, so a client that echoes a tagged `<think>...</think>` block
-  cannot make the re-rendered prompt diverge on every turn.
+1. **Never overrides an explicit flag.** llama.cpp discards its record of which args were supplied
+   (`seen_args` at `common/arg.cpp:814` is local to the parser), so the preflight scans `argv`
+   itself. The only reliable field-level tests are `n_gpu_layers` (-1 = unset) and
+   `tensor_buft_overrides` (null first entry = unset).
+2. **Device layout** — the plan's expert-layer count becomes `tensor_buft_overrides`, written *in
+   place* into the buffer `common_params_parse` already padded to 4096 entries. Never `push_back`
+   past the sentinel: `common.cpp:1706` asserts on it and the tensor loader walks to it.
+3. **Context, ubatch, KV dtypes, threads, flash-attn** — set only when the user did not pass them.
+4. **Three clamps on llama.cpp defaults that are dangerous on this box**: `n_ctx_checkpoints` 32 to
+   2 (each checkpoint is a *full* serialized sequence state, ~1.6 GiB at 200k), `cache_ram_mib` 8192
+   to 512 (anonymous RAM that evicts the model's page cache), and `fit_params` off.
+5. **Plans with the configuration it will actually apply.** This sounds obvious and was wrong twice:
+   planning with `opts.n_ctx` instead of the user's `-c` cost 4 GPU expert layers, and planning with
+   llama.cpp's default f16 KV while then setting q8_0/q4_0 cost another 4 layers and a 2.7x smaller
+   ubatch. Both are recorded in docs/BENCH.md.
+
+It never initialises a backend, loads the model, or creates a context — `llama_server()` owns all
+of that, and doing any of it twice would read 12 GB of weights twice.
+
+## What was deleted, and why
+
+The hand-rolled server (`src/server/`, ~2,200 lines) plus the code that only existed to serve it
+(`prefix_cache`, `util/json`, `util/text`, ~1,600 more) is gone. It implemented 7 endpoints;
+llama.cpp's server implements 40+ and is maintained against the commit we pin.
+
+The prefix cache is the deletion worth arguing for, because it was real work: 30 of 40 layers here
+are recurrent, so the KV cannot be rewound, and it snapshotted the sequence at the prompt boundary
+to work around that. llama.cpp solves it better — it asks the model what it supports via
+`common_context_seq_rm_type` (`common.h:989-992`), keeps context checkpoints with `pos_min`/`pos_max`
+ranges, and falls back to a full re-process with a log line pointing at the upstream PR that added
+it for hybrid/recurrent memory (`server-context.cpp:3379`). Maintaining our own version of a solved
+problem was the mistake, not writing it.
 
 ## Known duplication
 
-`ModelRuntime` (CLI) and `InferenceService` (server) are two implementations of the same forward loop:
-the CLI has the prefetcher, the server has the cache and the task queue. Deliberate — the server was
-built against the reference implementation rather than by refactoring a benchmark harness — and it is
-the first thing to fix now that both are proven.
+`ModelRuntime` (the `amp-infer` CLI) and llama.cpp's server context are two forward loops. This one
+is deliberate and worth keeping: the CLI is the measurement harness, it has the prefetcher, and it
+can be A/B'd against the server without a network round trip. It is not on the serving path.
