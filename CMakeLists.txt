@@ -8,7 +8,6 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-
 # ---------------------------------------------------------------------------
 # ggml: amp reuses the *exact* kernels llama.cpp uses, so the quantized math is
 # bit-identical. We link the already-built shared libraries from the local
@@ -16,6 +15,11 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ---------------------------------------------------------------------------
 set(AMP_LLAMA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp" CACHE PATH "llama.cpp source root")
 set(AMP_GGML_BIN_DIR "${AMP_LLAMA_ROOT}/build/bin" CACHE PATH "directory containing libggml*.so")
+
+# amp links llama.cpp's shared libs, so bake their location into the binaries: the tools must run
+# without LD_LIBRARY_PATH. (Must come after AMP_GGML_BIN_DIR is defined.)
+set(CMAKE_BUILD_RPATH "${AMP_GGML_BIN_DIR}")
+set(CMAKE_INSTALL_RPATH "${AMP_GGML_BIN_DIR}")
 
 find_path(AMP_GGML_INCLUDE_DIR ggml.h
   PATHS "${AMP_LLAMA_ROOT}/ggml/include" "${AMP_LLAMA_ROOT}/ggml/src"

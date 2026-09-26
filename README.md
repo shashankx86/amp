@@ -50,12 +50,23 @@ changing the numbers.
 Measurements and open questions: `docs/BENCH.md`. Design: `docs/ARCHITECTURE.md`.
 Working rules and hard constraints: `AGENT.md`.
 
-## Build
+## Build and run
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DAMP_LLAMA_ROOT=../llama.cpp
 cmake --build build -j$(nproc)
+
+M=/home/e0u/localhost/models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
+./build/amp-plan  --model $M                    # what the planner decided, and why
+./build/amp-warm  --model $M --what plan        # pull the expert set into the page cache
+./build/amp-infer --model $M --prompt "hi" -n 128
+./scripts/head2head.sh                          # amp vs llama-server on the same prompt
+./scripts/parity.py                             # quality parity, three ways
 ```
 
-Requires the local llama.cpp build (`../llama.cpp/build/bin/libggml*.so`) — amp links ggml so the
+**amp is not a server yet** — for chat today keep using the `llama-server` command in `../RUN.md`.
+Full instructions: [`RUNNING.md`](RUNNING.md).
+
+Requires the local llama.cpp build (`../llama.cpp/build/bin/libllama*.so`); its location is baked
+into the binaries with RPATH, so no `LD_LIBRARY_PATH` is needed. amp links llama.cpp so the
 quantized math is literally the same code llama.cpp runs.
