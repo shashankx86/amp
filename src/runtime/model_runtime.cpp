@@ -241,6 +241,9 @@ Result<std::unique_ptr<ModelRuntime>> ModelRuntime::create(const RuntimeConfig &
         return Status::Error("llama_init_from_model failed for unknown reasons");
     }
 
+    if (cfg.top_k_track > 0) {
+        rt->top_k_track_ = cfg.top_k_track;
+    }
     llama_sampler_chain_params sp = llama_sampler_chain_default_params();
     sp.no_perf                  = true;
     rt->smpl_                   = llama_sampler_chain_init(sp);   // a chain is a llama_sampler
@@ -331,6 +334,82 @@ Status ModelRuntime::prefill(const std::vector<llama_token> & tokens) {
         stats_.warm_calls        = prefetch_->calls();
     }
     return Status::OK();
+}
+
+// Scores a FIXED token sequence. Same as generate() except the next token is read from `tokens`
+// rather than sampled, so two engines with different KV dtypes evaluate the identical prefix at
+// every position and their per-position distributions are directly comparable.
+//
+// The distribution is captured BEFORE the token at that position is consumed, exactly as in
+// generate(), so position i's top-k is the distribution over the token that appears at position i.
+// That is the convention the logprob dumps already use, so existing captures stay comparable.
+Result<std::vector<llama_token>> ModelRuntime::score(const std::vector<llama_token> & tokens) {
+    if (!smpl_) {
+        return Status::Error("no sampler");
+    }
+    decode_batch_.assign(1, 0);
+    logprobs_.clear();
+
+    const Stopwatch sw;
+    std::vector<llama_token> scored;
+    scored.reserve(tokens.size());
+
+    for (size_t i = 0; i < tokens.size(); i++) {
+        if (prefetch_) {
+            prefetch_->prime_for_decode();
+        }
+
+        if (top_k_track_ > 0) {
+            const float * logits = llama_get_logits_ith(ctx_, -1);
+            if (logits) {
+                const int n = llama_vocab_n_tokens(vocab_);
+                std::vector<std::pair<float, int32_t>> all;
+                all.reserve((size_t) n);
+                for (int t = 0; t < n; t++) {
+                    all.emplace_back(logits[t], t);
+                }
+                const int k = std::min(top_k_track_, n);
+                std::partial_sort(all.begin(), all.begin() + k, all.end(),
+                                  [](const auto & a, const auto & b) { return a.first > b.first; });
+                const float maxl = all.front().first;
+                double      sum  = 0.0;
+                for (const auto & kv : all) {
+                    sum += std::exp((double) (kv.first - maxl));
+                }
+                const double logZ = (double) maxl + std::log(sum);
+                std::vector<TopK> tk;
+                for (int j = 0; j < k; j++) {
+                    tk.push_back({ all[(size_t) j].second,
+                                   (float) ((double) all[(size_t) j].first - logZ) });
+                }
+                logprobs_.push_back(std::move(tk));
+            }
+        }
+
+        const llama_token id = tokens[i];
+        // The sampler still sees the forced token, so penalties and any stateful sampler stay in
+        // step with what the arm is being asked to score. It is not sampling this.
+        llama_sampler_accept(smpl_, id);
+        if (llama_vocab_is_eog(vocab_, id)) {
+            scored.push_back(id);
+            break;
+        }
+        scored.push_back(id);
+
+        if (i + 1 < tokens.size()) {
+            decode_batch_[0] = id;
+            llama_batch batch = llama_batch_get_one(decode_batch_.data(), 1);
+            const int32_t rc = llama_decode(ctx_, batch);
+            if (rc != 0) {
+                return Status::Errorf("llama_decode failed while scoring (rc=%d)", rc);
+            }
+            n_past_++;
+            stats_.n_decode_calls++;
+        }
+    }
+    stats_.decode_tokens = (int64_t) scored.size();
+    stats_.decode_ms    = sw.elapsed_s() * 1e3;
+    return scored;
 }
 
 Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::string * text_out) {

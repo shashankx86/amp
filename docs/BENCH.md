@@ -1536,3 +1536,77 @@ to fill, so a 5-prompt run cannot expose an eviction effect even if it is real. 
 own earlier test used 18k prompts, which is why the effect, if it exists, needs at least 4
 prompts to appear. Any future test of a cache-vs-page-cache lever has to run past the point
 where the cache fills, and check that it did.
+
+## 2026-09-28: the v1 preset measured at long context, which required fixing the quality instrument first
+
+Strata's finding to check: their 4-bit KV with a 256-point Hadamard rotation **costs real
+precision, and the cost grows with context** - document perplexity +8% at 1K and +12% at 8K.
+amp's `v1` preset is `q8_0` K / `q4_0` V and had only ever been measured at 32,768 context. So
+the claim was untested here at exactly the place it would matter.
+
+### The instrument was wrong first, in a way that would have produced a false result
+
+`kl_parity.py capture` generates greedily and records the distribution at each position. Two
+arms therefore sample their own tokens, so the first argmax difference puts them on **different
+prefixes**, and every later position compares two different questions. Measured at 131,072 with
+placement pinned: **444 of 512 positions "disagreed"**, median KL 1.7e-05, and the per-block
+breakdown showed the distribution wandering with no relationship to the dtype. That number
+measures the divergence cascade, not the KV dtype.
+
+The fix is teacher forcing — score a *fixed* token sequence so every position is comparable.
+Three changes made that possible, and each was a latent trap:
+
+- **`ModelRuntime::score()`** (`src/runtime/model_runtime.cpp`) generates the same way but reads
+  the next token from a supplied sequence instead of sampling it. The sampler is still fed each
+  token, so penalties and any stateful sampler stay in step.
+- **`--emit-score`** on `amp-infer` writes a reference run's tokens as a fixture, and
+  **`--score-file`** makes every arm score those exact tokens.
+- **`--logprobs-n`**, because `top_k_track_` was a hard-coded **5**. A token falling out of a
+  5-wide window in one arm and not the other reads as a disagreement that is really the window's
+  edge. With 5 candidates, teacher-forced `q8_0/q8_0` reported 92.2% top-1 disagreement while
+  the underlying first-pair argmax agreed at positions 0, 1 and 2. It is now 32 and configurable.
+
+### Controls first, because they decide whether the rest means anything
+
+| control | result |
+|---|---|
+| f16 vs f16, same config, two runs | **byte-identical** |
+| `q8_0/q8_0` vs itself, two runs | **byte-identical** |
+| `q8_0/q8_0` at g=3 vs g=6 | median KL **1.217e-04**, 8/512 top-1 flips |
+
+The engine is bit-deterministic on the scored path, and **placement alone moves the median KL
+by 1.2e-04** — the same quantized matmul accumulated on CPU and GPU sums in a different order.
+That is the floor any dtype number has to be read against.
+
+### The result
+
+512 teacher-forced positions, `-c 131072`, g=3 for every arm, 32-wide window, reference f16/f16.
+**Every arm's f16 reference is the same fixture**, so the only variable is the KV dtype.
+
+| arm | top-1 flip | median KL(f16‖arm) | mean | median KL(arm‖f16) | median Δ top-1 logprob | vs placement floor |
+|---|---:|---:|---:|---:|---:|---:|
+| `q8_0/q4_0` (v1) | 60/512 (11.7%) | **3.551e-03** | 1.152e-02 | 3.658e-03 | 0.0640 | 29.2x |
+| `q8_0/q8_0` (v2) | 54/512 (10.5%) | **3.179e-03** | 9.520e-03 | 3.565e-03 | 0.0537 | 26.1x |
+
+### What this does and does not say
+
+**The dtype effect is real and an order of magnitude above the placement floor** — 26-29x it,
+not 1.2x, so this is not float reordering in disguise.
+
+**But v1 and v2 are within 12% of each other at 131k** (3.551e-03 against 3.179e-03), where at
+32k v2 was 8.8x closer to f16. **The gap between q8_0 and q4_0 in V largely closes at long
+context.** That is the opposite of Strata's shape — their q4_0 penalty *grew* with context
+(+8% at 1K, +12% at 8K) — and it is consistent with what this model is: only 2 KV heads at
+key/value length 256, so the V cache is small and the long-context cost lands in attention
+rounding rather than in V's own error.
+
+**So the honest reading of Strata's warning here is: the v1 preset is not measurably worse than
+v2 at long context, and therefore is not the quality risk it was assumed to be.** v2 stays the
+default because it is no worse and its 32k advantage is real, but `v1` is no longer a suspect
+at 200k. What *is* real at 131k is that **both** q8_0 configs are 26-29x further from f16 than
+placement noise, which is a larger gap than the 32k measurement suggested and is worth knowing
+before claiming q8_0 is near-lossless on this model.
+
+Per-block, the divergence does not compound with position (v1: 1.0e-02 early, 3.6e-04 late;
+v2: 1.1e-02 early, 5.7e-04 late), so this is a stationary per-token rounding cost, not an
+error that accumulates down a long context.

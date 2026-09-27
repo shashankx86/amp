@@ -41,6 +41,10 @@ struct RuntimeConfig {
     float       temperature      = 0.6f;
     float       top_p            = 0.95f;
     int32_t     top_k            = 20;
+    // Width of the per-position top-k retained for --dump-logprobs. Reporting only, never
+    // sampling. 32, because 5 is narrow enough that a token leaving the window in one arm and
+    // not the other reads as a disagreement that is really the window's edge.
+    int32_t     top_k_track      = 32;
     uint32_t    seed             = LLAMA_DEFAULT_SEED;
     bool        verbose          = false;
 };
@@ -132,6 +136,21 @@ public:
     // Generates up to max_new tokens. Returns the generated tokens.
     Result<std::vector<llama_token>> generate(int32_t max_new, std::string * text_out = nullptr);
 
+    // TEACHER FORCED SCORING, and the reason the plain generate() path cannot measure quality.
+    //
+    // generate() samples its own token at every step, so the moment one engine's argmax differs
+    // from another's, the two are conditioning on DIFFERENT prefixes and every later position
+    // compares two different questions. That is what saturates a 512-position KL comparison: the
+    // engine is bit-deterministic, so arms agree exactly until a rounding difference flips one
+    // argmax, and after that the arms are reading different text. Measured on this model: the
+    // distributions are near-identical for the first ~48 positions and then "disagree" at 444 of
+    // 512 - which measures the divergence cascade, not the dtype.
+    //
+    // This scores a FIXED token sequence: every arm evaluates the same tokens, so every position
+    // is comparable and the number means what it claims. `tokens` is the continuation to score;
+    // the returned per-position top-k is over the same positions for every arm.
+    Result<std::vector<llama_token>> score(const std::vector<llama_token> & tokens);
+
     // Full detokenized text of the last generate() call (for quality diffing).
     const std::string & last_text() const { return last_text_; }
 
@@ -168,7 +187,12 @@ private:
     std::vector<llama_token>             decode_batch_;  // reusable batch storage
     std::string                          last_text_;
     std::vector<std::vector<TopK>>       logprobs_;
-    int32_t                              top_k_track_ = 5;
+    // Width of the per-position top-k kept for --dump-logprobs. It is a REPORTING width, not a
+    // sampling one: the sampler still uses top_k. But it bounds every quality comparison made
+    // from the dump, because a token that falls out of the window in one arm and not the other
+    // reads as a disagreement that is really the window. 5 made an 87% "disagreement" that was
+    // entirely the window. Default raised to 32; expose it on amp-infer and amp-server.
+    int32_t                              top_k_track_ = 32;
 };
 
 } // namespace amp

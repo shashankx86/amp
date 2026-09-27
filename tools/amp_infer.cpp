@@ -76,6 +76,10 @@ int main(int argc, char ** argv) {
     bool          json          = false;
     std::string   dump_output;
     std::string   dump_logprobs;
+    // Teacher forcing: score a fixed token file instead of sampling. See ModelRuntime::score()
+    // for why this and plain --dump-logprobs are different measurements.
+    std::string   score_file;
+    std::string   emit_score;
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -100,8 +104,11 @@ int main(int argc, char ** argv) {
         else if (a == "--temp") cfg.temperature = (float) atof(next("--temp").c_str());
         else if (a == "--top-p") cfg.top_p = (float) atof(next("--top-p").c_str());
         else if (a == "--top-k") cfg.top_k = atoi(next("--top-k").c_str());
+        else if (a == "--logprobs-n") cfg.top_k_track = atoi(next("--logprobs-n").c_str());
         else if (a == "--dump-output") dump_output = next("--dump-output");
         else if (a == "--dump-logprobs") dump_logprobs = next("--dump-logprobs");
+        else if (a == "--score-file") score_file = next("--score-file");
+        else if (a == "--emit-score") emit_score = next("--emit-score");
         else if (a == "--json") json = true;
         else if (a == "-v" || a == "--verbose") { cfg.verbose = true; set_log_level(LogLevel::kDebug); }
         else if (a == "-h" || a == "--help") { usage(); return 0; }
@@ -179,13 +186,34 @@ int main(int argc, char ** argv) {
     if (!tok_res.ok()) { fprintf(stderr, "amp-infer: %s\n", tok_res.message().c_str()); return 1; }
     const std::vector<llama_token> & toks = *tok_res;
 
+    // Teacher forcing: a fixed continuation, scored rather than sampled. The continuation is
+    // read from a file so EVERY arm scores byte-identical tokens - which is the whole point,
+    // because a sampled continuation diverges at the first argmax difference and everything
+    // after that compares two different texts. Produce one with --emit-score from a reference
+    // run (typically f16/f16, the most precise arm).
+    std::vector<llama_token> forced;
+    if (!score_file.empty()) {
+        std::string txt;
+        {
+            std::ifstream in(score_file, std::ios::binary);
+            if (!in) { fprintf(stderr, "amp-infer: cannot read --score-file %s\n", score_file.c_str()); return 2; }
+            std::ostringstream ss; ss << in.rdbuf(); txt = ss.str();
+        }
+        auto fr = rt->tokenize(txt, /*add_special=*/ false);
+        if (!fr.ok()) { fprintf(stderr, "amp-infer: %s\n", fr.message().c_str()); return 1; }
+        forced = *fr;
+        if (forced.empty()) { fprintf(stderr, "amp-infer: --score-file tokenised to nothing\n"); return 2; }
+        if ((int32_t) forced.size() > n_predict) forced.resize((size_t) n_predict);
+    }
+
     double pp_sum = 0.0, tg_sum = 0.0;
     int64_t pp_toks = 0, tg_toks = 0;
     for (int r = 0; r < repeat; r++) {
         const Status st = rt->prefill(toks);
         if (!st.ok()) { fprintf(stderr, "amp-infer: %s\n", st.message().c_str()); return 1; }
         std::string out;
-        auto gen = rt->generate(n_predict, &out);
+        auto gen = forced.empty() ? rt->generate(n_predict, &out)
+                                  : rt->score(forced);
         if (!gen.ok()) { fprintf(stderr, "amp-infer: %s\n", gen.message().c_str()); return 1; }
         pp_sum  += rt->stats().prefill_ms;
         tg_sum  += rt->stats().decode_ms;
@@ -200,6 +228,14 @@ int main(int argc, char ** argv) {
     if (!dump_output.empty()) {
         std::ofstream f(dump_output, std::ios::binary);
         f << rt->last_text();
+    }
+    if (!emit_score.empty()) {
+        // One token id per line: a fixture every arm can score identically.
+        std::ofstream f(emit_score);
+        const std::vector<std::vector<ModelRuntime::TopK>> & lg = rt->logprobs();
+        for (const auto & pos : lg) {
+            if (!pos.empty()) f << pos.front().token << "\n";
+        }
     }
     if (!dump_logprobs.empty()) {
         std::ofstream f(dump_logprobs);
