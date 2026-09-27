@@ -94,11 +94,30 @@ def main():
             print(f"    per-pair: {[round(d, 1) for d in diffs]} %")
             print(f"    median  : {med:+.1f} %   spread: {spread:.1f} pp"
                   f"   n={len(diffs)} session pairs")
-            if spread > 10:
-                print("    VERDICT: the spread is wider than any effect this could claim.")
-                print("             More pairs needed, or the effect is below this box's noise.")
+
+            # Draft accounting, and the verdict. A first version of this printed "separable"
+            # whenever the spread was under 10 pp, which is a claim about the noise being
+            # small and NOT about the effect being real: a measured -0.5% with a 4.7 pp spread
+            # is a tie, and saying "separable" invited reading it as a result. So the test is
+            # the effect against the spread.
+            acc = [d.get("draft_acceptance") for d in ds
+                   if d.get("draft_acceptance") is not None]
+            drafted = sum(d.get("drafted_total", 0) or 0 for d in ds)
+            if drafted:
+                rate = sum(d.get("draft_accepted_total", 0) or 0
+                           for d in ds) / drafted
+                print(f"    drafted {drafted} tokens, {rate*100:.1f}% accepted")
             else:
-                print(f"    VERDICT: {med:+.1f} % is separable from the per-pair spread.")
+                print("    drafted 0 tokens - THE DRAFTER NEVER FIRED. Not a measurement.")
+
+            if len(diffs) > 1 and abs(med) < spread:
+                print(f"    VERDICT: TIE. The effect ({med:+.1f} %) is smaller than the "
+                      f"per-pair spread ({spread:.1f} pp), so this measures nothing either way.")
+            elif len(diffs) > 1:
+                print(f"    VERDICT: {med:+.1f} %, and it is larger than the per-pair spread "
+                      f"({spread:.1f} pp).")
+            else:
+                print("    VERDICT: one session pair is a hypothesis, not a result.")
     return 0
 
 

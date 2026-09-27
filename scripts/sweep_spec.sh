@@ -31,6 +31,8 @@ set -uo pipefail
 
 PAIRS="${1:-3}"
 REQS="${2:-5}"
+ARMS="${AMP_SPEC_ARMS:-base,map-k}"
+WORKLOADS="${AMP_SPEC_WORKLOADS:-code,prose}"
 PORT="${AMP_SPEC_PORT:-8081}"
 MODEL="${AMP_TEST_MODEL:-/home/e0u/localhost/models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf}"
 CTX="${AMP_SPEC_CTX:-200000}"
@@ -46,21 +48,48 @@ arm_args() {
     case "$1" in
         base)      echo "" ;;
         map-k)     echo "--spec-type ngram-map-k" ;;
+        # Strata's configuration rather than llama.cpp's default. Strata's SuffixDrafter keys
+        # on a trigram (WAYS=4 candidates, min_match 3, drafts up to 5). llama.cpp's default
+        # is size_n=12, size_m=48: a 12-token EXACT key, which is why the first sweep drafted
+        # nothing at all on the code workload and 48 tokens with zero accepted on prose.
+        map-k3)    echo "--spec-type ngram-map-k --spec-ngram-map-k-size-n 3 --spec-ngram-map-k-size-m 16" ;;
+        simple3)   echo "--spec-type ngram-simple --spec-ngram-simple-size-n 3 --spec-ngram-simple-size-m 16" ;;
         map-k4v)   echo "--spec-type ngram-map-k4v" ;;
         mod)       echo "--spec-type ngram-mod" ;;
         simple)    echo "--spec-type ngram-simple" ;;
         *) echo "unknown arm $1" >&2; return 1 ;;
     esac
 }
-# What the server must log for us to believe it is that arm. The base arm's marker is the
-# absence of any speculative type, so it gets the one line every run prints.
+# What the server must log for us to believe it is that arm, and what it must NOT log.
+#
+# Both halves matter, and the negative half is the only sound one for the baseline. The base arm
+# is defined by the ABSENCE of speculation, so requiring a line that merely proves the server
+# started proves nothing - a driver that failed to pass --spec-type would look identical. So:
+#
+#   base  -> forbid the speculation line
+#   spec  -> require the exact implementation name
+#
+# The marker text is from this pinned llama.cpp at -lv 5, which is why every arm runs at -lv 5:
+#   I spec common_specu: adding speculative implementation 'ngram-map-k'
+#   I srv    load_model: speculative decoding context initialized
+# At the default verbosity 3 the speculative configuration is not logged at all, which is how a
+# whole sweep produced base numbers for an arm that was supposed to be measuring speculation.
+SPEC_MARK="adding speculative implementation"
 arm_require() {
     case "$1" in
-        base)      echo "amp-preflight: n_parallel" ;;
-        map-k)     echo "ngram-map-k" ;;
-        map-k4v)   echo "ngram-map-k4v" ;;
-        mod)       echo "ngram-mod" ;;
-        simple)    echo "ngram-simple" ;;
+        base)      echo "" ;;
+        map-k)     echo "$SPEC_MARK 'ngram-map-k'" ;;
+        map-k3)    echo "$SPEC_MARK 'ngram-map-k'" ;;
+        simple3)   echo "$SPEC_MARK 'ngram-simple'" ;;
+        map-k4v)   echo "$SPEC_MARK 'ngram-map-k4v'" ;;
+        mod)       echo "$SPEC_MARK 'ngram-mod'" ;;
+        simple)    echo "$SPEC_MARK 'ngram-simple'" ;;
+    esac
+}
+arm_forbid() {
+    case "$1" in
+        base)      echo "$SPEC_MARK" ;;
+        *)         echo "" ;;
     esac
 }
 
@@ -94,61 +123,90 @@ no_strays || exit 1
 [ -f "$MODEL" ] || { say "FATAL: model not found at $MODEL"; exit 1; }
 
 say "sweep: pairs=$PAIRS reqs/session=$REQS ctx=$CTX port=$PORT"
+say "arms=$ARMS  workloads=$WORKLOADS"
 say "model=$MODEL"
 python3 scripts/gen_spec_prompts.py "$WORK" 2>&1 | tee -a "$LOG"
 say "free RAM: $(free -g | awk 'NR==2{print $7" GiB"}')  free VRAM: $(nvidia-smi --query-gpu=memory.free --format=csv,noheader)"
 
-for workload in code prose; do
+# shellcheck disable=SC2206
+ARMS_LIST=($(echo "$ARMS" | tr ',' ' '))
+# shellcheck disable=SC2206
+WORKLOADS_LIST=($(echo "$WORKLOADS" | tr ',' ' '))
+
+for workload in "${WORKLOADS_LIST[@]}"; do
     prompt="$WORK/spec_${workload}.txt"
     [ -f "$prompt" ] || { say "FATAL: $prompt missing; run scripts/gen_spec_prompts.py"; exit 1; }
 
     for pair in $(seq 1 "$PAIRS"); do
-        for arm in base map-k; do
+        for arm in "${ARMS_LIST[@]}"; do
             args="$(arm_args "$arm")"
             require="$(arm_require "$arm")"
+            forbid="$(arm_forbid "$arm")"
             slog="$WORK/server_${workload}_${arm}_${pair}.log"
 
             say "--- $workload pair $pair/$PAIRS arm=$arm args=[$args] ---"
 
             rm -f "$slog"
             # Detached, so an OOM kill takes the server and not whatever is driving it.
-            setsid nohup "$BIN" --model "$MODEL" --port "$PORT" -c "$CTX" $args \
+            # -lv 5 on every arm, including base: the speculative configuration is not logged
+            # below it, so at the default verbosity the base arm cannot be told from a spec arm.
+            setsid nohup "$BIN" --model "$MODEL" --port "$PORT" -c "$CTX" -lv 5 $args \
                 > "$slog" 2>&1 < /dev/null &
             sleep 1
 
             # Wait for the load, judged by the log rather than by /health. `/health` answers 200
             # about two seconds in, while the model is still being read off disk; a readiness
             # check that trusts it measures an empty server.
+            #
+            # The marker has to be one THIS build actually prints. An earlier version waited for
+            # "server is listening" and "load_tensors: offload N/M tensors", neither of which
+            # exists in the pinned llama.cpp - it emits "llama_server: model loaded" and
+            # "llama_server: listening on http://...". The wait then never fired and the sweep
+            # sat out its full 800 s per cell against a server that had been ready in 12 s.
+            # Grounded in the log we have on disk:
+            #   0.12.443.447 I srv  llama_server: model loaded
+            #   0.12.443.448 I srv  llama_server: listening on http://127.0.0.1:8081
             loaded=0
             for i in $(seq 1 400); do
-                if grep -qE "server is listening|load_tensors: offload [0-9]+/[0-9]+ tensors" "$slog" 2>/dev/null; then
-                    loaded=1; break
-                fi
-                if grep -qiE "error|failed to allocate|out of memory|cudaMalloc" "$slog" 2>/dev/null; then
-                    say "arm=$arm FAILED TO LOAD:"
-                    grep -iE "error|failed to allocate|out of memory|cudaMalloc" "$slog" | head -5 | tee -a "$LOG"
+                if grep -qE "llama_server: (model loaded|listening on http)" "$slog" 2>/dev/null; then
+                    loaded=1
+                    say "loaded after ~$((i * 2))s"
                     break
+                fi
+                if grep -qiE "error|failed to allocate|out of memory|cudaMalloc|assertion" "$slog" 2>/dev/null; then
+                    say "arm=$arm FAILED TO LOAD:"
+                    grep -iE "error|failed to allocate|out of memory|cudaMalloc|assertion" "$slog" | head -5 | tee -a "$LOG"
+                    break
+                fi
+                # Say something if this is dragging, so a stuck wait is visible rather than silent.
+                if [ $((i % 30)) -eq 0 ]; then
+                    say "  ...still waiting for arm=$arm ($((i * 2))s); last log line:"
+                    tail -1 "$slog" | tee -a "$LOG"
                 fi
                 sleep 2
             done
 
             if [ "$loaded" = 1 ]; then
+                # BEFORE the benchmark, not after: bench_spec.py reads this file to learn which
+                # arm it is measuring, and exits 2 if it is missing or stale. An earlier version
+                # wrote it afterwards, on the reasoning that the log had to exist first - but
+                # the log's existence is what `loaded=1` has just established, and writing the
+                # label late meant every single cell died with "no state file".
+                printf '{"arm": "%s", "pair": %s, "workload": "%s"}\n' \
+                    "$arm" "$pair" "$workload" > "$WORK/spec_state.json"
+
                 python3 scripts/bench_spec.py \
                     --url "http://127.0.0.1:$PORT" \
                     --state "$WORK/spec_state.json" \
                     --log "$slog" \
                     --require "$require" \
+                    --forbid "$forbid" \
                     --prompt-file "$prompt" \
                     --workload "$workload" \
                     --n "$REQS" \
                     --n-predict 128 \
                     --pair "$pair" \
-                    2>&1 | tee -a "$LOG" &
-                bench=$!
-                wait "$bench"
-                # The script writes the state file the driver owns; do it after, so the
-                # corroboration check above is reading a log that already exists.
-                echo "{\"arm\": \"$arm\"}" > "$WORK/spec_state.json"
+                    2>&1 | tee -a "$LOG"
             else
                 say "arm=$arm did not come up; skipping this cell"
             fi

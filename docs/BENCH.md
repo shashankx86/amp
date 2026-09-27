@@ -1190,8 +1190,7 @@ forcing the lookup drafter whenever it proposed more than the MTP **lost 2-8% on
 text**. So the question is not "is it faster" but two questions - does it help where it should,
 and does it hurt where it should not.
 
-**Status: harness built, not run.** The measurement was cut short by a reboot. Nothing is
-claimed about n-gram speculation's effect on this box.
+**Status: measured. Both configurations are a loss. See below.**
 
 ```
 python3 scripts/gen_spec_prompts.py                  # fixtures, derived from live source
@@ -1219,3 +1218,74 @@ otherwise have lied:
 The code workload is generated from `src/plan/preflight.cpp` by brace-matching a live function
 rather than embedding a copy - the first version quoted a function that had already been
 rewritten, so it was asking the model to reproduce code that no longer existed.
+
+## 2026-09-28: n-gram speculation, measured, and it is a loss
+
+Two arms, 3 paired sessions each, alternating base/speculative to cancel the 22% session
+drift, 5 requests per session with the first dropped, 128 generated tokens, `-c 200000`,
+decode only (`cache_prompt: true`, so the slot serves the prefix and requests 2+ prefill
+4 tokens). Every number below is the engine's own `timings.predicted_per_second`.
+
+| workload | arm | drafted | accepted | median t/s | paired vs base |
+|---|---|---:|---:|---:|---:|
+| code | base | - | - | 35.38 | - |
+| code | `ngram-map-k` (default, 12-gram key) | **0** | - | 35.09 | -0.5% (tie, 4.7 pp spread) |
+| code | `ngram-map-k` (3-gram key, m=16) | 936 | 26.9% | **26.12** | **-26.5%** (1.4 pp spread) |
+| prose | `ngram-map-k` (default) | 48 | **0.0%** | 34.67 | -0.9% (3.4 pp spread) |
+
+**Neither configuration helps. The 3-gram one costs a quarter of decode throughput.**
+
+### The first result was not a null result, it was a broken experiment
+
+`ngram-map-k` at its defaults uses `size_n = 12`: a **12-token exact** key. On a 128-token
+answer the engine drafted **zero** tokens on the code workload, and 48 tokens with **zero
+accepted** on prose. The `-0.5%` above is two arms of nothing, not a tie between two
+configurations.
+
+Strata's SuffixDrafter keys on a **trigram** (`WAYS = 4` candidates, `min_match = 3`,
+drafts up to 5). That is a completely different matcher from llama.cpp's default, and
+importing Strata's 6-11% while running llama.cpp's defaults would have measured the wrong
+thing while looking like a refutation. Retested with `--spec-ngram-map-k-size-n 3
+--spec-ngram-map-k-size-m 16`, the drafter fires, and the result is the -26.5% above.
+
+**The harness now refuses to report a speculative arm that drafted nothing**
+(`bench_spec.py` exits non-zero with "the drafter never fired"), and `summarise_spec.py`
+prints the draft count and acceptance beside every comparison and classifies the effect
+against the per-pair spread rather than just checking the spread is small. An earlier
+version printed "separable" for a -0.5% effect with a 4.7 pp spread, which is a claim about
+the noise and not about the effect. Unit-tested against tie, never-fired, real-effect and
+single-pair cases.
+
+### Why it loses, from the measurement with no cost model in it
+
+From the engine's own accounting: 78 drafted, 21 accepted, **mean accepted run 2.75**, so
+7.6 verify passes produced 21 tokens and each pass proposed ~10.2 tokens. A pass therefore
+costs 38.3 ms/token x 2.75 = **105 ms**, against **28 ms** for a one-token pass.
+
+**A ~10-token verify window on this model costs 3.7x a single-token pass. Break-even needs
+an accepted run of 3.7 consecutive tokens; the measured run was 2.75 - 1.35x too short.**
+
+This is Strata's exact break-even condition failing. Their MTP drafter accepts 0.89 / 0.86 /
+0.85 at steps 1-3, i.e. runs of 3+, so it clears 3.7. An n-gram drafter on a code answer does
+not: the model paraphrases the function rather than reproducing it verbatim, so matches are
+short and scattered. Strata's 6-11% came from a *learned* MTP head, not from the lookup.
+
+Their cost model is also the reason this is close rather than catastrophic: "the dense
+weights are read ONCE for T tokens", so a window amortises the dense read and only the
+union of missed experts multiplies (1.75x at T=2, 2.40x at 3, 3.05x at 4). The measurement
+confirms the amortisation is real - a 10-token window costs 3.7x, not 10x - which is why the
+loss is 26% and not 90%. The 3.7x is the expert term: 16 tokens' worth of routing is close
+to the whole working set, not a small multiple of one token's 8.
+
+### Verdict
+
+**Rejected. Do not enable speculative decoding on this model.** No n-gram configuration is
+available that both fires and breaks even: the one that fires needs accepted runs of 3.7 and
+gets 2.75, and the configuration that would need shorter runs is the 12-gram default that
+never fires at all. Strata's own negative result predicted exactly this - "forcing the
+lookup drafter whenever it proposes more than the MTP lost 2-8% on ordinary text" - and here
+there is no MTP to compare against, so the lookup is always the loser.
+
+The one Strata speculation idea that would work on this model is the MTP head, and there is
+no MTP head: a byte scan of all 13.66 GB of the Occamy GGUF found no `nextn`, `draft`, `mtp`
+or `eagle` tensor. Speculative decoding on Occamy is not a tuning problem.

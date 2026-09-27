@@ -92,6 +92,12 @@ def one_request(url, prompt, n_predict, timeout):
         "prompt_tps": t.get("prompt_per_second"),
         "n": t.get("predicted_n"),
         "tps": t.get("predicted_per_second"),
+        # The engine's own draft accounting (tools/server/server-common.cpp puts draft_n and
+        # draft_n_accepted in `timings`). Without these, "speculation did not help" and
+        # "speculation never ran" are indistinguishable - and a sweep with a mis-set match
+        # length produces exactly the second while looking like the first.
+        "draft_n": t.get("draft_n", 0) or 0,
+        "draft_accepted": t.get("draft_n_accepted", 0) or 0,
         "wall": wall,
     }
 
@@ -111,6 +117,10 @@ def main():
     ap.add_argument("--require", default="", help="comma-separated substrings that must ALL appear "
                     "in the server log before the first request; guards against measuring a "
                     "server that started with different flags than the driver intended")
+    ap.add_argument("--forbid", default="", help="comma-separated substrings, NONE of which may "
+                    "appear in the server log. This is the only sound way to confirm the BASELINE "
+                    "arm, which has no line of its own: the base arm is defined by the absence of "
+                    "speculation, so a positive requirement proves nothing about it.")
     ap.add_argument("--prompt-file", default="/tmp/opencode/spec_code.txt")
     ap.add_argument("--workload", default="code", help="label only, recorded in the output")
     ap.add_argument("--log", default="/tmp/opencode/spec_server.log",
@@ -143,7 +153,7 @@ def main():
     # server's own log to corroborate the arm turns that from a silent lie into a loud failure.
     # Read the log BEFORE the first request: once requests start flowing, the file is full of
     # timing lines and a substring search is no longer evidence of anything.
-    if args.require:
+    if args.require or args.forbid:
         try:
             with open(args.log) as f:
                 head = f.read()
@@ -156,7 +166,14 @@ def main():
                   f"state file claims. Refusing to record numbers for the wrong configuration.",
                   file=sys.stderr)
             return 2
-        print(f"# corroborated in log: {args.require}", flush=True)
+        present = [r for r in args.forbid.split(",") if r and r in head]
+        if present:
+            print(f"FATAL: server log contains {present!r}, which the claimed arm forbids. "
+                  f"This server is NOT the baseline. Refusing to record its numbers as baseline.",
+                  file=sys.stderr)
+            return 2
+        print(f"# corroborated in log: require={args.require or '(none)'} "
+              f"forbid={args.forbid or '(none)'}", flush=True)
 
     waited = wait_ready(args.url, args.timeout)
     if waited is None:
@@ -171,7 +188,8 @@ def main():
         r = one_request(args.url, prompt, args.n_predict, args.timeout)
         rows.append(r)
         print(f"  req {i}: tps={r['tps']} n={r['n']} prompt_n={r['prompt_n']} "
-              f"prompt_tps={r['prompt_tps']} wall={r['wall']:.1f}s", flush=True)
+              f"prompt_tps={r['prompt_tps']} wall={r['wall']:.1f}s "
+              f"draft={r['draft_accepted']}/{r['draft_n']}", flush=True)
         if i == 0:
             print("  (cold: dropped from the median)", flush=True)
 
@@ -197,6 +215,25 @@ def main():
         "dropped_short_or_cold": dropped + 1,
     }
     print(f"RESULT {json.dumps(out)}", flush=True)
+    drafted = sum(r["draft_n"] for r in steady)
+    accepted = sum(r["draft_accepted"] for r in steady)
+    out["drafted_total"] = drafted
+    out["draft_accepted_total"] = accepted
+    out["draft_acceptance"] = (accepted / drafted) if drafted else None
+
+    # A speculative arm that never drafted a token has not been measured, it has merely been
+    # run. This is not hypothetical: a first sweep of this harness reported "-0.5%, a tie"
+    # when the truth was that the drafter's match length was 12 tokens against a workload
+    # whose best match was shorter, so it proposed nothing at all. The engine logged
+    # "0 accepted / 48 generated" in one workload and no draft line whatsoever in the other.
+    # A tie is a result; a drafter that never fired is a broken experiment.
+    if arm != "base" and drafted == 0:
+        print("FATAL: this arm is supposed to speculate but the engine drafted ZERO tokens in "
+              f"{len(steady)} steady-state requests. The result is meaningless and will not be "
+              "written as a measurement. Check the drafter's match length against the workload "
+              "(--spec-ngram-*-size-n is a strict exact-match length, not a hint).", file=sys.stderr)
+        return 1
+
     suffix = f"_{args.pair}" if args.pair else ""
     with open(f"/tmp/opencode/spec_{args.workload}_{arm}{suffix}.json", "w") as f:
         json.dump(out, f, indent=2)
