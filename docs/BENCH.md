@@ -1659,3 +1659,76 @@ remaining time is GPU-side layer work, not host-side scanning.
 
 **Consequence: the `top_k_track_` 5 -> 32 widening stays**, because it is free and it fixed the
 quality instrument. It is recorded here as measured-free rather than assumed-free.
+
+## 2026-09-28: a g-sweep for the 60%, and an arithmetic error it caught
+
+The open question was what the 60% of a token that is not expert bandwidth *is*. Strata's prior
+says the recurrent GDN mixers; amp had never measured it, and `perf` cannot on this box
+(`perf_event_paranoid = 2`, and `perf record -e cpu-cycles` silently degrades to a software
+event so the output looks valid). So: measure the marginal cost of a CPU expert layer by sweeping
+`g` and fitting. `amp-infer --repeat 3`, 1536 tokens per point, 2 runs per point, `-c 8192`.
+
+| g | CPU expert set | ms/token | t/s |
+|---:|---:|---:|---:|
+| 0 | 12.19 GiB | 50.56 | 19.78 |
+| 2 | 11.58 GiB | 37.74 | 26.50 |
+| 4 | 10.97 GiB | 36.11 | 27.69 |
+| 6 | 10.36 GiB | 31.36 | 31.89 |
+| 8 | 9.75 GiB | 30.34 | 32.96 |
+| 10 | 9.14 GiB | **28.06** | 35.63 |
+| 12 | 8.53 GiB | 29.04 | 34.43 |
+
+### g=0 and g=2 are not on the same curve, and fitting all seven is invalid
+
+g=0 puts 12.19 GiB of experts on the CPU against a measured ~11.2 GiB usable page cache, and
+this model has a documented decode cliff: 10.25 GiB gives 25.6-29.9 t/s, 11.54 GiB gives
+2.8-4.8 t/s. So **g=0..2 is caching-bound and g>=4 is bandwidth-bound** — one line through all
+seven points describes a cliff with a ramp. Fitting all seven gives `ms = -19.70 + 1.601*cpu`,
+i.e. a **negative** intercept and experts at 175% of the token, which is physically impossible.
+R² was 0.78, a perfectly respectable-looking fit on data that cannot be right. That is the
+clearest argument in this project for refusing to read an intercept off a regression.
+
+### In the planner's own regime (g>=6) the fit is clean
+
+`ms/token = 15.41 + 0.461 * (CPU expert layers)`, **R² = 0.954**, residuals +0.27 +0.18 -1.18
++0.73 ms. At g=6 (34 CPU layers) that is 15.67 ms of expert-attributable time in a 31.36 ms token.
+
+### An arithmetic error, caught by the sweep disagreeing with itself
+
+My first pass divided **total** expert bytes by 40 layers, giving "312 MiB per layer" and 10.3 ms
+per layer — 432 ms for a token measured at 28-50 ms, which is nonsense. **A token routes 8 of 256
+experts per layer, so it reads 1/32 of each layer's bytes.** Corrected: 9.75 MiB per layer,
+0.339 ms of bandwidth per CPU expert layer, 13.54 ms for a fully-CPU token against the
+documented 349 MiB/token.
+
+The correction matters because it is what makes the two estimates agree:
+
+| estimate | expert | non-expert |
+|---|---:|---:|
+| (a) pure-bandwidth subtraction, 349 MiB at 30.2 GB/s | 37% | 63% |
+| (b) g-sweep marginal slope, 0.461 ms x 34 layers | 50% | 50% |
+
+**Two independent routes bracket the 40/60 split the earlier measurement reported, so that
+conclusion stands.** What is new is (b): the marginal cost of a CPU expert layer is **0.461 ms
+against 0.339 ms of pure bandwidth, so 1.36x**. That 0.12 ms per layer — about 4 ms per token —
+is not memory. It is the per-expert work around the memory: gather, dequant, the group-scatter
+back into the residual, and the launch per expert.
+
+This is the first *measured* number on the other side of the 60%, and it is the same shape as
+Strata's `moe_grouped_s2` motivation ("this cannot be a per-layer grouped kernel and the three-way
+split is not an optimisation", h_layer = 0.0456 ruling out the cheap shapes). Their answer was to
+group experts into one kernel and get 10.2 ms off a 19.0 ms pool drain. amp's per-expert overhead
+is smaller in absolute terms but is the same phenomenon, and it is a kernel question rather than
+a bandwidth question — the only kind left on this box.
+
+### The finding with immediate operational value: g=10 is the turning point
+
+**g=12 is slower than g=10** (29.04 vs 28.06 ms). Adding GPU expert layers stops paying at about
+10 of 40 and then reverses, because the compute buffer grows ~80 MiB per GPU expert layer and the
+GPU begins competing with the CPU for the same memory path. So `max_expert_layers_gpu` above ~10
+is not a free safety margin — it is a region where the planner can choose a slower plan. The
+planner's VRAM-driven choice lands at g=3..6 at 200k, well inside the paying region.
+
+`--gpu-layers 14` is **refused** by the planner (fails model load) but prints the refusal to
+stderr only, so a script that captures stdout sees an empty file and reads it as a hang. Worth
+knowing: `amp-infer --gpu-layers 14` never starts, it does not run slowly.
