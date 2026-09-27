@@ -845,15 +845,70 @@ A cheaper dequant kernel would **not** help the MoE: the dequant is already hidd
 traffic, so the expert path can only be improved by moving fewer bytes, which means quantization,
 which the project rules out.
 
-### The one thing still unmeasured
+### The per-op profile: the SSM layers were never the problem
 
-30 of the 40 layers are recurrent (linear attention), and 10 are full attention. Together with
-everything outside the expert matvec, that is the other two thirds of decode, and it has never
-been profiled per-op. A sequential SSM recurrence parallelises badly, and the expert-matvec
-result makes this the natural place to look: the MoE half of the model is now measured,
-understood, and closed, so the recurrent half is the only substantial region left.
+This is the measurement that was missing, and it refutes the hypothesis the previous section
+recorded. `perf` is installed (extracted from the local pacman cache, no sudo, no system install);
+`perf_event_open` was verified to work at `perf_event_paranoid=2` for our own process first. The
+binary is not stripped and carries 126 `ggml_compute_forward_*` symbols, so no debug rebuild was
+needed.
 
-No per-op profile exists, because `perf` is not installed on this box and there is no sudo.
-`/proc` counters say what decode is waiting on but not which op; that needs either a sampling
-profiler, a ggml build with `GGML_SCHED_DEBUG` in a debug build, or per-op timers in the CPU
-backend.
+Decode, 352,440 samples at 999 Hz, prefill pinned to 4 tokens so this is pure decode at 29.7 t/s:
+
+| symbol | share of CPU cycles |
+|---|---|
+| `libgomp` (OpenMP barrier spin) | **53.6 %** |
+| `ggml_vec_dot_iq3_xxs_q8_K` | 21.2 % |
+| `ggml_vec_dot_q3_K_q8_K` | 16.6 % |
+| `ggml_graph_compute_thread` | 1.2 % |
+| `__vdso_clock_gettime` | 1.3 % |
+| `libcuda` | 1.3 % |
+
+**Essentially 100 % of the CPU-side decode work is the two quantized dot-product kernels.**
+`ssm_conv`, `ssm_scan`, `flash_attn_ext`, `argsort` (the router) and `get_rows` do not appear at
+all, at a 0.001 % reporting threshold. They are not slow; they are **not on the CPU**. Only expert
+weights are pinned to CPU (`-ot ffn_.*exps.weight=CPU`), so all 30 recurrent layers, all 10
+attention layers and the routers run on the GPU under `-ngl 99`.
+
+So the previous note in this file, which called the recurrent layers "the obvious suspect for the
+96 %", was wrong twice over: the MoE is not 96 % of decode, and the recurrent layers are not where
+the CPU time is. The CPU's entire job during decode is the 36 layers x 3 matrices of expert matvec,
+which the kernel-bound measurement above already showed to be running at memory bandwidth.
+
+**The 53.6 % barrier spin is load balancing, not waste.** ggml is built with OpenMP, so a decode
+graph of ~1000+ nodes costs ~1000+ barriers per token, and the 8 threads spin at each one. Making
+them sleep instead is worse:
+
+| `OMP_WAIT_POLICY` | steady decode |
+|---|---|
+| active (default, spin) | **29.56 t/s** |
+| passive (sleep) | 22.53 t/s |
+
+A 31 % penalty for sleeping. Never set `OMP_WAIT_POLICY=passive` on this box, and treat that 53.6 %
+as the price of 8-thread efficiency on a kernel whose threads finish at different times.
+
+### Agentic loop: the cache is not the problem
+
+Throughput is the wrong metric for tool use. A tool-using client sends a large context once and then
+sends that context plus a small delta every turn, so a turn's cost is dominated by *how much got
+re-prefilled*, and the pain is the worst turn rather than the median.
+`scripts/bench_agentic.py` measures that: 1 initial context plus N turns, each appending a ~1 KB
+tool result, reporting the max turn and flagging any turn that re-prefilled the whole context.
+
+18,265-token base context, 8 turns, 48 tokens generated per turn:
+
+| `-cram` | median turn | max turn | full re-prefills |
+|---|---|---|---|
+| 512 (amp's clamp) | 2.3 s | 4.7 s | **0** |
+| 2048 | 2.0 s | 4.5 s | **0** |
+| 4096 | 2.2 s | 4.6 s | **0** |
+
+**`cache_ram_mib` is not the cause of the tool-call stalls.** The hypothesis was that amp's clamp
+from 8192 to 512 was thrashing the prompt cache and forcing full re-prefills. It is not: at every
+setting the prefix is reused and no turn re-prefills. The clamp stays, because its stated reason
+(that the prompt cache evicts the model's page cache) is a real trade against decode, but it is not
+the explanation for the 234-second stall in the field.
+
+Squeezing 5 GiB of RAM to imitate a memory-starved session also did not reproduce it: prefill stayed
+at 383 t/s and the loop at 2.9 s median with 0 re-prefills. `MAP_POPULATE` at load refills the page
+cache, so a fresh server is warm even when the box is tight.

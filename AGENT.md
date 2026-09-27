@@ -169,12 +169,29 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - [x] M7 **spent.** Every quality-neutral decode lever has been measured: threads already optimal
       (`-t 8` beats 4/12/16), expert placement 3.4 %, context length 2.6 %, n-gram speculation
       0.2 %, expert prefetch 0.2 %. There is no gap left to close on the CPU side.
-- [ ] Profile the **30 recurrent layers** (of 40; the other 10 are full attention). This is now the
-      only substantial unmeasured region: the MoE's third of decode is measured, understood and
-      closed, so the other two thirds is what remains. A sequential SSM recurrence parallelises
-      badly and is the obvious suspect. No per-op profile exists, because `perf` is absent and there
-      is no sudo — `/proc` counters say what decode waits on but not which op. Needs a sampling
-      profiler, a debug ggml with `GGML_SCHED_DEBUG`, or per-op timers in the CPU backend.
+- [x] Profile decode per-op — **done, and it refuted the hypothesis.** `perf` works here: extract it
+      from the local pacman cache (`/var/cache/pacman/pkg/perf-*.pkg.tar.zst`) into a user dir, no
+      sudo; `perf_event_open` was verified to work at `perf_event_paranoid=2` for our own process.
+      The Release binary is not stripped and has all 126 `ggml_compute_forward_*` symbols, so no
+      debug rebuild is needed. Result over 352k samples of pure decode: **100 % of CPU-side work is
+      `ggml_vec_dot_iq3_xxs_q8_K` (21.2 %) + `ggml_vec_dot_q3_K_q8_K` (16.6 %)**, and `ssm_conv`,
+      `ssm_scan`, `flash_attn_ext`, `argsort` and `get_rows` are **absent entirely**. They are not
+      slow, they are not on the CPU: only expert weights are pinned to CPU, so all 30 recurrent
+      layers and all 10 attention layers run on the GPU. **Do not go looking for SSM wins on the CPU
+      side; there is no CPU work there.** The MoE expert matvec is the whole CPU story and it is
+      already at memory bandwidth.
+- [x] **Never set `OMP_WAIT_POLICY=passive` on this box.** ggml is OpenMP-built, so decode spends
+      ~1000 barriers per token and the 8 threads spin at each: **53.6 % of CPU cycles**. That is load
+      balancing, not waste — spinning measures 29.56 t/s against 22.53 t/s for sleeping, a 31 %
+      penalty. That 53.6 % is the price of 8-thread efficiency, not a bug to fix.
+- [ ] **Tool-call latency: three hypotheses falsified, cause still unidentified.** Use
+      `scripts/bench_agentic.py` (per-turn latency and full-re-prefill count), not tokens/second.
+      Measured: `cache_ram_mib` 512 / 2048 / 4096 all give 0 full re-prefills and a ~2.2 s median
+      turn; squeezing 5 GiB of RAM also gives 0 re-prefills and 2.9 s. So neither the prompt-cache
+      clamp nor memory pressure explains a 234 s stall seen in the field. The signature to look for
+      in the server log is `selected slot by LRU` (no `f_sim_best`) or `f_sim_best` well below 0.9,
+      followed by `release ... n_tokens` collapsing to a few hundred — that is the prefix being lost
+      and the next turn paying a full prefill. Do not re-test the two falsified ones.
 - [x] Fold the two forward paths into one — resolved by deletion rather than refactoring. The server
       (`InferenceService`) is gone; `amp-server` is llama.cpp's server. `ModelRuntime` survives as
       `amp-infer`, the measurement harness, because it has the prefetcher and can be A/B'd against
