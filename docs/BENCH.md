@@ -671,28 +671,128 @@ lie: they are different cache states. Neither is a speedup over llama-server.
 
 ## 2026-09-27 — every quality-neutral decode lever, exhausted
 
-Follow-up to the placement result above. If decode is compute-bound, then the remaining levers are
-parallelism, prefetching, and speculation. All three were measured.
+Follow-up to the placement result above. The remaining levers were parallelism, prefetching, and
+speculation. All three were measured; prefetching is recorded below in full.
 
-### M3c is refuted with a number, not an opinion
+### M3c: implemented, measured, and a tie
 
-From the `-ncmoe` sweep: g=0 -> 30.39 t/s, g=4 -> 31.44 t/s. g=4 removes 1.29 GiB of 12.19 GiB
-(10.7 %) of expert weights from the CPU path. Writing decode time as `t = a + b` with `b`
-proportional to CPU expert bytes and solving for the split:
+The section this replaces got the arithmetic wrong and reached the opposite conclusion. The
+error is worth recording, because it is the second time in this project that a confident number
+came out of a script nobody sanity-checked against a second method.
 
-| | share of decode time |
+The original claim was that the `-ncmoe` sweep implies expert weight fetching is **3.7 %** of
+decode. It is not. The script computed the share of expert bytes *removed* as
+`1 - 1.29/12.19 = 0.894` when it is `1.29/12.19 = 0.106`, an 8.4x error, and everything
+downstream of it was wrong:
+
+| | original (wrong) | corrected |
+|---|---|---|
+| share of expert bytes removed | 0.894 | 0.106 |
+| expert weight fetching | 3.7 % of decode | **~30-36 % of decode** |
+| all experts on GPU | 1.04x | 1.46x |
+
+So M3c was not obviously worthless, and it was built and measured rather than argued away.
+
+**Implementation.** The milestone assumed an observable router required owning the whole ggml
+graph, which is why it was called impossible through `llama.h`. It is not necessary. Inside
+`ggml_compute_forward_mul_mat_id` the router output is *already host-resident*: `ids->data` is
+dereferenced directly to build `matrix_row_counts`, because CPU-resident expert layers run the
+router on the CPU. The active experts are therefore observable with no sync and no new plumbing.
+The patch prefetches the head of each selected expert's weight matrix, and each thread prefetches
+the expert it is about to compute, mirroring the existing `cur_a` chunking so no barrier is
+needed. It lives in `third_party/patches/m3c-expert-prefetch.patch` and is applied by
+`fetch_deps.sh`, because `third_party/llama.cpp` is gitignored and an edit made directly in that
+tree is not version controlled.
+
+Two variants were measured, because prefetching in the same node that consumes the data gives
+almost no time lead:
+
+- **same-node**: prefetch the experts this token just selected. Memory-level parallelism across
+  the 8 selected experts, but microseconds of lead.
+- **predictive** (negative depth): while layer L computes, prefetch what the *previous* token
+  selected for layer L+1. Expert routing is stable across adjacent tokens and one layer of
+  compute is ~0.9 ms here, four orders of magnitude more lead than a DRAM latency. This is the
+  form the milestone actually promised.
+
+**Measurement.** Same server process for both arms. `AMP_M3C_PREFETCH_FILE` is re-read at most
+twice a second, so depth can be switched without a restart; a per-arm restart would measure
+session noise rather than the prefetch. Arms interleaved and order-reversed per round, first
+request after each switch discarded. 200k, warm cache, 2 requests per visit.
+
+| variant | depth | result |
+|---|---|---|
+| same-node | 16 KiB | +0.9 % |
+| same-node | 64 KiB | +0.7 % |
+| same-node | 4096 KiB | -1.9 % |
+| predictive | -16 KiB | -0.5 % |
+| predictive | -128 KiB | +0.9 %, then **-0.2 %** over 4 further rounds |
+
+Nine paired comparisons in total span **-1.9 % to +1.7 %**, mean about **+0.2 %**. The ordering
+is not even consistent between rounds. **Tie.**
+
+The 4096 KiB arm is what makes the tie interpretable rather than merely unexplained. That depth
+issues ~13,400 prefetches per expert and cost 1.9 %, which is about what the loop's instruction
+issue alone should cost. So the code path is definitely live: the hint fires, and firing it at
+already-resident lines is nearly free. There is nothing left for it to fetch.
+
+### Why: the expert matvec already runs at memory bandwidth
+
+A tie is consistent with two opposite explanations, so the tie alone does not say which. Either
+the bytes are already available (nothing to fetch), or dequant is the wall (earlier bytes cannot
+help). `tools/kernel_bound.cpp` separates them by timing a plain 8-thread read of an expert
+weight matrix against the real `ggml` `mul_mat` over the same bytes at batch 1, sweeping the whole
+98 MiB tensor because one expert alone fits in L2 and would flatter the kernel.
+
+Layer 20, `iq3_xxs`, 8 threads, with `ggml`'s thread count pinned explicitly:
+
+| | rate |
 |---|---|
-| expert weight fetching (`b`) | **3.7 %** |
-| everything else (`a`) | **96.3 %** |
+| plain read of the same bytes | 28.69 GB/s |
+| `ggml mul_mat`, batch 1 | **29.21 GB/s** (101.8 % of plain) |
 
-**Expert memory is 3.7 % of decode.** M3c's entire premise is that prefetching the 8 active experts
-recovers meaningful time, and the ceiling on that is ~4 % — and prefetch hides *latency*, not bytes,
-so the realisable figure is lower still. Extrapolating as if the model were linear, moving **every**
-expert to the GPU would give **1.04x**. M3c should not be built on this evidence.
+**The expert matvec moves its weights as fast as a plain read of them.** The dequant work is
+entirely hidden behind the memory traffic. Thread scaling is near-linear and saturates at 8:
 
-That 3.7 % also says the ~4 GiB that streams from NVMe (the page cache holds 7.27 GiB of the
-12.19 GiB working set) is already well overlapped with compute. Demand paging and readahead are
-doing their job; the I/O is not what hurts.
+| threads | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| `mul_mat` | 4.80 | 9.17 | 17.75 | **29.21** | 29.27 GB/s |
+| plain read | 27.64 | 31.62 | 31.07 | 28.49 | 27.34 GB/s |
+
+The 16-thread flatness independently reproduces the SMT cliff in the `-t` sweep above.
+
+This is a stronger statement than "the hardware prefetcher already covers it". The kernel is not
+leaving bandwidth unused, it is leaving *nothing* unused. There is no exposed latency to hide,
+because it already runs at the speed the memory system delivers the bytes. **M3c cannot win, and
+the reason is a property of the kernel rather than of the prefetcher.**
+
+### How much of decode is the expert matvec, three ways
+
+| method | share of decode |
+|---|---|
+| 349 MiB/token at the measured 29.21 GB/s = 12.5 ms of 34.57 ms | **36 %** |
+| `-ncmoe` A/B, solved as `t = a + b` | 29 % |
+| `-ncmoe` A/B, marginal effect per byte moved | 29 % |
+
+Three independent routes agree inside their noise: **expert reads are about a third of decode**,
+and that third is memory-bound with nothing left to prefetch. The other two thirds is not the MoE.
+
+### Quality: provably unchanged
+
+A prefetch is a hint and cannot alter a value, so this is structural rather than merely measured.
+Confirmed anyway, prefetch off versus predictive 128 KiB, 512 positions, `n_probs=32`, with the
+gate set to require *exactly* zero:
+
+```
+KL(A || B)  0.000000e+00 over 512/512   max 0.000000e+00   inf at 0/512
+KL(B || A)  0.000000e+00 over 512/512   max 0.000000e+00   inf at 0/512
+JS(A, B)    0.000000e+00
+|delta logprob| on shared tokens: mean 0.000000e+00  max 0.000000e+00
+top-1 agreement 512/512 (100.00 %)
+captured mass, both sides: mean 0.998502  min 0.934985
+```
+
+Zero quality loss, at zero speed gain. Captures committed as `quality/m3c-off.json` and
+`quality/m3c-on.json`.
 
 ### Threads: already optimal
 
@@ -727,23 +827,33 @@ drafting to find matches.
 
 Measured and spent: concurrency (**44x**, the only large win), the KV-dtype planning fix (2.3x on
 plan quality), expert placement (**3.4 %**), context length (**2.6 %**), threads (**already
-optimal**), n-gram speculation (**0.2 %**).
+optimal**), n-gram speculation (**0.2 %**), expert prefetch (**0.2 %, a tie**).
 
-**Decode is ~96 % CPU arithmetic, running at the optimal thread count, on a working set whose I/O is
-already overlapped.** The only things left would change the arithmetic — custom dequant/matmul
-kernels for the MoE, or more aggressive expert quantization. The first breaks the "literally the
-same ggml code" guarantee that makes zero quality loss structural rather than merely measured; the
-second is the quality change the project rules out. Neither is a free win.
+**This reverses the earlier claim that VRAM is not the binding constraint.** That rested on the
+3.7 % figure, and it was wrong. The corrected picture is that expert reads are about a third of
+decode and are memory-bandwidth-bound on the CPU, so moving experts to the GPU removes both the
+memory traffic and the CPU arithmetic for those layers. Measured: g=0 -> g=4 is **+3.4 %** for
+10.6 % of expert bytes moved. Extrapolating linearly, g=8 is worth roughly **+7 %** and every
+expert on the GPU roughly **1.46x**.
 
-A consequence worth stating plainly, because it reframes the hardware question: **the 6 GB of VRAM
-is not the binding constraint.** g=8 does not fit, but g=8 would only have been worth ~3 %. Buying
-more VRAM, or a faster GPU, would change very little for this model. It is compute-bound on eight
-Zen 3 cores.
+6 GB of VRAM cannot hold g=8, so on this box that headroom is unreachable. It is still real
+headroom, and it is the only large multiplier left. This laptop's 4050 cannot be upgraded, so
+this is a fact about the hardware rather than an avenue, but anyone reproducing this on a bigger
+card should know that VRAM is where the win is, not threads and not prefetching.
+
+A cheaper dequant kernel would **not** help the MoE: the dequant is already hidden behind memory
+traffic, so the expert path can only be improved by moving fewer bytes, which means quantization,
+which the project rules out.
 
 ### The one thing still unmeasured
 
-30 of the 40 layers are recurrent (linear attention). They are the obvious suspect for the 96 %,
-because an SSM recurrence is sequential and parallelises badly — and nobody would guess that from
-"MoE precompute" framing. Those layers' weights are already on the GPU (only expert weights are
-pinned to CPU), but the *recurrence* may still be running badly. No per-op profile has been taken.
-That is where a genuinely custom optimisation would start, and it is the opposite of M3c.
+30 of the 40 layers are recurrent (linear attention), and 10 are full attention. Together with
+everything outside the expert matvec, that is the other two thirds of decode, and it has never
+been profiled per-op. A sequential SSM recurrence parallelises badly, and the expert-matvec
+result makes this the natural place to look: the MoE half of the model is now measured,
+understood, and closed, so the recurrent half is the only substantial region left.
+
+No per-op profile exists, because `perf` is not installed on this box and there is no sudo.
+`/proc` counters say what decode is waiting on but not which op; that needs either a sampling
+profiler, a ggml build with `GGML_SCHED_DEBUG` in a debug build, or per-op timers in the CPU
+backend.
