@@ -1460,3 +1460,27 @@ Not yet implemented: making the planner pick 2048 when the budget allows. It is 
 change to the same code that already sizes the buffer, and the measurement says it is worth
 +38% of prefill for every user at a context where it fits. Recorded as the concrete next step
 rather than a claim.
+
+### Shipped: the planner now finds this by itself
+
+`ubatch_saturation` 1024 -> 2048 in `CostModelConstants`, with the measurement in the comment
+and an `AMP_UBATCH_SATURATION` override. No flags, `-c 32768`:
+
+| | prefill median | decode median | GPU expert layers | compute buffer | total VRAM |
+|---|---:|---:|---:|---:|---|
+| **shipped (planner picks 2048)** | **828.1 t/s** | 36.98 t/s | 6 | 1.91 GiB | 5.84 / 5.89 GiB |
+| `-ub 1024` for comparison | 601.2 t/s | 36.88 t/s | 7 | 1.27 GiB | 5.57 / 5.89 GiB |
+
+**+37.7% prefill, decode unchanged** (36.98 vs 36.88 t/s). Decode is unchanged because
+`n_ubatch` is a prefill batching parameter and the decode path reads the expert matvec at
+batch 1, already measured at 30.2 GB/s against a 28.99 GB/s plain read.
+
+At `-c 200000` nothing changes: the planner still lands on 1024, because 2048's buffer leaves
+50 MiB. Verified the server loads and reports `n_ubatch: 1024`, 5.69 / 5.89 GiB, 234 MiB free.
+The planner is now context-sensitive on this knob, and the VRAM check is what makes it so.
+
+The test that pinned the wrong constant, `cost_model_ubatch_efficiency_is_monotonic`, asserted
+`ubatch_efficiency(1024) == 1.0` — so it was *enforcing* the error. It now asserts saturation at
+2048, that 1024 is strictly below it, and that the 2048/1024 ratio brackets the measured 1.38x,
+so if the measurement stops being represented in the model the test fails rather than the
+constant quietly staying wrong.
