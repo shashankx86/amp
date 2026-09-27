@@ -21,7 +21,7 @@ so they are fully testable without touching hardware; `amp_io` is the only modul
 ## Modules
 
 ### amp_util
-`Status`/`Result<T>` (the only error channel across module boundaries — no exceptions cross an
+`Status`/`Result<T>`, the only error channel across module boundaries. No exceptions cross an
 interface), a tiny `format()`, byte parsing/printing, a leveled logger, `Stopwatch`, and
 `read_meminfo()`. The meminfo reader exists because page-cache residency is the single most
 important signal in this project; it is a first-class utility rather than something buried in a tool.
@@ -29,20 +29,20 @@ important signal in this project; it is a first-class utility rather than someth
 ### amp_io
 The memory system. Three pieces behind interfaces:
 
-- `MappedFile` — read-only mmap. Never `MAP_POPULATE`, never an anonymous copy. A 14.65 GB
+- `MappedFile`: read-only mmap. Never `MAP_POPULATE`, never an anonymous copy. A 14.65 GB
   anonymous load froze this machine once; file-backed pages are evictable and re-readable, which is
   what makes a working set larger than RAM survivable at all.
-- `IPageCacheWarmer` — asynchronous page-cache warming. `readahead()` in 2 MiB chunks from a small
+- `IPageCacheWarmer`: asynchronous page-cache warming. `readahead()` in 2 MiB chunks from a small
   worker pool, so the block layer accumulates queue depth instead of the compute thread stalling on
   each 4 KiB fault. Plus `warm_range_blocking()` for start-up, where blocking is the point.
-- `IStreamReader` — `pread()` pool for bytes that should *not* enter the page cache. This is the
+- `IStreamReader`: `pread()` pool for bytes that should *not* enter the page cache. This is the
   escape hatch from LRU thrash: stream the cold tail into a small reusable buffer and keep the hot
   set pinned. io_uring slots in behind this interface later.
-- `IReadScheduler` — composite that dispatches per `ReadPolicy` (`kCacheWarm` vs `kStream`). The
+- `IReadScheduler`: composite that dispatches per `ReadPolicy` (`kCacheWarm` vs `kStream`). The
   runtime states an intent; the backends stay swappable.
 
 ### amp_model
-`GGUFFile` parses the header only — 41 KV pairs and 733 tensor infos, a few hundred KB, with
+`GGUFFile` parses the header only: 41 KV pairs and 733 tensor infos, a few hundred KB, with
 sizes taken from ggml itself so amp's view of the file is byte-for-byte llama.cpp's view. That is
 what makes "zero quality loss" structural instead of aspirational: the arithmetic is the same code.
 
@@ -82,13 +82,13 @@ The `IoMode` distinction is deliberate and load-bearing:
 
 The forward path for `amp-infer` (the benchmark tool), on llama.cpp's kernels.
 
-- `model_runtime.cpp` — tokenize, embed, 40 blocks (30 recurrent + 10 attention), sample. Uses the
+- `model_runtime.cpp`: tokenize, embed, 40 blocks (30 recurrent + 10 attention), sample. Uses the
   legacy `llama_batch` API; the prefetcher walks expert ranges ahead of the compute thread.
-- `buft_overrides.{h,cpp}` — builds the null-terminated `tensor_buft_overrides` array that pins
+- `buft_overrides.{h,cpp}`: builds the null-terminated `tensor_buft_overrides` array that pins
   `ffn_*_exps.weight` to the CPU for the layers the plan left there (the `-ncmoe` equivalent).
   One helper, because a missing sentinel is a segfault and two call sites had it.
 
-### amp_preflight — the whole of amp's server contribution
+### amp_preflight, the whole of amp's server contribution
 
 `src/plan/preflight.{h,cpp}`, plus `tools/amp_server.cpp` which is ~90 lines. There is no amp HTTP
 layer, no amp OpenAI translation, no amp slot management, and no amp prompt cache. All of it is
@@ -105,10 +105,10 @@ What the preflight actually does, and why each part exists:
    (`seen_args` at `common/arg.cpp:814` is local to the parser), so the preflight scans `argv`
    itself. The only reliable field-level tests are `n_gpu_layers` (-1 = unset) and
    `tensor_buft_overrides` (null first entry = unset).
-2. **Device layout** — the plan's expert-layer count becomes `tensor_buft_overrides`, written *in
+2. **Device layout.** The plan's expert-layer count becomes `tensor_buft_overrides`, written *in
    place* into the buffer `common_params_parse` already padded to 4096 entries. Never `push_back`
    past the sentinel: `common.cpp:1706` asserts on it and the tensor loader walks to it.
-3. **Context, ubatch, KV dtypes, threads, flash-attn** — set only when the user did not pass them.
+3. **Context, ubatch, KV dtypes, threads, flash-attn.** Set only when the user did not pass them.
 4. **Three clamps on llama.cpp defaults that are dangerous on this box**: `n_ctx_checkpoints` 32 to
    2 (each checkpoint is a *full* serialized sequence state, ~1.6 GiB at 200k), `cache_ram_mib` 8192
    to 512 (anonymous RAM that evicts the model's page cache), and `fit_params` off.
@@ -117,7 +117,7 @@ What the preflight actually does, and why each part exists:
    llama.cpp's default f16 KV while then setting q8_0/q4_0 cost another 4 layers and a 2.7x smaller
    ubatch. Both are recorded in docs/BENCH.md.
 
-It never initialises a backend, loads the model, or creates a context — `llama_server()` owns all
+It never initialises a backend, loads the model, or creates a context. `llama_server()` owns all
 of that, and doing any of it twice would read 12 GB of weights twice.
 
 ## What was deleted, and why
@@ -128,7 +128,7 @@ llama.cpp's server implements 40+ and is maintained against the commit we pin.
 
 The prefix cache is the deletion worth arguing for, because it was real work: 30 of 40 layers here
 are recurrent, so the KV cannot be rewound, and it snapshotted the sequence at the prompt boundary
-to work around that. llama.cpp solves it better — it asks the model what it supports via
+to work around that. llama.cpp solves it better, asking the model what it supports via
 `common_context_seq_rm_type` (`common.h:989-992`), keeps context checkpoints with `pos_min`/`pos_max`
 ranges, and falls back to a full re-process with a log line pointing at the upstream PR that added
 it for hybrid/recurrent memory (`server-context.cpp:3379`). Maintaining our own version of a solved

@@ -13,7 +13,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)                       # first build compiles the CUDA kernels: ~15 min
 ```
 
-`third_party/DEPS.lock` holds the pin. The fetch is idempotent — re-running it only re-checks the
+`third_party/DEPS.lock` holds the pin. The fetch is idempotent, so re-running it only re-checks the
 commit. The first build is slow because ggml's CUDA kernels are compiled from scratch; after that,
 incremental builds are seconds.
 
@@ -66,7 +66,7 @@ Those three clamps matter: llama.cpp's own defaults for `n_ctx_checkpoints` and 
 **It is not faster than a well-configured `llama-server` at steady state.** Measured with 5
 identical requests per engine: amp 28.39 t/s decode, llama-server 30.05 t/s. What the plan buys is
 that the CPU expert set fits the page cache (10.90 GiB) where llama-server's documented config does
-not (~11.5 GiB), so amp does not collapse — llama-server's first request runs at 1.96 t/s, amp's at
+not (~11.5 GiB), so amp does not collapse. llama-server's first request runs at 1.96 t/s and amp's at
 26 t/s. See `docs/BENCH.md`.
 
 ### Quality variants: `--model-config <name>:v<N>`
@@ -123,9 +123,9 @@ things worse:
 
 **Do not reach for these**, all measured to be worth nothing on this model:
 
-- **N-gram speculative decoding** (`--spec-type ngram-simple`) — lossless, but +0.2 % on templated
+- **N-gram speculative decoding** (`--spec-type ngram-simple`). Lossless, but +0.2 % on templated
   output, which is where it should pay best. The model is too entropic for drafts to match.
-- **Expert prefetch** (M3c, `AMP_M3C_PREFETCH_KIB`) — built, measured, and a tie at +0.2 % over
+- **Expert prefetch** (M3c, `AMP_M3C_PREFETCH_KIB`). Built, measured, and a tie at +0.2 % over
   nine paired comparisons. The expert matvec already runs at 101.8 % of a plain read of its own
   bytes, so there is no exposed latency for a prefetcher to hide. Off by default; see
   `docs/BENCH.md` before enabling it for any reason.
@@ -183,7 +183,7 @@ The reasoning budget also works and is effective (100 -> 12 tokens), but it forc
 mid-thought, and at a very tight budget (8 tokens) 1 sample in 3 returned a doubled answer. It stays
 opt-in; `docs/BENCH.md` has the table.
 
-Always inspect `POST /apply-template` when a turn misbehaves — it shows the exact prompt the server
+Always inspect `POST /apply-template` when a turn misbehaves. It shows the exact prompt the server
 will evaluate, for free.
 
 ### Concurrency
@@ -208,7 +208,7 @@ What that costs:
 
 `n > 1` needs more than one slot, so it is unavailable by default and returns a typed
 `invalid_request_error`. Stock llama-server can serve it. This is a deliberate trade, not an
-oversight — but it is a capability stock llama-server has and amp does not by default, so it
+oversight, but it is a capability stock llama-server has and amp does not by default, so it
 should be your call rather than mine. Pass `--parallel N` if you need it.
 
 Re-measured with one slot, three simultaneous requests: 3/3 completed, all with
@@ -234,7 +234,7 @@ python3 scripts/kl_parity.py compare --a quality/llama-matched.json --b quality/
 python3 scripts/bench_server.py --url http://127.0.0.1:8081 --tag amp --n 5
 ```
 
-A KL comparison is only meaningful with **placement held fixed** — amp's plan deliberately chooses a
+A KL comparison is only meaningful with **placement held fixed**. Amp's plan deliberately chooses a
 different device layout from llama.cpp's default, which on its own produces ~11 % top-1 agreement
 from a 0.012 logprob difference. Match the layout, then compare; see `docs/BENCH.md`.
 
@@ -255,8 +255,8 @@ M=/home/e0u/localhost/models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
 Prints the model's byte budget, the box's limits, the chosen configuration, and a ranked candidate
 table. Two things to look for:
 
-- `predicted prefill / decode` — what the cost model expects
-- `DECODE IS CACHE-BOUND RIGHT NOW` — appears when other programs are holding RAM that the expert
+- `predicted prefill / decode`: what the cost model expects
+- `DECODE IS CACHE-BOUND RIGHT NOW`: appears when other programs are holding RAM that the expert
   weights need. Close the browser and re-run; that is usually a 10x decode difference.
 
 Useful flags: `--ctx N`, `--json`, `--gpu-layers N`, `--ubatch N`, `--top N`.
@@ -267,7 +267,7 @@ Useful flags: `--ctx N`, `--json`, `--gpu-layers N`, `--ubatch N`, `--top N`.
 ./build/bin/amp-infer --model $M --prompt "explain MoE routing" --n-predict 128
 ```
 
-Realistic prompt (52 KB, ~18k tokens) — the numbers in `docs/BENCH.md` come from this:
+Realistic prompt (52 KB, ~18k tokens). The numbers in `docs/BENCH.md` come from this:
 
 ```bash
 ./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/amp_bench_prompt.txt --n-predict 128 --ctx 200000
@@ -342,9 +342,9 @@ AMP_TEST_MODEL=/path/to/other.gguf ./build/bin/amp_tests
   need, and the difference is 10x on decode.
 - Do not start `amp-server` (or `amp-infer`) while a `llama-server` is running: they will fight over
   the same 6 GB of VRAM and 14 GiB of page cache, and both will be slow and possibly unstable. The
-  planner will also refuse to fit the model, which is the intended behaviour — free the VRAM first.
+  planner will also refuse to fit the model, which is the intended behaviour. Free the VRAM first.
 - `pkill -x amp-server` sends SIGTERM and the server exits cleanly. If a run left one behind, check
-  `pgrep -a amp-server` — a stale instance holds 5.4 GB of VRAM and every other instance will then
+  `pgrep -a amp-server`. A stale instance holds 5.4 GB of VRAM and every other instance will then
   fail to plan.
 - The Kioxia SSD (`/run/media/e0u/D1`) is 6-13x slower than the Kingston for this workload. Keep the
   model where it is.

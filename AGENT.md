@@ -266,7 +266,7 @@ GPU expert residency, and predicts 240 t/s prefill and 16.4 t/s decode at 200k w
 From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/server-task.cpp`:
 
 - **Generation starts inside a think block.** `{%- if enable_thinking is defined and enable_thinking is
-  false %}` → `<think>\n\n</think>\n\n` (pre-closed, answer directly); else `<think>\n`.
+  false %}` -> `<think>\n\n</think>\n\n` (pre-closed, answer directly); else `<think>\n`.
 - **`preserve_thinking`** decides whether an assistant turn's reasoning is re-rendered; the template
   *also* preserves anything after `ns.last_query_index` automatically, so the current turn needs no flag.
   llama.cpp's public name for this is `preserve_reasoning`, mapped onto the real variable names by

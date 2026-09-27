@@ -26,7 +26,7 @@ belongs in a preflight rather than a hand-written inference loop.
 
 **Zero quality loss is a hard constraint**, and it is structural rather than aspirational: same
 ggml kernels, same weights, same KV dtypes, same sampler, statically linked from the same commit.
-Measured, not asserted — with placement held fixed, llama.cpp's server and amp's produce
+Measured, not asserted. With placement held fixed, llama.cpp's server and amp's produce
 **bit-identical** output distributions (KL = 0.000000e+00 both directions, JS = 0, max
 |Δ logprob| = 0 over 512 greedy tokens).
 
@@ -57,7 +57,7 @@ version of this file claimed 7.4x; that was amp's warm state measured against ll
 one, and it did not reproduce.
 
 What the plan does buy is that it does not collapse. `llama-server`'s documented config needs
-~11.5 GiB of CPU experts — more than this box keeps resident — so its first request runs at
+~11.5 GiB of CPU experts, more than this box keeps resident, so its first request runs at
 **1.96 t/s** before recovering. amp keeps the CPU set at 10.90 GiB, inside the budget, and its first
 request runs at 26 t/s. It also forces a single slot by default, because `llama-server`'s four
 concurrent slots thrash the same shared working set (0.64 t/s measured). Full numbers, including
@@ -70,7 +70,7 @@ the mistakes, in `docs/BENCH.md`.
 hidden behind memory traffic.
 
 That closes the MoE from both sides. Prefetching cannot help it, because there is no exposed
-latency left to hide — M3c was built and measured at a mean **+0.2 %**, a tie, with quality
+latency left to hide. M3c was built and measured at a mean **+0.2 %**, a tie, with quality
 provably unchanged. A cheaper dequant kernel would not help either. The only thing that moves the
 expert path is fewer bytes, which means quantization, which this project rules out.
 
@@ -97,7 +97,7 @@ This is a reasoning model whose chat template renders the generation prompt alre
 - Structured `tool_calls` are emitted with a real id and parsed `arguments`. A thinking model needs
   ~66 tokens to reach a tool call; with thinking disabled, 27.
 - `reasoning_format` (`none`/`auto`/`deepseek`/`deepseek-legacy`) is honoured.
-- `reasoning_effort` is accepted and **ignored** — this template has no such capability.
+- `reasoning_effort` is accepted and **ignored**. This template has no such capability.
 - The reasoning budget is upstream's sampler, left off by default: this quant loops after a forced
   `</think>`.
 
