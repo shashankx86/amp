@@ -689,7 +689,7 @@ downstream of it was wrong:
 |---|---|---|
 | share of expert bytes removed | 0.894 | 0.106 |
 | expert weight fetching | 3.7 % of decode | **~30-36 % of decode** |
-| all experts on GPU | 1.04x | 1.46x |
+| all experts on GPU | 1.04x | 1.46x, later **refuted**, see below |
 
 So M3c was not obviously worthless, and it was built and measured rather than argued away.
 
@@ -833,8 +833,8 @@ optimal**), n-gram speculation (**0.2 %**), expert prefetch (**0.2 %, a tie**).
 3.7 % figure, and it was wrong. The corrected picture is that expert reads are about a third of
 decode and are memory-bandwidth-bound on the CPU, so moving experts to the GPU removes both the
 memory traffic and the CPU arithmetic for those layers. Measured: g=0 -> g=4 is **+3.4 %** for
-10.6 % of expert bytes moved. Extrapolating linearly, g=8 is worth roughly **+7 %** and every
-expert on the GPU roughly **1.46x**.
+10.6 % of expert bytes moved. The linear extrapolation that followed from this - g=8 worth ~+7 %,
+every expert on the GPU 1.46x - **was wrong, and is retracted below.**
 
 6 GB of VRAM cannot hold g=8, so on this box that headroom is unreachable. It is still real
 headroom, and it is the only large multiplier left. This laptop's 4050 cannot be upgraded, so
@@ -958,3 +958,25 @@ While building the 35k fixture, a 104,884-character prompt (36,530 tokens, verif
 a plausible explanation, since 4x the text tokenises to 106,239 tokens as one string. Something
 truncates a long prompt to about half. Not investigated, and recorded here rather than forgotten:
 if a real prompt is silently halved, that is worse than any speed question.
+
+**This supersedes the 1.46x figure above, which was wrong in the same way the 3.7 % one was.** It was
+a linear extrapolation from two A/B points, and placement does not stay linear. Measured directly,
+200k context, decode and prefill on the same 18,265-token prompt:
+
+| `-c` | GPU expert layers | prefill | decode |
+|---|---|---|---|
+| 200000 | 4 | 198.8 t/s | **28.89 t/s** |
+| 64000 | 7 | **252.9 t/s (+27 %)** | 26.44 t/s |
+| 16000 | 8 | (context too small to measure) | - |
+
+**Moving expert layers to the GPU helps prefill a great deal and does nothing for decode - it makes
+decode slightly worse.** At batch 1 the GPU GEMV cannot exploit its parallelism and simply competes
+with the 30 recurrent layers already resident there; at batch 1024 it is far more efficient per byte
+than the CPU. The GPU is not the constraint for decode and there is spare capacity for prefill.
+
+So the placement ceiling is the measured g=0 -> g=4 gain of **+3.4 %**, not a compounding 1.46x.
+Forcing more at 200k is not even possible: `-ncmoe 34` (g=6) and `-ncmoe 32` (g=8) both OOM at load,
+so 6 GB caps this at g=4 to g=5. The remaining honest trade is context length against prefill rate:
+`-c 64000` buys **+27 % prefill** for **-8.5 % decode** and 64k of context instead of 200k. Whether
+that is worth it depends on how often you re-prefill, and for a cached agentic loop the answer is
+usually no, because steady-state turns are decode-bound.

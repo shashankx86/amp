@@ -74,10 +74,12 @@ latency left to hide — M3c was built and measured at a mean **+0.2 %**, a tie,
 provably unchanged. A cheaper dequant kernel would not help either. The only thing that moves the
 expert path is fewer bytes, which means quantization, which this project rules out.
 
-It also means **VRAM is the binding constraint**, reversing the earlier advice: g=0 -> g=4 measures
-+3.4 % for 10.6 % of expert bytes moved, so g=8 is worth roughly +7 % and all-experts-on-GPU
-roughly **1.46x**. 6 GB cannot hold g=8, so that headroom is unreachable on this laptop — but on a
-bigger card it is where the win is, not threads and not prefetching.
+It also means **VRAM is a binding constraint**, but not the one the earlier note claimed: placement
+saturates. g=0 -> g=4 measures +3.4 % for 10.6 % of expert bytes moved, then g=4 -> g=7 measures
+28.89 -> 26.44 t/s, i.e. *slightly worse*, and g=6 OOMs at 200k. A 1.46x "all experts on GPU"
+extrapolation from the first pair was wrong and is retracted. The GPU sits 70 % idle during decode
+and moving work onto it still does not help, because at batch 1 a GEMV cannot exploit parallelism
+and competes with the recurrent layers already resident.
 
 Measured and spent on the CPU side: threads already optimal (`-t 8` beats 4/12/16), placement
 3.4 %, the 200k context 2.6 %, n-gram speculation 0.2 %, expert prefetch 0.2 %. What is left is the

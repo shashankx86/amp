@@ -43,9 +43,14 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
   which the project rules out. Measure with `amp-kernel-bound`; pin ggml's thread count with
   `ggml_backend_cpu_set_n_threads` or the comparison is meaningless.
 - **VRAM *is* a binding constraint, reversing the earlier advice.** g=0 -> g=4 measures +3.4 % for
-  10.6 % of expert bytes moved off the CPU, so g=8 is worth roughly +7 % and all-experts-on-GPU
-  roughly **1.46x**. 6 GB cannot hold g=8. Unreachable on this laptop, but it is the only large
-  multiplier left, and on a bigger card that is where the win is.
+  10.6 % of expert bytes moved off the CPU. **Placement then saturates: g=4 -> g=7 measures 28.89 ->
+  26.44 t/s, i.e. slightly worse, and g=6 OOMs at 200k.** So the placement ceiling is the measured
+  +3.4 %, not a compounding 1.46x - a linear extrapolation that was wrong in the same way the 3.7 %
+  figure was. The GPU is 70 % idle during decode (29 % utilisation, 18.7 W of ~140 W) yet moving
+  work onto it does not help, because at batch 1 a GPU GEMV cannot exploit its parallelism and
+  competes with the 30 recurrent layers already resident. What spare GPU capacity *does* help is
+  prefill: g=4 -> g=7 is **+27 % prefill**. The real trade is context length against prefill rate
+  (`-c 64000` gives +27 % prefill for -8.5 % decode), not VRAM for decode.
 - **Decode I/O is a non-issue and page faults are not on the critical path.** Over 384 tokens:
   `read_bytes` 88.61 MiB total = **236 KiB/token**, `majflt` 56/token, and `stime` **0.1 %** of busy
   time. Note that DRAM stalls bill as *user* time, so a small `stime` rules out I/O and kernel work

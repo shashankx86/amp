@@ -89,11 +89,17 @@ things worse:
 - **A smaller context to "free" VRAM.** The 200k target costs 2.6 % of decode (8,192 -> 35.61,
   65,536 -> 35.27, 200,000 -> 34.68 t/s). Use the context you need; the trade is not worth making.
 
-**VRAM is the one place left with real headroom**, and 6 GB cannot reach it. g=0 -> g=4 measures
-+3.4 % for 10.6 % of expert bytes moved off the CPU, so g=8 would be worth roughly +7 % and every
-expert on the GPU roughly 1.46x. The 4050 in this laptop cannot be upgraded, so this is a fact
-about the hardware rather than an avenue — but do not carry over the old claim that VRAM does not
-matter. It is the only large multiplier left.
+**VRAM is a real constraint, but placement saturates, so do not expect a win from it.** g=0 -> g=4
+measures +3.4 % for 10.6 % of expert bytes moved off the CPU, but g=4 -> g=7 then measures 28.89 ->
+26.44 t/s, i.e. slightly *worse*, and forcing g=6 at 200k OOMs at load. The GPU is 70 % idle during
+decode and moving work onto it still does not help: at batch 1 a GEMV cannot exploit parallelism and
+competes with the recurrent layers already resident. An earlier note here claimed 1.46x for
+all-experts-on-GPU; that was a linear extrapolation and it is wrong.
+
+**The one real trade is context length against prefill rate.** Cutting `-c` to 64000 gives the planner
+room for 7 GPU expert layers instead of 4, which measures **+27 % prefill** (198.8 -> 252.9 t/s) for
+**-8.5 % decode** (28.89 -> 26.44 t/s). Worth it if you re-prefill often; usually not worth it in a
+cached agentic loop, where steady-state turns are decode-bound.
 
 The measurement still missing is a per-op profile. **30 of the 40 layers are recurrent** and 10 are
 full attention; together with everything outside the expert matvec that is the other two thirds of
