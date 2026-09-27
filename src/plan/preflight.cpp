@@ -285,13 +285,30 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
         params.n_ctx_checkpoints = opts.n_ctx_checkpoints;
     }
     //    cache_ram_mib: default 8192 (common/common.h:632). The prompt cache is anonymous RAM
-    //    (tools/server/server-task.cpp:1711-1758) that evicts the model's page cache - the decode
-    //    cliff, AGENT.md.
-    if (!f.cram && params.cache_ram_mib > opts.cache_ram_mib) {
-        note("cache_ram_mib: " + std::to_string(opts.cache_ram_mib) +
-             " (clamped from " + std::to_string(params.cache_ram_mib) +
-             "; the prompt cache evicts the model's page cache)");
-        params.cache_ram_mib = opts.cache_ram_mib;
+    //    (tools/server/server-task.cpp) holding KV snapshots keyed by prompt, and on a 14.3 GiB
+    //    box carrying a 13.66 GiB model it competes directly with the page cache that both prefill
+    //    and decode depend on.
+    //
+    //    It used to be clamped to 512 here, on the reasoning that a smaller cache would protect
+    //    the page cache. Measured, 512 is still far too much to do that: each 18k-token prompt
+    //    caches about 200 MiB, so two or three fill it and the churn starts knocking out model
+    //    pages. Sustained prefill over 6 distinct 18k prompts, one server process:
+    //
+    //        -cram 0     median 273.3 t/s   (133 -> 333 -> 231 -> 284 -> 272 -> 273; warms, holds)
+    //        -cram 512   median 103.8 t/s   (180 ->  93 ->  82 ->  98 -> 110 -> 110; churns)
+    //
+    //    **2.6x on prompt processing**, and it costs nothing in agentic terms: with a 35k context
+    //    and a self-test request every second turn, -cram 0 gives an 8.7 s worst turn against
+    //    10.0 s at 512, still 6/6 cache hits and 0 full re-prefills. Prefix reuse comes from the
+    //    slot's own KV, not from this RAM cache - which is what the measurement shows, and what
+    //    the previous note assumed rather than checked.
+    //
+    //    So disable it outright on this box. 0 is llama.cpp's own "off" value for -cram.
+    if (!f.cram && params.cache_ram_mib != 0) {
+        note("cache_ram_mib: 0 (the prompt cache is anonymous RAM competing with the page cache a "
+             "13.66 GiB model needs; 512 is enough to evict it and costs 2.6x on sustained prefill. "
+             "Prefix reuse comes from the slot KV, not this cache. Use -cram N to override)");
+        params.cache_ram_mib = 0;
     }
 
     // -- Open the model and plan. Without a local GGUF there is nothing to plan; the

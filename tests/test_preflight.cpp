@@ -188,7 +188,23 @@ AMP_TEST(preflight_clamps_the_dangerous_defaults) {
     const auto r = apply_preflight(o, p, std::vector<std::string>{ "amp-server", "-m", m });
     AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
     AMP_CHECK_EQ(p.n_ctx_checkpoints, 2);
-    AMP_CHECK_EQ(p.cache_ram_mib, 512);
+    // 0, not the old 512. 512 is still enough for two or three 18k-token prompt entries to fill
+    // it and start evicting the model's page cache, which measured 2.6x on sustained prefill.
+    AMP_CHECK_EQ(p.cache_ram_mib, 0);
+    {
+        // ...unless the user asks for a cache, in which case they get one.
+        // common_params_parse would already have applied the VALUE; the preflight only has to
+        // notice that the user supplied the flag at all. So set both, as the real pipeline does.
+        common_params   q = parsed_like_llama_cpp();
+        q.model.path    = m;
+        q.cache_ram_mib = 2048;   // as "-cram 2048" would have left it
+        PreflightOptions qo;
+        qo.n_ctx = 4096;
+        const auto r2 = apply_preflight(qo, q,
+                                        std::vector<std::string>{ "amp-server", "-m", m, "-cram", "2048" });
+        AMP_CHECK_MSG(r2.ok(), "should not fail: " + r2.message());
+        AMP_CHECK_EQ(q.cache_ram_mib, 2048);
+    }
     AMP_CHECK_MSG(!p.fit_params, "fit_params must be off so it cannot overwrite our layout");
 }
 
@@ -219,8 +235,8 @@ AMP_TEST(preflight_plan_failure_still_leaves_a_usable_config) {
     AMP_CHECK_EQ(p.n_ctx_checkpoints, 2);
     AMP_CHECK_MSG(p.cache_type_k == GGML_TYPE_Q8_0,
                   std::string("K cache must still be q8_0, got ") + ggml_type_name(p.cache_type_k));
-    AMP_CHECK_MSG(p.cache_type_v == GGML_TYPE_Q4_0,
-                  std::string("V cache must still be q4_0, got ") + ggml_type_name(p.cache_type_v));
+    AMP_CHECK_MSG(p.cache_type_v == GGML_TYPE_Q8_0,
+                  std::string("V cache must still be q8_0, got ") + ggml_type_name(p.cache_type_v));
     AMP_CHECK_MSG(p.n_ubatch == 2048,
                   std::string("n_ubatch must be left untouched without a plan, got ") +
                       std::to_string(p.n_ubatch) + " (0 would mean plan.ubatch was assigned)");
@@ -282,7 +298,13 @@ AMP_TEST(preflight_forces_two_slots_unless_asked) {
 AMP_TEST(preflight_applies_the_measured_kv_dtypes) {
     // The regression test for the worst of the two planning bugs. llama.cpp's field default is
     // F16; the preflight previously planned at F16 and then applied q8_0/q4_0, so the plan
-    // reserved 2.46x the VRAM the cache actually needs.
+    // reserved 2.46x the VRAM the cache actually needs. The rule that survives is the one that
+    // says plan against what will actually be applied, not what the field happened to hold.
+    //
+    // V is q8_0 rather than the older q4_0. llama.cpp's own default is f16/f16, so q4_0 was
+    // already a reduction, and published measurements put q4_0 V about 7x further from f16 than
+    // q8_0 V is. The extra VRAM comes out of one GPU expert layer, which is the right trade:
+    // decode stays far above its floor and that layer was worth little to it.
     const char * m = model_path();
     if (!m) {
         return;
@@ -297,6 +319,19 @@ AMP_TEST(preflight_applies_the_measured_kv_dtypes) {
     AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
     AMP_CHECK_MSG(p.cache_type_k == GGML_TYPE_Q8_0,
                   std::string("K cache must be q8_0, got ") + ggml_type_name(p.cache_type_k));
-    AMP_CHECK_MSG(p.cache_type_v == GGML_TYPE_Q4_0,
-                  std::string("V cache must be q4_0, got ") + ggml_type_name(p.cache_type_v));
+    AMP_CHECK_MSG(p.cache_type_v == GGML_TYPE_Q8_0,
+                  std::string("V cache must be q8_0, got ") + ggml_type_name(p.cache_type_v));
+    {
+        // ...unless the user names a dtype, in which case it is theirs.
+        common_params   q = parsed_like_llama_cpp();
+        q.model.path    = m;
+        q.cache_type_v  = GGML_TYPE_F16;   // as "-ctv f16" would have left it
+        PreflightOptions qo;
+        qo.n_ctx = 4096;
+        const auto r2 = apply_preflight(qo, q,
+                                        std::vector<std::string>{ "amp-server", "-m", m, "-ctv", "f16" });
+        AMP_CHECK_MSG(r2.ok(), "should not fail: " + r2.message());
+        AMP_CHECK_MSG(q.cache_type_v == GGML_TYPE_F16,
+                      std::string("an explicit -ctv must survive, got ") + ggml_type_name(q.cache_type_v));
+    }
 }

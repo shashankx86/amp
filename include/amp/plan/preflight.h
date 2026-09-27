@@ -56,7 +56,7 @@ struct PreflightOptions {
     // KV cache dtypes. Must stay q8_0/q4_0: those are the dtypes the BENCH.md
     // numbers were measured with (zero-quality-loss constraint, AGENT.md).
     CacheType cache_k = CacheType::kQ8_0;
-    CacheType cache_v = CacheType::kQ4_0;
+    CacheType cache_v = CacheType::kQ8_0;
 
     // CPU threads when the user did not pass -t. 8 = ncpu/2 on this 8C/16T box.
     int64_t n_threads = 8;

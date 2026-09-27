@@ -46,7 +46,7 @@ DeviceBudget detect_device_budget(const CostModelConstants & cost_constants = Co
 struct PlannerOptions {
     int64_t   n_ctx          = 200000;
     CacheType cache_k        = CacheType::kQ8_0;
-    CacheType cache_v        = CacheType::kQ4_0;
+    CacheType cache_v        = CacheType::kQ8_0;
     int64_t   ubatch_min     = 256;
     int64_t   ubatch_max     = 2048;
     int32_t   max_expert_layers_gpu = 8;
@@ -89,7 +89,7 @@ struct ExecutionPlan {
     int32_t   n_expert_layers_gpu = 0;  // layers [n_layer-g, n_layer) on GPU
     int64_t   ubatch              = 0;
     CacheType cache_k             = CacheType::kQ8_0;
-    CacheType cache_v             = CacheType::kQ4_0;
+    CacheType cache_v             = CacheType::kQ8_0;
 
     int64_t   kv_bytes            = 0;
     int64_t   compute_bytes       = 0;
