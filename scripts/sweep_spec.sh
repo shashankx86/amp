@@ -54,6 +54,12 @@ arm_args() {
         # nothing at all on the code workload and 48 tokens with zero accepted on prose.
         map-k3)    echo "--spec-type ngram-map-k --spec-ngram-map-k-size-n 3 --spec-ngram-map-k-size-m 16" ;;
         simple3)   echo "--spec-type ngram-simple --spec-ngram-simple-size-n 3 --spec-ngram-simple-size-m 16" ;;
+        # The last configuration worth testing. The 3-gram arm loses because a 10-token window
+        # needs an accepted run of 3.7 and gets 2.75. A 5-token window raises the density of
+        # chances (more passes, each shorter) while lowering the pass cost, so it is the only
+        # remaining shape where a run-based drafter could pay. If this also loses, the idea is
+        # exhausted for this model and no further n-gram tuning is worth spending on.
+        map-k3-m5)  echo "--spec-type ngram-map-k --spec-ngram-map-k-size-n 3 --spec-ngram-map-k-size-m 5" ;;
         map-k4v)   echo "--spec-type ngram-map-k4v" ;;
         mod)       echo "--spec-type ngram-mod" ;;
         simple)    echo "--spec-type ngram-simple" ;;
@@ -80,6 +86,7 @@ arm_require() {
         base)      echo "" ;;
         map-k)     echo "$SPEC_MARK 'ngram-map-k'" ;;
         map-k3)    echo "$SPEC_MARK 'ngram-map-k'" ;;
+        map-k3-m5) echo "$SPEC_MARK 'ngram-map-k'" ;;
         simple3)   echo "$SPEC_MARK 'ngram-simple'" ;;
         map-k4v)   echo "$SPEC_MARK 'ngram-map-k4v'" ;;
         mod)       echo "$SPEC_MARK 'ngram-mod'" ;;

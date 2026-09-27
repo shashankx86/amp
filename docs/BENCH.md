@@ -1289,3 +1289,24 @@ there is no MTP to compare against, so the lookup is always the loser.
 The one Strata speculation idea that would work on this model is the MTP head, and there is
 no MTP head: a byte scan of all 13.66 GB of the Occamy GGUF found no `nextn`, `draft`, `mtp`
 or `eagle` tensor. Speculative decoding on Occamy is not a tuning problem.
+
+### The last n-gram shape, and why the idea is now exhausted
+
+Halving the verify window from ~10 tokens to ~5.5 was the only remaining shape worth
+testing, and it also loses:
+
+| window | drafted/pass | accepted run A | pass cost | break-even A | short by | decode |
+|---|---:|---:|---:|---:|---:|---:|
+| `m=16` (T~10.2) | 10.2 | 2.75 | 3.72x t1 | 3.72 | 1.35x | **-26.2%** |
+| `m=5` (T~5.5) | 5.5 | 2.62 | 3.29x t1 | 3.29 | 1.26x | **-20.3%** |
+
+The shape of that table is the finding. Halving the window cut the per-pass cost by only
+12% (3.72x -> 3.29x) while the accepted run got slightly *worse* (2.75 -> 2.62), so the
+deficit barely moved. **The accepted run length is set by the model and the workload, not
+by the window size** - it is how often Occamy reproduces a span of its context verbatim
+rather than paraphrasing it, and no flag changes that.
+
+Break-even needs A ~ 3.3-3.7 consecutive accepted tokens. Strata's MTP head delivers
+0.89 / 0.86 / 0.85 at steps 1-3, i.e. runs of 3+, and clears it. A lookup drafter gets 2.6
+on this workload and cannot clear it at any window size. **n-gram speculation on Occamy is
+closed.** No further tuning of `-lcs`, `-lcd` or `--spec-ngram-*` is worth spending on.
