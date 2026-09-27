@@ -1051,6 +1051,14 @@ Measured on the same prompt, and the early single-request numbers for this were 
 | `-tb 16` | 221.0 t/s |
 | `-tb 8` explicit | 173.0 t/s |
 
+> **SUPERSEDED 2026-09-28 — the "above 1024 loses" half of this is now measured to be
+> wrong, and the correction is in the 2026-09-28 section below.** The 2048 point is not a
+> wash: it is 38% *faster* than 1024 under the same harness, and the displacement argument does
+> not survive. The "below 1024 falls off a cliff" half still holds. The failure was measuring a
+> `n_ubatch` sweep with single requests, which is the exact mistake that had already
+> invalidated an earlier sweep in this project — and `n_ubatch 1024` is still the planner's
+> choice, for a reason given in the 2026-09-28 section.
+
 The compute buffer is not tradeable: below 1024 prefill falls off a cliff, and above it the GPU
 expert layers the buffer displaces cost more than the batch size gains. More batch threads hurt.
 These are single-request numbers and the ordering is what carries the conclusion, not the values.
@@ -1389,3 +1397,66 @@ launches per token), while on Linux with graph capture a launch is 0.805 us. amp
 Linux, so the specific disease does not transfer, but the measurement that would settle it -
 how many kernel launches per token, and what each costs - needs an instrument this box does
 not have. Recorded as the next question with the reason it is still open, not as a finding.
+
+## 2026-09-28: Strata's 2048-token prompt chunk beats amp's 1024, by 38%
+
+Strata processes prompts in **2,048-token chunks** with the experts streamed to the GPU over
+PCIe. amp's measured optimum was 1,024, and its `n_ubatch` sweep claimed 2,048 was 24% *worse*
+(243 vs 320 t/s). That was measured with single requests, which this project has already
+recorded as the mistake that invalidated an earlier sweep. Re-measured with
+`scripts/bench_prefill.py` — five distinct ~8,192-token prompts, one server process, first
+request reported separately by the script — the sign flips:
+
+| `n_ubatch` | GPU expert layers | total VRAM | prefill median | spread |
+|---:|---:|---|---:|---:|
+| 1024 (planner's choice) | 7 | 5.57 / 5.89 GiB | 604.4 t/s | 3.42x |
+| **2048 (Strata's chunk)** | 6 | 5.84 / 5.89 GiB | **836.5 t/s** | 1.28x |
+
+**+38% prefill**, for one fewer GPU expert layer. Run again with `-ncmoe 33` to hold the
+placement fixed and separate the two effects:
+
+| arm | prefill median | spread |
+|---|---:|---:|
+| `-ub 2048 -ncmoe 33` (placement held) | 836.8 t/s | 3.16x |
+| `-ub 2048` (placement free, g=6) | 836.5 t/s | 1.31x |
+
+Identical. **The displacement is not the mechanism** — losing a GPU expert layer costs nothing
+measurable here, because during prefill a 2048-token batch activates so many experts that the
+extra resident layer is a rounding error. The win is the batch size itself, and it is the same
++38% whether or not the placement is pinned.
+
+### Why the earlier sweep had it backwards
+
+Three things differ from the 2026-09-27 run, and none of them is the hardware:
+
+1. **`cache_ram_mib` is now 0.** The old sweep ran with the 512 MiB RAM prompt cache on, which
+   is a measured ~3x on sustained prefill, and that penalty is *per prompt*. A 2,048-token
+   ubatch against a 512 MiB cache that holds ~2.5 such chunks interacts badly; with no cache
+   there is nothing to thrash.
+2. **KV is q8_0/q8_0**, not q8_0/q4_0. Smaller, so a bigger compute buffer fits.
+3. **Single request per point.** The old numbers were 1536 -> 248.9 and 2048 -> 242.7 t/s, from
+   a sweep whose spread this project later measured at 2.35x. The current `n_ubatch 1024` arm
+   still reports a 3.42x spread; its *median* is 604 t/s, nearly double the 320 t/s the old
+   sweep recorded for the same configuration. The old sweep was reading cold-cache requests.
+
+### What was given up, and what this does not claim
+
+2048 needs a 1.91 GiB compute buffer against 1 GiB at 1024, and total VRAM rises to 5.84 of
+5.89 GiB — **50 MiB free**, which is below Strata's 256 MiB "requests may stall" threshold and
+below the 119 MiB at which amp's own preflight already warns. At 200,000 context the buffer
+scales with the batch and this does not fit at all.
+
+**So 2048 is right at short context and wrong at 200k, and the planner's 1024 is not a
+mistake — it is the only value that fits the target configuration.** The honest conclusion is
+that `n_ubatch` should be a function of context, not a constant, and that the constant was
+chosen for the case that matters:
+
+| context | best `n_ubatch` | why |
+|---|---:|---|
+| 32,768 | **2048** | +38% prefill, 5.84/5.89 GiB fits |
+| 200,000 | 1024 | 2048's buffer does not fit; 1024 is the largest that does |
+
+Not yet implemented: making the planner pick 2048 when the budget allows. It is a two-line
+change to the same code that already sizes the buffer, and the measurement says it is worth
++38% of prefill for every user at a context where it fits. Recorded as the concrete next step
+rather than a claim.
