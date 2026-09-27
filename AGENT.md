@@ -51,6 +51,18 @@ One protocol trap, because it will hide an eviction effect even when the effect 
 delivered). At 11.2k a 512 MiB cache needs 5.7 prompts to fill, so a 5-prompt run cannot show it.
 Run past the point where the cache fills, and check that it did.
 
+**Quality parity needs TEACHER FORCING, and getting this wrong produces a large, confident,
+completely meaningless number.** A per-position KL comparison where each engine samples its own
+tokens puts the two arms on different prefixes at the first argmax difference, and every later
+position compares two different questions. Measured at 131k that reported **444 of 512 positions
+"disagreeing"** at median KL 1.7e-05 while the dtype under test had almost no effect. The fix is
+`amp-infer --score-file` against a fixture from `--emit-score`: every arm then evaluates the
+identical prefix and every position is comparable. Also note the logprob window — `top_k_track_`
+was 5, and a token dropping out of a 5-wide window reads as a disagreement; it is 32 now and
+`--logprobs-n` sets it. Run the determinism control (two runs, same config) and the placement
+control (same dtype, g=3 vs g=6) before believing any dtype number: placement alone is a
+**1.2e-04** median KL floor, and both q8_0 configs sit 26-29x above it at 131k.
+
 Decode splits 40% expert bandwidth and 60% everything else, measured 2026-09-28 by subtraction
 (349 MiB of experts at a measured 30.2 GB/s = 11.29 ms of a 28.25 ms token; `ggml mul_mat` at
 batch 1 runs at 30.2 GB/s on GDN layers and 29.5 on attention, against plain reads of 29.1 and

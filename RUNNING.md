@@ -238,6 +238,40 @@ A KL comparison is only meaningful with **placement held fixed**. Amp's plan del
 different device layout from llama.cpp's default, which on its own produces ~11 % top-1 agreement
 from a 0.012 logprob difference. Match the layout, then compare; see `docs/BENCH.md`.
 
+### For a dtype or kernel change, use `amp-infer` teacher forcing instead
+
+`kl_parity.py capture` above is fine for a *placement* question against a reference, but it
+generates greedily and each engine samples its own tokens. Two engines therefore sit on
+**different prefixes** from the first argmax difference onward, and every later position compares
+two different questions. Measured at 131k on this model, that reported **444 of 512 positions
+"disagreeing"** at a median KL of 1.7e-05 while the dtype under test barely mattered.
+
+To compare a KV dtype or a kernel, score a **fixed** token sequence so every position is
+comparable:
+
+```bash
+M=~/.local/share/amp/models/occamy.gguf        # or your path
+P=quality/prompt.txt
+
+# 1. a reference run emits the fixture. f16/f16 is the most precise arm, so use it.
+./build/bin/amp-infer --model $M --prompt-file $P -c 131072 --ctk f16 --ctv f16 \
+    --gpu-layers 3 --n-predict 512 --temp 0 --emit-score /tmp/opencode/score.txt
+
+# 2. every arm scores those exact tokens. Same --gpu-layers, same ctx: the only variable
+#    is the dtype.
+./build/bin/amp-infer --model $M --prompt-file $P -c 131072 --ctk q8_0 --ctv q8_0 \
+    --gpu-layers 3 --n-predict 512 --temp 0 --logprobs-n 32 \
+    --score-file /tmp/opencode/score.txt --dump-logprobs /tmp/opencode/arm.tsv
+```
+
+Run the controls before the result, not after: **two runs of the same arm** must be
+byte-identical, and **one arm at a different `--gpu-layers`** gives the float-order floor, which
+is **1.2e-04** median KL on this box. Both q8_0 configs sit 26-29x above that floor at 131k, so
+the floor is the thing that makes the number interpretable.
+
+`--logprobs-n` defaults to 32. It was 5, and a 5-wide window makes a token dropping out of it
+read as a disagreement that is really the window's edge.
+
 ## Everyday commands
 
 Model path used throughout below:
