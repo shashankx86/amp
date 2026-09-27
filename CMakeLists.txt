@@ -148,6 +148,14 @@ if(AMP_BUILD_TOOLS)
   target_include_directories(amp-server PRIVATE "${AMP_VENDOR_DIR}/common" "${AMP_VENDOR_DIR}/include")
   target_link_libraries(amp-server PRIVATE amp_preflight llama-server-impl)
   target_compile_options(amp-server PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+  # kernel-bound: a measurement tool, not part of the serving path. It answers whether the MoE
+  # expert matvec is limited by memory or by arithmetic, which is what decides whether a
+  # prefetcher or a cheaper dequant kernel is the thing worth writing.
+  add_executable(amp-kernel-bound tools/kernel_bound.cpp)
+  target_include_directories(amp-kernel-bound PRIVATE "${AMP_VENDOR_DIR}/include" "${AMP_VENDOR_DIR}/ggml/include")
+  target_link_libraries(amp-kernel-bound PRIVATE llama ggml ggml-cpu)
+  target_compile_options(amp-kernel-bound PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(AMP_BUILD_TESTS)
