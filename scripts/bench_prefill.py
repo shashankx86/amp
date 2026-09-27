@@ -134,9 +134,15 @@ def main():
     print(f"  prefill min     {min(rates):7.1f} t/s")
     print(f"  prefill max     {max(rates):7.1f} t/s")
     print(f"  spread          {max(rates) / min(rates):7.2f}x   <- the honest uncertainty")
-    dec = [x["decode_tps"] for x in rows if isinstance(x.get("decode_tps"), (int, float))]
-    if dec:
+    # Only report decode if it was generated in enough tokens to mean anything. A handful of
+    # tokens rounds to 0.0 and printing that would be a misleading line in a report.
+    dec = [x["decode_tps"] for x in rows
+           if isinstance(x.get("decode_tps"), (int, float)) and x["decode_tps"] > 0]
+    if dec and args.gen >= 64:
         print(f"  decode median   {statistics.median(dec):7.1f} t/s   (much more stable)")
+    elif dec:
+        print(f"  (decode not reported: only --gen {args.gen} tokens, too few to be meaningful. "
+              f"Use scripts/bench_server.py for decode.)")
 
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:

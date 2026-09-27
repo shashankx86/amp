@@ -980,3 +980,139 @@ so 6 GB caps this at g=4 to g=5. The remaining honest trade is context length ag
 `-c 64000` buys **+27 % prefill** for **-8.5 % decode** and 64k of context instead of 200k. Whether
 that is worth it depends on how often you re-prefill, and for a cached agentic loop the answer is
 usually no, because steady-state turns are decode-bound.
+
+## 2026-09-27 — prefill-first retune: q8_0/q8_0 KV and no RAM prompt cache
+
+The objective: maximise prompt processing, keep decode above 15 t/s (aim 20+), switch the KV cache
+to q8_0/q8_0, land it all at 200k context, and lose no quality.
+
+### The measurement problem came first, and it invalidated my own sweep
+
+Prefill on this box has a huge run-to-run spread. The same configuration, restarted three times,
+measured **132.5, 178.4 and 311.3 t/s** on an identical 18,265-token prompt. Decode over the same
+runs varied only 26.4 to 27.7. An entire `n_ubatch` sweep was run on single requests before this was
+noticed, and every conclusion drawn from it was discarded.
+
+The cause is the working set, and it changes how prefill has to be measured. Prefill runs at batch
+~1024, which routes most or all of the 256 experts per layer through the CPU matmul, so it reads
+essentially the whole 13.66 GiB of weights and thrashes a page cache holding about 11 GiB of it.
+Decode at batch 1 touches 8 experts per layer - small enough to stay resident - which is why decode is
+stable to 5 % and prefill spans 2.35x. `scripts/bench_prefill.py` now generates a distinct prompt per
+measurement so nothing is served from the prompt cache, and reports the median with the spread beside
+it.
+
+### The win: the RAM prompt cache was evicting the model
+
+`cache_ram_mib` is llama.cpp's prompt cache - anonymous RAM holding KV snapshots keyed by prompt.
+The preflight clamped it 8192 -> 512 on the reasoning that a smaller cache would protect the model's
+page cache. Measured, **512 is still far too much to do that.** Each 18k-token prompt caches about
+200 MiB, so two or three fill it and the churn starts knocking out model pages.
+
+Sustained prefill over 6 distinct 18k prompts, one server process, alternating to cancel drift, KV
+held at q8_0/q8_0 so this is the lever in isolation:
+
+| `-cram` | prefill median | prefill min |
+|---|---|---|
+| **0** | **244.8 t/s** | 192.2 t/s |
+| 512 | 85.0 t/s | 77.0 t/s |
+| 512 | 77.9 t/s | 54.3 t/s |
+
+**~3x on prompt processing**, reproducing in both orders. The shape inside a run is the tell: with
+`-cram 0` the sequence climbs and holds (133 -> 333 -> 231 -> 284 -> 272 -> 273) because the page
+cache is left alone; with `-cram 512` it collapses and never recovers (180 -> 93 -> 82 -> 98 -> 110 ->
+110) because the churn keeps evicting model pages.
+
+It costs nothing in agentic terms, which is what the previous note assumed rather than checked. At
+35k context with a self-test request every second turn: `-cram 0` gives an **8.7 s worst turn**
+against 10.0 s at 512, still 6/6 cache hits and 0 full re-prefills. Prefix reuse comes from the
+slot's own KV, not from this RAM cache.
+
+**Unresolved:** the old configuration (`-ctv q4_0 -cram 512`) measured 205.1 and 229.7 t/s in a
+back-to-back head-to-head, which is far above the 77.9-85.0 t/s that `-cram 512` gives with
+q8_0/q8_0. The only difference is the V dtype, which should not move prefill by 2.5x, and that arm
+also got g=4 where the q8_0 arm got g=3 - the wrong direction to explain it. Recorded as a loose
+end rather than explained away. The `cram` lever itself reproduces cleanly at ~3x; this anomaly is
+about the old arm being faster than expected, not about the new one being slow.
+
+### n_ubatch and friends were already optimal
+
+Measured on the same prompt, and the early single-request numbers for this were wrong:
+
+| setting | prefill |
+|---|---|
+| **n_ubatch 1024 (planner's choice)** | **320.1 t/s** (first read; see the caveat above) |
+| n_ubatch 768 | 141.0 t/s |
+| n_ubatch 512 | 180.8 t/s |
+| n_ubatch 256 | 133.6 t/s |
+| n_ubatch 1536 (g falls to 2) | 248.9 t/s |
+| n_ubatch 2048 (g falls to 1) | 242.7 t/s |
+| `-tb 12` | 288.6 t/s |
+| `-tb 16` | 221.0 t/s |
+| `-tb 8` explicit | 173.0 t/s |
+
+The compute buffer is not tradeable: below 1024 prefill falls off a cliff, and above it the GPU
+expert layers the buffer displaces cost more than the batch size gains. More batch threads hurt.
+These are single-request numbers and the ordering is what carries the conclusion, not the values.
+
+### Quality: q8_0/q8_0 is 8.8x closer to f16 than what we shipped
+
+Reference is **f16/f16**, llama.cpp's own default and strictly more precise than either arm. All
+three arms at 32,768 context with placement forced identical at g=7 (`-ncmoe 33`), so the KV dtype is
+the only variable. The committed captures are `quality/kv-f16.json`, `quality/kv-q8q8.json`,
+`quality/kv-q8q4.json` and the control `quality/ctl-f16-{A,B}.json`.
+
+**The engine is bit-deterministic.** Two independent runs of the identical f16/f16 configuration give
+`KL = 0.000000e+00` both directions, `JS = 0`, `max|delta logprob| = 0`, 512/512 top-1, zero
+flips. So every difference below is the KV dtype and nothing else.
+
+The 512-position metric is saturated once the two arms start generating different text, so the
+signal is in the positions before the first token flip:
+
+| arm vs f16/f16 | first token flip | med KL | max KL | med &#124;delta logprob&#124; |
+|---|---|---|---|---|
+| f16 vs f16 (control) | none in 512 | **0.000e+00** | 0.000e+00 | 0.0000 |
+| **q8_0/q8_0 (new)** | 25 | **2.065e-07** | 3.002e-04 | 0.7695 |
+| q8_0/q4_0 (old) | 48 | **1.809e-06** | 1.809e-06 | 0.8546 |
+
+**q8_0/q8_0 is 8.8x closer to f16 than the configuration we shipped**, which matches the published
+ratio direction (q4_0 V about 7x further from f16 than q8_0 V).
+
+The honest part: **neither q8_0 configuration is lossless against f16 on this model.** Both diverge
+measurably - median |delta logprob| around 0.8 nats, median KL 2e-7 to 2e-6 - where published
+measurements on other architectures report q8_0 KV as near-lossless. This is a `qwen35moe` hybrid
+with only 2 KV heads at key/value length 256, and there is upstream work noting that uniform q8_0 KV
+breaks specific architectures. **f16/f16 does not fit at 200k on this box at all** - it fails with
+"failed to allocate compute pp buffers" even with 0 GPU expert layers, and first fits at 131,072. So
+q8_0/q8_0 is not a choice between lossless and fast; it is the closest available to the reference.
+
+### What the change costs and buys
+
+At 200k context, no flags beyond the defaults:
+
+| | old | new |
+|---|---|---|
+| KV dtypes | q8_0 / q4_0 | **q8_0 / q8_0** |
+| `-cram` | 512 | **0** |
+| GPU expert layers | 4 | 3 |
+| KV size | 1.55 GiB | 2.03 GiB |
+| prefill median | 205.1 t/s | **236.1 t/s** |
+| decode median | 27.73 t/s | **28.25 t/s** |
+| distance from f16 (med KL) | 1.809e-06 | **2.065e-07** |
+
+Decode gains nothing and loses nothing: 28.25 t/s is far above the 15 t/s floor and the 20 t/s aim.
+Prefill improves, and quality improves 8.8x. The price is one GPU expert layer, which the placement
+work already showed is worth little to decode.
+
+Caveat on the prefill column: a reversed-order rerun gave new 224.4 against old 229.7, i.e. the
+opposite sign. So **the old-versus-new prefill difference is inside the noise** and only the
+`-cram` lever (measured in isolation, alternating, ~3x) should be treated as established. The 205 ->
+236 figure is what one ordering produced and is not a claim this document makes.
+
+### A false green, fixed
+
+`AMP_TEST_MODEL` is unset and every preflight test begins `if (!m) return;`, so **ctest had been
+reporting "100% tests passed" while 7 of the tests did nothing at all.** That is how a stale
+`cache_ram_mib == 512` assertion survived a behaviour change unnoticed. `build.sh` now points ctest
+at the model and exits non-zero if there is not one, and the new expectations are asserted:
+`cache_ram_mib == 0`, `cache_type_v == GGML_TYPE_Q8_0`, and both surviving an explicit
+`-cram N` and `-ctv f16`.
