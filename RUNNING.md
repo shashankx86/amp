@@ -71,8 +71,8 @@ not (~11.5 GiB), so amp does not collapse — llama-server's first request runs 
 
 ### Performance: what to tune, and what to leave alone
 
-**Leave `-t` alone.** Decode is compute-bound, and `-t 8` (one thread per physical core) is already
-the measured peak. Raising it makes things worse:
+**Leave `-t` alone.** `-t 8` (one thread per physical core) is the measured peak. Raising it makes
+things worse:
 
 | `-t` | 4 | **8 (default)** | 12 | 16 |
 |---|---|---|---|---|
@@ -82,15 +82,25 @@ the measured peak. Raising it makes things worse:
 
 - **N-gram speculative decoding** (`--spec-type ngram-simple`) — lossless, but +0.2 % on templated
   output, which is where it should pay best. The model is too entropic for drafts to match.
-- **More VRAM / more GPU expert layers.** Expert weight fetching is 3.7 % of decode, so even moving
-  every expert to the GPU extrapolates to 1.04x. g=4 is the VRAM ceiling at 200k and g=8 would only
-  have been worth ~3 %.
+- **Expert prefetch** (M3c, `AMP_M3C_PREFETCH_KIB`) — built, measured, and a tie at +0.2 % over
+  nine paired comparisons. The expert matvec already runs at 101.8 % of a plain read of its own
+  bytes, so there is no exposed latency for a prefetcher to hide. Off by default; see
+  `docs/BENCH.md` before enabling it for any reason.
 - **A smaller context to "free" VRAM.** The 200k target costs 2.6 % of decode (8,192 -> 35.61,
   65,536 -> 35.27, 200,000 -> 34.68 t/s). Use the context you need; the trade is not worth making.
 
-The one measurement still missing is a per-op profile. **30 of the 40 layers are recurrent**, and a
-sequential SSM recurrence parallelises badly — the obvious suspect for the 96 % that is not expert
-fetching. Their weights are already on the GPU; whether the recurrence is efficient is untested.
+**VRAM is the one place left with real headroom**, and 6 GB cannot reach it. g=0 -> g=4 measures
++3.4 % for 10.6 % of expert bytes moved off the CPU, so g=8 would be worth roughly +7 % and every
+expert on the GPU roughly 1.46x. The 4050 in this laptop cannot be upgraded, so this is a fact
+about the hardware rather than an avenue — but do not carry over the old claim that VRAM does not
+matter. It is the only large multiplier left.
+
+The measurement still missing is a per-op profile. **30 of the 40 layers are recurrent** and 10 are
+full attention; together with everything outside the expert matvec that is the other two thirds of
+decode, and it has never been profiled. `perf` is not installed and there is no sudo, so this needs
+a sampling profiler, a debug ggml with `GGML_SCHED_DEBUG`, or per-op timers in the CPU backend.
+`amp-kernel-bound` answers the memory-versus-arithmetic question for a single tensor if you want to
+check the reasoning above yourself.
 
 Beware the noise: steady decode varies **~22 % between sessions** with page-cache warmth
 (28.39-34.68 t/s at 200k across one day). Compare two configurations inside the same session, or

@@ -27,12 +27,29 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 
 ## Established by measurement (see docs/BENCH.md — do not re-derive)
 
-- **Decode is compute-bound, not memory-bound, and not VRAM-bound.** Expert weight fetching is
-  **3.7 %** of decode time; the other 96.3 % is arithmetic. Three independent consequences:
-  (a) the 6 GB VRAM limit is *not* the binding constraint — g=8 would only be worth ~3 %, so more or
-  faster GPU changes little for this model; (b) the ~4 GiB that streams from NVMe (cache holds
-  7.27 GiB of a 12.19 GiB working set) is already well overlapped, which is why the working set
-  exceeding cache costs so little; (c) prefetching expert reads — M3c — has a ~4 % ceiling.
+- **Decode splits roughly one third / two thirds between the expert matvec and everything else.**
+  The expert share is **~30-36 %** by three independent routes (349 MiB/token at the measured
+  29.21 GB/s = 12.5 ms of a 34.57 ms token; the `-ncmoe` A/B solved two ways, both 29 %).
+  **This supersedes an earlier claim of 3.7 %, which was an arithmetic bug** — the share of expert
+  bytes *removed* was computed as `1 - 1.29/12.19 = 0.894` instead of `0.106`, an 8.4x error. Do
+  not restore the old number. If you write a script that turns one A/B pair into a decomposition,
+  check it against a second method before believing it.
+- **The expert matvec is memory-bandwidth-bound, and already at bandwidth.** `ggml mul_mat` over
+  an `iq3_xxs` expert matrix at batch 1 runs at **29.21 GB/s** against **28.69 GB/s** for a plain
+  8-thread read of the same bytes — 101.8 % of plain, so the dequant work is entirely hidden behind
+  the memory traffic. Consequence: **prefetching cannot help the MoE**, not because the hardware
+  prefetcher is clever but because there is no exposed latency left; and a cheaper dequant kernel
+  would not help either. The expert path improves only by moving fewer bytes, i.e. quantization,
+  which the project rules out. Measure with `amp-kernel-bound`; pin ggml's thread count with
+  `ggml_backend_cpu_set_n_threads` or the comparison is meaningless.
+- **VRAM *is* a binding constraint, reversing the earlier advice.** g=0 -> g=4 measures +3.4 % for
+  10.6 % of expert bytes moved off the CPU, so g=8 is worth roughly +7 % and all-experts-on-GPU
+  roughly **1.46x**. 6 GB cannot hold g=8. Unreachable on this laptop, but it is the only large
+  multiplier left, and on a bigger card that is where the win is.
+- **Decode I/O is a non-issue and page faults are not on the critical path.** Over 384 tokens:
+  `read_bytes` 88.61 MiB total = **236 KiB/token**, `majflt` 56/token, and `stime` **0.1 %** of busy
+  time. Note that DRAM stalls bill as *user* time, so a small `stime` rules out I/O and kernel work
+  but does **not** by itself show decode is arithmetic-bound.
 - **Decode threads are already optimal.** `-t 8` (one per physical core) measures 32.97 t/s against
   27.95 at 4, 29.96 at 12 and 21.19 at 16. The planner's `ncpu / 2` default is right; SMT siblings
   contend. Do not "improve" this.
@@ -138,19 +155,26 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - [x] M5 page-cache warming at start-up; decode-time prefetch of active experts **removed** on purpose
 - [x] M6 server: OpenAI-compatible API, SSE, token-level prefix cache, prompt-boundary checkpoints,
       reasoning alias fix — `amp-server`, driven by `scripts/parity_test.py`
-- [x] M3c — **REFUTED by measurement, do not build it.** It was carried as "the only remaining
-      decode win" on the premise that decode is bound by CPU memory latency on the expert reads.
-      Measured: expert weight fetching is **3.7 %** of decode (from the `-ncmoe` sweep, solved as
-      `t = a + b`), so prefetching has a ~4 % ceiling and hides latency rather than bytes anyway.
-      Putting *every* expert on the GPU extrapolates to 1.04x. See docs/BENCH.md.
-- [ ] M7 **reframed.** There is no gap to close: every quality-neutral decode lever has been
-      measured and spent. Threads are already optimal (`-t 8` beats 4/12/16), expert placement is
-      worth 3.4 %, context length costs 2.6 %, and n-gram speculation is worth 0.2 %. Decode is
-      ~96 % CPU arithmetic at the optimal thread count with its I/O already overlapped.
-- [ ] Profile the **30 recurrent layers** (of 40). A sequential SSM recurrence parallelises badly
-      and is the obvious suspect for the 96 %, yet it is the opposite of the MoE framing M3c was
-      built on. No per-op profile has been taken. This is the only untested avenue left, and it is
-      where custom work would actually start.
+- [x] M3c — **implemented, measured, TIE.** It did not need to own the ggml graph after all: inside
+      `ggml_compute_forward_mul_mat_id` the router output is already host-resident, so the active
+      experts are observable with no sync. Two variants measured (same-node, and predictive
+      cross-layer, which is the form the milestone promised), nine paired comparisons spanning
+      -1.9 % to +1.7 %, mean **+0.2 %**. Quality is provably unchanged: KL exactly 0.000000e+00 both
+      directions, JS 0, max |delta logprob| 0, 512/512 top-1, gated at `max-kl 0.0`.
+      **Why it cannot win:** the expert matvec already runs at 101.8 % of a plain read of its own
+      bytes, so there is no exposed latency for a prefetcher to hide. The code path is verified
+      live — depth 4096 KiB costs 1.9 %, which is the loop's instruction-issue cost.
+      Kept as `third_party/patches/m3c-expert-prefetch.patch`, off by default, because
+      `third_party/llama.cpp` is gitignored and an edit made in that tree is not versioned.
+- [x] M7 **spent.** Every quality-neutral decode lever has been measured: threads already optimal
+      (`-t 8` beats 4/12/16), expert placement 3.4 %, context length 2.6 %, n-gram speculation
+      0.2 %, expert prefetch 0.2 %. There is no gap left to close on the CPU side.
+- [ ] Profile the **30 recurrent layers** (of 40; the other 10 are full attention). This is now the
+      only substantial unmeasured region: the MoE's third of decode is measured, understood and
+      closed, so the other two thirds is what remains. A sequential SSM recurrence parallelises
+      badly and is the obvious suspect. No per-op profile exists, because `perf` is absent and there
+      is no sudo — `/proc` counters say what decode waits on but not which op. Needs a sampling
+      profiler, a debug ggml with `GGML_SCHED_DEBUG`, or per-op timers in the CPU backend.
 - [x] Fold the two forward paths into one — resolved by deletion rather than refactoring. The server
       (`InferenceService`) is gone; `amp-server` is llama.cpp's server. `ModelRuntime` survives as
       `amp-infer`, the measurement harness, because it has the prefetcher and can be A/B'd against

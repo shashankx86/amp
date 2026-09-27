@@ -12,7 +12,7 @@ CFG=${AMP_BUILD_TYPE:-Release}
 # gates the whole tools/ tree on it, not on LLAMA_BUILD_SERVER). That also *defines* every other
 # llama.cpp tool target -- llama-bench, llama-cli, llama-perplexity, llama-quantize and friends --
 # so we must name our targets rather than build `all`, or a plain build compiles all of them.
-TARGETS=(amp-server amp-infer amp-plan amp-warm amp_tests)
+TARGETS=(amp-server amp-infer amp-plan amp-warm amp-kernel-bound amp_tests)
 
 ./scripts/fetch_deps.sh
 cmake -B build -DCMAKE_BUILD_TYPE="$CFG"

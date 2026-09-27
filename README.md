@@ -45,9 +45,9 @@ Measured, not asserted — with placement held fixed, llama.cpp's server and amp
 | **M6 server: llama.cpp's, with amp's plan** | **done** — 40+ routes, tool calls, reasoning formats |
 | M6b preflight correctness | done — 7 tests assert it never overrides an explicit flag |
 | M6c parity test suite | done — 15 sections pass, 8 features honestly skipped |
-| M3c own graph (observable router) | **refuted** — expert fetching is 3.7 % of decode, so prefetch has a ~4 % ceiling |
+| M3c own graph (observable router) | **built and measured: a tie.** Did not need a new graph — the router is already host-resident in the CPU MoE kernel. Mean +0.2 % over nine paired comparisons; quality provably identical |
 | M7 decode headroom | **spent** — every quality-neutral lever measured and exhausted |
-| M7b profile the 30 recurrent layers | the only untested avenue; a sequential SSM recurrence is the suspect for the 96 % |
+| M7b profile the 30 recurrent layers | the only substantial unmeasured region; the MoE's third of decode is now measured and closed |
 
 ## On speed, honestly
 
@@ -63,13 +63,26 @@ request runs at 26 t/s. It also forces a single slot by default, because `llama-
 concurrent slots thrash the same shared working set (0.64 t/s measured). Full numbers, including
 the mistakes, in `docs/BENCH.md`.
 
-**Decode is compute-bound, and that reframes the hardware question.** Expert weight fetching is
-**3.7 %** of decode; the other 96.3 % is arithmetic. So the 6 GB of VRAM is *not* the binding
-constraint — g=8 would only be worth ~3 % — and more or faster GPU would change little for this
-model. Measured and spent: threads are already optimal (`-t 8` beats 4/12/16), placement is worth
-3.4 %, the 200k context costs 2.6 %, and n-gram speculation is worth 0.2 %. The one untested
-avenue is the 30 recurrent layers out of 40, whose sequential recurrence is the obvious suspect
-for the 96 % — the opposite of the MoE framing the old M3c milestone assumed.
+**Where decode actually goes, measured three ways.** The expert matvec is **~30-36 %** of decode
+(349 MiB/token at the measured 29.21 GB/s is 12.5 ms of a 34.57 ms token; the placement A/B says
+29 % both ways). And that matvec is **memory-bandwidth-bound and already at bandwidth**: it runs at
+29.21 GB/s against 28.69 GB/s for a plain read of the same bytes, so the dequant is entirely
+hidden behind memory traffic.
+
+That closes the MoE from both sides. Prefetching cannot help it, because there is no exposed
+latency left to hide — M3c was built and measured at a mean **+0.2 %**, a tie, with quality
+provably unchanged. A cheaper dequant kernel would not help either. The only thing that moves the
+expert path is fewer bytes, which means quantization, which this project rules out.
+
+It also means **VRAM is the binding constraint**, reversing the earlier advice: g=0 -> g=4 measures
++3.4 % for 10.6 % of expert bytes moved, so g=8 is worth roughly +7 % and all-experts-on-GPU
+roughly **1.46x**. 6 GB cannot hold g=8, so that headroom is unreachable on this laptop — but on a
+bigger card it is where the win is, not threads and not prefetching.
+
+Measured and spent on the CPU side: threads already optimal (`-t 8` beats 4/12/16), placement
+3.4 %, the 200k context 2.6 %, n-gram speculation 0.2 %, expert prefetch 0.2 %. What is left is the
+**other two thirds of decode**: 30 recurrent layers out of 40, plus 10 attention layers, none of
+which has ever been profiled per-op.
 
 ## Thinking models
 
