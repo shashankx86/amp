@@ -1310,3 +1310,82 @@ Break-even needs A ~ 3.3-3.7 consecutive accepted tokens. Strata's MTP head deli
 0.89 / 0.86 / 0.85 at steps 1-3, i.e. runs of 3+, and clears it. A lookup drafter gets 2.6
 on this workload and cannot clear it at any window size. **n-gram speculation on Occamy is
 closed.** No further tuning of `-lcs`, `-lcd` or `--spec-ngram-*` is worth spending on.
+
+## 2026-09-28: the decode budget, measured rather than inferred
+
+Strata's one strong lead that had not been tried here: **the recurrent mixers are probably
+the dominant non-expert cost.** They measured the mixers at 55.8% of their GPU floor -
+10.88 ms across 36 GDN layers and 4.56 ms across 12 QSA, corrected total 14.039 ms/token.
+amp has 30 GDN + 10 QSA, and had never profiled the non-expert part of a token.
+
+That number is from another model, so it is a hypothesis here. Measuring it needed three
+things, two of which this box does not have.
+
+### What the box can and cannot measure
+
+`perf` is present at `/usr/bin/perf` but `perf_event_paranoid = 2`, so hardware counters are
+not available to an unprivileged process. `perf record -e cpu-cycles` **silently degrades to
+a software `cpu-clock` event** and still writes a data file, so a naive profile looks like it
+worked. What comes out is 56% `clock_gettime` in libc and 37%
+`pthread_cond_clockwait` - the CUDA driver's event handler thread spinning while it waits for
+the GPU, which is the thing being measured and not a consumer of decode time. Sampling the
+process with `-p` is worse than useless here. `-t <tid>` on the busy compute thread gives the
+same two symbols. **There is no usable per-symbol CPU profile on this box without
+`perf_event_paranoid` lowered, and there is no sudo.**
+
+So per-symbol attribution is off the table. The question is still answerable, by subtraction
+and by an A/B that does not need a profiler.
+
+### The isolated kernel rate, on both layer kinds
+
+`tools/kernel-bound` (it takes the model as `argv[1]`, not `--model`):
+
+| layer | kind | `ggml mul_mat` batch 1 | plain read |
+|---|---|---:|---:|
+| 1 | GDN | 30.19 GB/s | 29.10 GB/s |
+| 2 | GDN | 30.20 | |
+| 3 | GDN | 30.20 | |
+| 5 | GDN | 30.29 | |
+| 6 | GDN | 30.21 | |
+| 7 | GDN | 30.21 | |
+| 9 | GDN | 30.10 | |
+| 20 | attention | 29.52 | 28.99 |
+
+Seven GDN layers and one attention layer all run at **~30.2 GB/s**, i.e. at the plain-read
+rate, on both layer kinds. There is no layer whose matvec is unusually slow, and no
+layer-kind difference in the expert path. Whatever the non-expert 60% of a token is, it is
+not an expert kernel running badly.
+
+### The budget, by subtraction
+
+| | ms/token | share |
+|---|---:|---:|
+| measured token (35.4 t/s) | 28.25 | 100% |
+| expert bytes: 349 MiB at 30.2 GB/s | 11.29 | **40%** |
+| everything else | 16.96 | **60%** |
+
+Strata's prior, scaled from 36 to amp's 30 GDN layers, predicts **~9.07 ms/token** of
+recurrent-mixer cost against amp's 16.96 ms of non-expert time. Same order of magnitude, so
+the prior holds as a prior - and the point of writing this down is that the number is now
+amp's to measure rather than imported. The honest statement is: **40% of decode is expert
+bandwidth, 60% is something else, and "something else" is not an expert kernel.**
+
+`profile_decode.py` independently confirms the bandwidth side: 786% CPU across threads,
+99.8% of it user time, **0.2% system** (so page-fault handling is not on the critical path),
+0.14 MiB read from disk across the whole run, 0.1 major faults per token, 12.17 GiB of the
+12.19 GiB expert working set resident in page cache.
+
+### What this rules out, and what it does not
+
+Ruled out by measurement: any expert-side latency trick. The matvec is at the memory rate,
+the working set is resident, the disk is idle, and the kernel time is 0.2% of busy. There is
+no exposed latency to hide and no bytes to stop re-reading.
+
+Not ruled out, and now the only remaining place with 60% of a token in it: the 30 GDN
+recurrent layers and the 10 attention layers, and the per-layer launch and sync overhead
+around them. Strata's caveat is the relevant one - their GDN expense is ~13 latency-bound
+kernel launches per block under **WDDM on Windows** (0.3-0.4 ms per graph launch, 96
+launches per token), while on Linux with graph capture a launch is 0.805 us. amp is on
+Linux, so the specific disease does not transfer, but the measurement that would settle it -
+how many kernel launches per token, and what each costs - needs an instrument this box does
+not have. Recorded as the next question with the reason it is still open, not as a finding.
