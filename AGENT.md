@@ -1,4 +1,4 @@
-# AGENT.md — working rules for `amp`
+# AGENT.md, working rules for `amp`
 
 Read this first, every session. It is written to survive compaction.
 
@@ -16,100 +16,116 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling
 
 ## Non-negotiable environment facts (measured, see ../NOTES.md)
 
-- VRAM: 6141 MiB total, ~104 MiB desktop. **The whole MoE expert set is 12.188 GiB — it can never fit in VRAM.**
+- VRAM: 6141 MiB total, ~104 MiB desktop. **The whole MoE expert set is 12.188 GiB and can never fit in VRAM.**
 - RAM: 14.3 GiB usable; page cache (~11.5 GiB observed) is the real budget, and the CPU expert working
   set is 11.54 GiB at `-ncmoe 38`. We are operating right at the cache cliff.
-- NVMe (Kingston QLC, LUKS+btrfs): 555 MB/s @4K-QD32, ~2.0 GB/s @128K/1M. The Kioxia is 6-13x slower — unusable.
+- NVMe (Kingston QLC, LUKS+btrfs): 555 MB/s @4K-QD32, ~2.0 GB/s @128K/1M. The Kioxia is 6 to 13x slower, which makes it unusable.
 - CPU: 8C/16T Zen 3, AVX2 + FMA + F16C, **no AVX-512, no VNNI**. 8 physical cores.
 - Compute ceiling measured: ~240 t/s prefill, 11-14 t/s decode (llama.cpp, cache-resident).
 - Per-layer MoE expert bytes: 330.0 MiB (Q3_K, layers 0-9 and 30-39) / 294.0 MiB (IQ3_XXS, layers 10-29).
 - Per expert per layer: 3 tensors x ~440 KiB (gate/up `[2048,512]`, down `[512,2048]`), ~1.29 MiB total.
 
-## Established by measurement (see docs/BENCH.md — do not re-derive)
-- **Prefill needs a sequence of distinct prompts or it means nothing.** The same configuration
-  restarted three times measured **132.5, 178.4 and 311.3 t/s** on an identical 18,265-token prompt,
-  while decode over the same runs varied only 26.4-27.7. Prefill at batch ~1024 routes most of the
-  256 experts per layer through the CPU matmul and thrashes a page cache holding ~11 GiB of a
-  13.66 GiB model; decode at batch 1 touches 8 experts and stays cached. Use
-  `scripts/bench_prefill.py`, which generates a distinct prompt per measurement so nothing is served
-  from the prompt cache, and quote the median with the spread. An entire `n_ubatch` sweep in this
-  project was run on single requests and every conclusion from it had to be discarded.
-- **`cache_ram_mib` is 0, and that is the single largest prefill lever measured (~3x).** The old
-  clamp to 512 was reasoning that a smaller prompt cache would protect the model's page cache;
-  measured, 512 is still far too much, because each 18k prompt caches ~200 MiB and the churn evicts
-  model pages. With `-cram 0` the prefill sequence climbs and holds; with 512 it collapses and never
-  recovers. Prefix reuse comes from the slot's own KV, not this cache - `-cram 0` measured an 8.7 s
-  worst agentic turn against 10.0 s at 512.
-- **KV is q8_0/q8_0 and is 8.8x closer to f16 than the q8_0/q4_0 we used to ship** (median KL
-  2.065e-07 against 1.809e-06, at matched 32,768 context and g=7). Two facts to keep straight:
-  **neither q8_0 config is lossless against f16 on this model** (median |delta logprob| ~0.8 nats),
-  and **f16/f16 does not fit at 200k on this box at all** - it fails to allocate compute buffers
-  even with 0 GPU expert layers, first fitting at 131,072. The engine is bit-deterministic
-  (two identical runs give KL exactly 0), which is what makes any of this attributable.
-- **The engine is bit-deterministic.** Two independent runs of the identical configuration give
-  `KL = 0.000000e+00` both directions, JS 0, max |delta logprob| 0, 512/512 top-1. Always run that
-  control before believing a large quality result; the first f16-vs-q8_0 comparison looked like a
-  catastrophic regression (11.72 % top-1) and was entirely the dtype.
+## Established by measurement (see docs/BENCH.md, do not re-derive)
 
+Measure prefill with a sequence of distinct prompts or the number means nothing. The same
+configuration, restarted three times, measured 132.5, 178.4 and 311.3 t/s on one identical
+18,265-token prompt. Decode over those same runs varied only between 26.4 and 27.7. The reason
+is the working set. Prefill at batch ~1024 routes most of the 256 experts per layer through the
+CPU matmul, so it reads nearly all 13.66 GiB of the weights and thrashes a page cache that
+holds about 11 GiB of it. Decode at batch 1 touches 8 experts and stays resident. Use
+`scripts/bench_prefill.py`, which builds a fresh prompt per measurement so nothing is served
+from the prompt cache, and quote the median with the spread beside it. An entire `n_ubatch`
+sweep in this project was run on single requests and every conclusion had to be thrown out.
 
-- **Decode splits roughly one third / two thirds between the expert matvec and everything else.**
-  The expert share is **~30-36 %** by three independent routes (349 MiB/token at the measured
-  29.21 GB/s = 12.5 ms of a 34.57 ms token; the `-ncmoe` A/B solved two ways, both 29 %).
-  **This supersedes an earlier claim of 3.7 %, which was an arithmetic bug** — the share of expert
-  bytes *removed* was computed as `1 - 1.29/12.19 = 0.894` instead of `0.106`, an 8.4x error. Do
-  not restore the old number. If you write a script that turns one A/B pair into a decomposition,
-  check it against a second method before believing it.
-- **The expert matvec is memory-bandwidth-bound, and already at bandwidth.** `ggml mul_mat` over
-  an `iq3_xxs` expert matrix at batch 1 runs at **29.21 GB/s** against **28.69 GB/s** for a plain
-  8-thread read of the same bytes — 101.8 % of plain, so the dequant work is entirely hidden behind
-  the memory traffic. Consequence: **prefetching cannot help the MoE**, not because the hardware
-  prefetcher is clever but because there is no exposed latency left; and a cheaper dequant kernel
-  would not help either. The expert path improves only by moving fewer bytes, i.e. quantization,
-  which the project rules out. Measure with `amp-kernel-bound`; pin ggml's thread count with
-  `ggml_backend_cpu_set_n_threads` or the comparison is meaningless.
-- **VRAM *is* a binding constraint, reversing the earlier advice.** g=0 -> g=4 measures +3.4 % for
-  10.6 % of expert bytes moved off the CPU. **Placement then saturates: g=4 -> g=7 measures 28.89 ->
-  26.44 t/s, i.e. slightly worse, and g=6 OOMs at 200k.** So the placement ceiling is the measured
-  +3.4 %, not a compounding 1.46x - a linear extrapolation that was wrong in the same way the 3.7 %
-  figure was. The GPU is 70 % idle during decode (29 % utilisation, 18.7 W of ~140 W) yet moving
-  work onto it does not help, because at batch 1 a GPU GEMV cannot exploit its parallelism and
-  competes with the 30 recurrent layers already resident. What spare GPU capacity *does* help is
-  prefill: g=4 -> g=7 is **+27 % prefill**. The real trade is context length against prefill rate
-  (`-c 64000` gives +27 % prefill for -8.5 % decode), not VRAM for decode.
-- **Decode I/O is a non-issue and page faults are not on the critical path.** Over 384 tokens:
-  `read_bytes` 88.61 MiB total = **236 KiB/token**, `majflt` 56/token, and `stime` **0.1 %** of busy
-  time. Note that DRAM stalls bill as *user* time, so a small `stime` rules out I/O and kernel work
-  but does **not** by itself show decode is arithmetic-bound.
-- **Decode threads are already optimal.** `-t 8` (one per physical core) measures 32.97 t/s against
-  27.95 at 4, 29.96 at 12 and 21.19 at 16. The planner's `ncpu / 2` default is right; SMT siblings
-  contend. Do not "improve" this.
-- **N-gram speculative decoding does nothing here.** Lossless and therefore the one remaining lever
-  that avoids the arithmetic: +3 % on a counting prompt (inside the 22 % session variance) and
-  **+0.2 %** on a 300-token templated list, which is where drafting should pay best. The model is too
-  entropic at the token level for n-grams to find matches.
-- **Context length barely costs decode.** 8,192 -> 35.61, 65,536 -> 35.27, 200,000 -> 34.68 t/s.
-  The 200k target costs **2.6 %** even though the planner gives up GPU expert layers (8 -> 4) as the
-  KV grows.
-- **Steady decode varies ~22 % between sessions** on this box (28.39 / 30.39 / 31.44 / 33.94 /
-  34.68 t/s at 200k), driven by page-cache warmth. A single-session A/B is only trustworthy if both
-  engines are measured in that same session. This is how the project came to hold both "35.25 t/s"
-  and "28.39 t/s" without either being a lie.
+`cache_ram_mib` is 0, and that is the largest prefill lever we have measured, at about 3x. The
+old clamp to 512 reasoned that a smaller prompt cache would protect the model's page cache.
+512 is still far too much for that: each 18k prompt caches about 200 MiB, so two or three fill
+the cache and the churn starts evicting model pages. With `-cram 0` the prefill sequence climbs
+and holds. With 512 it collapses and never recovers. Prefix reuse comes from the slot's own KV
+rather than this cache, and turning it off cost nothing agentically: an 8.7 s worst turn against
+10.0 s at 512.
 
-- Demand paging **with readahead** runs at **1.8 GiB/s** and leaves **100 % of pages resident**
-  (mincore-verified). Fully resident reads run at **3.5 GiB/s**. The 555 MB/s O_DIRECT fio number is
-  random access without readahead and is NOT the right constant — the cost model was wrong until
-  this was measured.
-- `amp-warm` pulls the entire 12.19 GiB expert set in at **1.92 GiB/s (6.3 s)**.
-- The practical page-cache ceiling on this box is **~9.6 GiB** while other processes hold ~5 GiB, so
-  the 12.19 GiB working set does **not** fit. Plan for a resident hot set plus a streamed tail.
-- llama.cpp's 12 t/s collapse was a *latency* problem (synchronous faults, LRU thrash), not a
-  bandwidth problem.
-- KV cache at the shipped k=q8_0/v=q8_0 is **~10.9 KB/token** (measured 2.03 GiB at 200k,
-  0.64 GiB at 131k) - higher than the 8320 B/token the old k=q8_0/v=q4_0 pair gave (1.55 GiB at
-  200k). The planner pays for it by dropping one GPU expert layer, which costs decode almost
-  nothing and buys 8.8x closer to f16.
-- The planner independently reproduces the measured llama.cpp optimum (large ubatch beats GPU
-  expert residency) and predicts **240 t/s prefill / 16.4 t/s decode** at 200k with prefetching.
+Decode splits roughly one third to the expert matvec and two thirds to everything else. Three
+independent routes put the expert share at 30 to 36 %: 349 MiB per token at the measured
+29.21 GB/s is 12.5 ms of a 34.57 ms token, and the `-ncmoe` A/B solved two ways gives 29 % both
+times.
+
+That 3.7 % figure this section used to carry was an arithmetic bug, and the bug is worth
+remembering. The share of expert bytes *removed* was computed as `1 - 1.29/12.19 = 0.894` instead
+of `0.106`, an 8.4x error that inverted the conclusion. Do not restore the old number. When you
+turn one A/B pair into a decomposition of a whole system, check it against a second method
+before believing it.
+
+The expert matvec is memory-bandwidth-bound and already sitting at bandwidth. `ggml mul_mat`
+over an `iq3_xxs` expert matrix at batch 1 runs at 29.21 GB/s, against 28.69 GB/s for a plain
+8-thread read of the very same bytes. That is 101.8 % of plain, which means the dequant work is
+entirely hidden behind the memory traffic.
+
+So prefetching cannot help the MoE, and not because the hardware prefetcher is clever. There is
+no exposed latency left to hide. A cheaper dequant kernel would not help either, for the same
+reason. The expert path improves only by moving fewer bytes, which means quantization, which
+this project rules out. Measure it with `amp-kernel-bound`, and pin ggml's thread count with
+`ggml_backend_cpu_set_n_threads` or the comparison means nothing.
+
+VRAM is a binding constraint, which reverses the earlier advice in this file. g=0 to g=4
+measures +3.4 % for 10.6 % of expert bytes moved off the CPU. Then placement saturates: g=4 to
+g=7 measures 28.89 against 26.44 t/s, slightly worse, and g=6 OOMs at 200k. The ceiling is
+therefore the measured +3.4 %, not a compounding 1.46x. That 1.46x came from the same kind of
+linear extrapolation that produced the 3.7 % error, and it was wrong for the same reason.
+
+The odd part is that the GPU sits 70 % idle through all of this, at 29 % utilisation and 18.7 W
+of a 140 W budget. Moving work onto it still does not help decode. At batch 1 a GPU GEMV has
+almost no parallelism to exploit and just competes with the 30 recurrent layers already resident
+there. What the spare capacity does help is prefill, where batches are big enough to fill it:
+g=4 to g=7 is +27 % prefill. The real trade is context length against prefill rate, not VRAM
+against decode speed. `-c 64000` gives +27 % prefill for -8.5 % decode.
+
+Decode I/O is a non-issue and page faults are nowhere near the critical path. Over 384 tokens,
+`read_bytes` totals 88.61 MiB, or 236 KiB per token, `majflt` is 56 per token, and `stime` is
+0.1 % of busy time. One caveat matters here: DRAM stalls bill as *user* time, so a small
+`stime` rules out I/O and kernel work without showing that decode is arithmetic-bound. That
+distinction is what made the 3.7 % error possible in the first place.
+
+Decode threads are already optimal. `-t 8` (one per physical core) measures 32.97 t/s, against
+27.95 at 4, 29.96 at 12 and 21.19 at 16. The planner's `ncpu / 2` default is right. SMT siblings
+contend, so do not "improve" this.
+
+N-gram speculative decoding does nothing here. It is lossless and was therefore the one
+remaining lever that avoids the arithmetic, but it buys +3 % on a counting prompt, which is
+inside the 22 % session variance, and +0.2 % on a 300-token templated list, which is exactly
+where drafting should pay best. The model is too entropic at the token level for n-grams to find
+matches.
+
+Context length barely costs decode: 8,192 gives 35.61 t/s, 65,536 gives 35.27, and 200,000 gives
+34.68. The 200k target costs 2.6 % even though the planner gives up GPU expert layers as the KV
+grows, 8 down to 4.
+
+Steady decode varies about 22 % between sessions on this box, driven by page-cache warmth:
+28.39, 30.39, 31.44, 33.94 and 34.68 t/s at 200k. An A/B is only trustworthy if both arms are
+measured in the same session. This is also how the project came to hold both "35.25 t/s" and
+"28.39 t/s" without either being a lie.
+
+Demand paging with readahead runs at 1.8 GiB/s and leaves 100 % of pages resident, verified
+with mincore. Fully resident reads run at 3.5 GiB/s. The 555 MB/s O_DIRECT fio number is random
+access without readahead and is not the right constant. The cost model was wrong until this got
+measured.
+
+`amp-warm` pulls the entire 12.19 GiB expert set in at 1.92 GiB/s, which takes 6.3 s.
+
+The practical page-cache ceiling on this box is about 9.6 GiB while other processes hold around
+5 GiB, so the 12.19 GiB working set does not fit. Plan for a resident hot set plus a streamed
+tail.
+
+llama.cpp's 12 t/s collapse was a latency problem, from synchronous faults and LRU thrash, not a
+bandwidth problem.
+
+KV cache at the shipped q8_0/q8_0 is about 10.9 KB per token, measured at 2.03 GiB at 200k and
+0.64 GiB at 131k. That is higher than the 8320 B/token the old q8_0/q4_0 pair gave, which was
+1.55 GiB at 200k. The planner pays for the difference by dropping one GPU expert layer, which
+costs decode almost nothing and buys 8.8x closer to f16.
+
+The planner independently reproduces the measured llama.cpp optimum, where a large ubatch beats
+GPU expert residency, and predicts 240 t/s prefill and 16.4 t/s decode at 200k with prefetching.
 - **Head-to-head vs llama-server, MEASURED AGAIN 2026-09-26 and CORRECTED.** The old claim was
   3.1x prefill and 5.4x decode (25.6 vs 4.76 t/s). Re-measured with 5 identical requests per
   engine, alternating order, rates from each server's own `timings`:
@@ -121,7 +137,7 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling
 
   **At steady state they are the same, within noise.** The old 5.4x compared amp's warm state
   against llama-server's cold one. 28.39 t/s is inside the 25.6-29.9 t/s range already recorded
-  below; 35.25 t/s was the outlier. Do not quote a speedup over llama-server — it does not
+  below; 35.25 t/s was the outlier. Do not quote a speedup over llama-server, because it does not
   reproduce. See docs/BENCH.md, "the 7.4x decode claim does not reproduce".
 - **Decode has a 10x cliff, not a slope**: 10.25 GiB of CPU experts -> 25.6-29.9 t/s, 11.54 GiB ->
   2.8-4.8 t/s. Cyclic scan + LRU means exceeding the cache by 1.3 GiB collapses reuse. Modelled as a
@@ -157,7 +173,7 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling
 - Do not launch a second `llama-server` while the user's is running (check `pgrep -x llama-server` and
   `nvidia-smi`); they contend for the same 6 GB of VRAM.
 - `pkill -f "port XXXX"` matches its own command line and kills the shell. Use `pkill -x <name>`.
-- `/tmp` is **tmpfs**. Never put I/O benchmark files there — they land in RAM and give false results.
+- `/tmp` is **tmpfs**. Never put I/O benchmark files there. They land in RAM and give false results.
 - Keep the model file's extents contiguous (+16% read bandwidth). If it is ever re-copied, use
   `cp --reflink=never --sparse=never`, `sync`, then swap the name.
 
@@ -172,9 +188,9 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling
 
 ## Reference material
 
-- `../NOTES.md` — every measurement, the performance model, VRAM arithmetic, the proven root causes.
-- `../RUN.md` — the best llama.cpp command and the operational checklist.
-- `../llama.cpp/` — source at git `1ab7e5a`. `../ik_llama.cpp/` — alternate kernels, slower on this model
+- `../NOTES.md`: every measurement, the performance model, VRAM arithmetic, the proven root causes.
+- `../RUN.md`: the best llama.cpp command and the operational checklist.
+- `../llama.cpp/`: source at git `1ab7e5a`. `../ik_llama.cpp/` has alternate kernels, slower on this model
   (117.6 vs 160.9 t/s prefill), needs `GGML_CUDA_NO_PINNED=1`.
 
 ## Milestones
@@ -187,8 +203,8 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling
 - [x] M4 GPU offload expressed through the public `tensor_buft_overrides` API (= `-ncmoe`)
 - [x] M5 page-cache warming at start-up; decode-time prefetch of active experts **removed** on purpose
 - [x] M6 server: OpenAI-compatible API, SSE, token-level prefix cache, prompt-boundary checkpoints,
-      reasoning alias fix — `amp-server`, driven by `scripts/parity_test.py`
-- [x] M3c — **implemented, measured, TIE.** It did not need to own the ggml graph after all: inside
+      reasoning alias fix. `amp-server`, driven by `scripts/parity_test.py`
+- [x] M3c. **Implemented, measured, and a tie.** It did not need to own the ggml graph after all. Inside
       `ggml_compute_forward_mul_mat_id` the router output is already host-resident, so the active
       experts are observable with no sync. Two variants measured (same-node, and predictive
       cross-layer, which is the form the milestone promised), nine paired comparisons spanning
@@ -196,13 +212,13 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling
       directions, JS 0, max |delta logprob| 0, 512/512 top-1, gated at `max-kl 0.0`.
       **Why it cannot win:** the expert matvec already runs at 101.8 % of a plain read of its own
       bytes, so there is no exposed latency for a prefetcher to hide. The code path is verified
-      live — depth 4096 KiB costs 1.9 %, which is the loop's instruction-issue cost.
+      live. Depth 4096 KiB costs 1.9 %, which is about what the loop's instruction issue alone should cost.
       Kept as `third_party/patches/m3c-expert-prefetch.patch`, off by default, because
       `third_party/llama.cpp` is gitignored and an edit made in that tree is not versioned.
 - [x] M7 **spent.** Every quality-neutral decode lever has been measured: threads already optimal
       (`-t 8` beats 4/12/16), expert placement 3.4 %, context length 2.6 %, n-gram speculation
       0.2 %, expert prefetch 0.2 %. There is no gap left to close on the CPU side.
-- [x] Profile decode per-op — **done, and it refuted the hypothesis.** `perf` works here: extract it
+- [x] Profile decode per-op. **Done, and it refuted the hypothesis.** `perf` works here. Extract it
       from the local pacman cache (`/var/cache/pacman/pkg/perf-*.pkg.tar.zst`) into a user dir, no
       sudo; `perf_event_open` was verified to work at `perf_event_paranoid=2` for our own process.
       The Release binary is not stripped and has all 126 `ggml_compute_forward_*` symbols, so no
@@ -215,7 +231,7 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling
       already at memory bandwidth.
 - [x] **Never set `OMP_WAIT_POLICY=passive` on this box.** ggml is OpenMP-built, so decode spends
       ~1000 barriers per token and the 8 threads spin at each: **53.6 % of CPU cycles**. That is load
-      balancing, not waste — spinning measures 29.56 t/s against 22.53 t/s for sleeping, a 31 %
+      balancing rather than waste. Spinning measures 29.56 t/s against 22.53 t/s for sleeping, a 31 %
       penalty. That 53.6 % is the price of 8-thread efficiency, not a bug to fix.
 - [x] **Tool-call latency: root-caused, reproduced and fixed.** It was `n_parallel: 1`. A model asked
       to verify a config sends a short self-test request to the API it is being served by; with one
@@ -236,7 +252,7 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling
       tokens by `/tokenize`) was processed as 18,269 tokens. Not the tokenizer, which tokenises 4x
       the text to 106,239 as one string. If a real prompt is silently halved that is worse than any
       speed problem here. Uninvestigated.
-- [x] Fold the two forward paths into one — resolved by deletion rather than refactoring. The server
+- [x] Fold the two forward paths into one, resolved by deletion rather than refactoring. The server
       (`InferenceService`) is gone; `amp-server` is llama.cpp's server. `ModelRuntime` survives as
       `amp-infer`, the measurement harness, because it has the prefetcher and can be A/B'd against
       the server without a network round trip. The duplication was a symptom of maintaining our own
@@ -286,24 +302,24 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
 - **The generation prompt ends *inside* a reasoning block.** `/apply-template` shows the rendered
   prompt ending `<|im_start|>assistant\n<think>\n`, so the model reasons without ever emitting an
   opening tag. Any split triggered by the opening tag never fires and the entire chain of thought is
-  delivered as `content` — that is what a conversation title came out as. The splitter must be told
+  delivered as `content`, which is what a conversation title came out as. The splitter must be told
   the block is already open, which `render_chat` derives from the rendered text (does it end with the
   template's thinking start tag?).
 - **The closing tag arrives with variable whitespace.** Naturally `\n</think>`; forced by the
   reasoning budget, `</think>` with no newline. Match the tag *and* the whitespace-trimmed tag.
 - **`llama_process()` asserts a batch is no larger than `n_ubatch`** (llama-context.cpp), and
   `llama_batch_ext` is sized to `n_batch`. The caller must split the prefill. Not splitting it failed
-  every prompt over the ubatch with "prefill batch full at token 2048" — i.e. every real conversation,
+  every prompt over the ubatch with "prefill batch full at token 2048", which is every real conversation,
   since an agent client resends the whole history each turn.
 - **To get a non-reasoning answer, use the template's switch, not a forced close.**
   `chat_template_kwargs: {"enable_thinking": false}` makes the template pre-close the think block.
-  The reasoning budget (`reasoning_budget_tokens`) also works and is effective — measured 100
-  completion tokens down to 12 — but forcing a close mid-thought alters generation, and at a very
+  The reasoning budget (`reasoning_budget_tokens`) also works, and is effective: measured 100
+  completion tokens down to 12. But forcing a close mid-thought alters generation, and at a very
   tight budget (8 tokens) 1 sample in 3 returned a visibly doubled answer (`4\n</think>\n\n4`).
   4 of 4 samples at 16-32 were clean. The severe looping in older notes was on the deleted server's
   sampling path and did not reproduce. It stays opt-in; see docs/BENCH.md.
 - **The reasoning budget is llama.cpp's `common_reasoning_budget_init`** and it arms itself by
-  *replaying the prefill tokens* through the sampler — no template special-casing. Feed it with
+  *replaying the prefill tokens* through the sampler, with no template special-casing. Feed it with
   `llama_sampler_accept` before the first generated token.
 - Use `common_tokenize()` for tags, not a hand-rolled "call with a null buffer to count" version: the
   counting call returns 0 for a bare special token, which silently disables the whole budget path.
@@ -313,13 +329,13 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
 ## Server rules learned the hard way
 
 - **A `llama_context` is not reentrant.** Two generations on one context corrupt the KV and the
-  sampler, and the process dies inside `ggml_abort` — every in-flight stream returns zero bytes. This
+  sampler, and the process dies inside `ggml_abort`, so every in-flight stream returns zero bytes. This
   is not hypothetical: OpenCode issues a side request (conversation title) while the main stream is
   running, on a second connection. Our HTTP layer happily served both on one context; four concurrent
   streams returned zero bytes each and the process died.
 
   Fixed in the hand-rolled server with `amp::TaskQueue` (one worker, FIFO), which no longer exists.
-  What handles it now is llama.cpp's slot model plus our `n_parallel = 1` default — see the next
+  What handles it now is llama.cpp's slot model plus our `n_parallel = 1` default. See the next
   bullet, which is the more important half of the lesson. Regression test: section 14 of
   `scripts/parity_test.py`.
 - **Concurrent slots are not free, and on this model they are actively destructive.**
@@ -327,7 +343,7 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
   `tools/server/server.cpp:156-159` expands to **four** concurrent slots with `kv_unified`. Every
   concurrent generation wants the same shared ~10.9 GiB CPU expert set, and on a box with ~10.9 GiB
   of usable page cache that is not sharing, it is thrashing: measured **0.64 t/s** with two slots
-  active against 28.4 t/s with one — a 44x collapse, found only by running the OpenCode harness
+  active against 28.4 t/s with one. A 44x collapse, found only by running the OpenCode harness
   (it stalled ~50 min on one prompt). The preflight now sets `n_parallel = 1` unless `--parallel N`
   is passed. General rule: **on a model whose decode is bound by a working set larger than cache,
   "parallel" slots divide a fixed resource and the default must be 1.**
@@ -338,7 +354,7 @@ From the `tokenizer.chat_template` in the GGUF (7764 chars), and `tools/server/s
 - **A stream must always end with `finish_reason`, then `[DONE]`.** Otherwise the Vercel AI SDK
   reports "OpenAI Chat stream ended without finish_reason" and retries forever, which presents as a
   mysterious hang rather than an error. On failure amp now sends the error object *and* a proper
-  finishing chunk — strictly more robust than llama.cpp, which sends the error and stops.
+  finishing chunk, which is strictly more robust than llama.cpp, since it sends the error and stops.
 - **A failed SSE write means the client is gone.** Stop generating (`interrupt()`) instead of
   computing tokens nobody will read. llama.cpp cancels the task on disconnect for the same reason.
 - Handler exceptions are caught and turned into a 500 with OpenAI's error shape, mirroring
