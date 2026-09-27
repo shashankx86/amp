@@ -11,7 +11,7 @@ A purpose-built inference engine for **exactly one model**:
 **Goal: beat llama.cpp's speed on this machine with ZERO quality loss.**
 Zero quality loss is a hard constraint, not a preference. Concretely that means:
 bit-identical quantized math (same dequant + same dot products as ggml), same RMSNorm/softmax/RoPE
-order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling, mmap'd weights
+order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q8_0`), same sampling, mmap'd weights
 (never copy weights into anonymous RAM), no quantization, no pruning, no approximate top-k.
 
 ## Non-negotiable environment facts (measured, see ../NOTES.md)
@@ -26,6 +26,31 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - Per expert per layer: 3 tensors x ~440 KiB (gate/up `[2048,512]`, down `[512,2048]`), ~1.29 MiB total.
 
 ## Established by measurement (see docs/BENCH.md — do not re-derive)
+- **Prefill needs a sequence of distinct prompts or it means nothing.** The same configuration
+  restarted three times measured **132.5, 178.4 and 311.3 t/s** on an identical 18,265-token prompt,
+  while decode over the same runs varied only 26.4-27.7. Prefill at batch ~1024 routes most of the
+  256 experts per layer through the CPU matmul and thrashes a page cache holding ~11 GiB of a
+  13.66 GiB model; decode at batch 1 touches 8 experts and stays cached. Use
+  `scripts/bench_prefill.py`, which generates a distinct prompt per measurement so nothing is served
+  from the prompt cache, and quote the median with the spread. An entire `n_ubatch` sweep in this
+  project was run on single requests and every conclusion from it had to be discarded.
+- **`cache_ram_mib` is 0, and that is the single largest prefill lever measured (~3x).** The old
+  clamp to 512 was reasoning that a smaller prompt cache would protect the model's page cache;
+  measured, 512 is still far too much, because each 18k prompt caches ~200 MiB and the churn evicts
+  model pages. With `-cram 0` the prefill sequence climbs and holds; with 512 it collapses and never
+  recovers. Prefix reuse comes from the slot's own KV, not this cache - `-cram 0` measured an 8.7 s
+  worst agentic turn against 10.0 s at 512.
+- **KV is q8_0/q8_0 and is 8.8x closer to f16 than the q8_0/q4_0 we used to ship** (median KL
+  2.065e-07 against 1.809e-06, at matched 32,768 context and g=7). Two facts to keep straight:
+  **neither q8_0 config is lossless against f16 on this model** (median |delta logprob| ~0.8 nats),
+  and **f16/f16 does not fit at 200k on this box at all** - it fails to allocate compute buffers
+  even with 0 GPU expert layers, first fitting at 131,072. The engine is bit-deterministic
+  (two identical runs give KL exactly 0), which is what makes any of this attributable.
+- **The engine is bit-deterministic.** Two independent runs of the identical configuration give
+  `KL = 0.000000e+00` both directions, JS 0, max |delta logprob| 0, 512/512 top-1. Always run that
+  control before believing a large quality result; the first f16-vs-q8_0 comparison looked like a
+  catastrophic regression (11.72 % top-1) and was entirely the dtype.
+
 
 - **Decode splits roughly one third / two thirds between the expert matvec and everything else.**
   The expert share is **~30-36 %** by three independent routes (349 MiB/token at the measured
@@ -79,7 +104,10 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
   the 12.19 GiB working set does **not** fit. Plan for a resident hot set plus a streamed tail.
 - llama.cpp's 12 t/s collapse was a *latency* problem (synchronous faults, LRU thrash), not a
   bandwidth problem.
-- KV cache is **8320 B/token** at k=q8_0/v=q4_0 → 1.55 GiB at 200k, 0.51 GiB at 65k.
+- KV cache at the shipped k=q8_0/v=q8_0 is **~10.9 KB/token** (measured 2.03 GiB at 200k,
+  0.64 GiB at 131k) - higher than the 8320 B/token the old k=q8_0/v=q4_0 pair gave (1.55 GiB at
+  200k). The planner pays for it by dropping one GPU expert layer, which costs decode almost
+  nothing and buys 8.8x closer to f16.
 - The planner independently reproduces the measured llama.cpp optimum (large ubatch beats GPU
   expert residency) and predicts **240 t/s prefill / 16.4 t/s decode** at 200k with prefetching.
 - **Head-to-head vs llama-server, MEASURED AGAIN 2026-09-26 and CORRECTED.** The old claim was

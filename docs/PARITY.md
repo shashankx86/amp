@@ -647,7 +647,7 @@ ngram config. **Not usable with this model** (no draft model available).
 - `-ncmoe` / `-cmoe` — CPU MoE control (amp's `-ncmoe` maps to this).
 - `-np` — parallel slots. Default -1 (auto).
 - `-b` / `-ub` — batch sizes. Prefill must be split to ubatch.
-- `-ctk` / `-ctv` — KV cache dtypes. amp uses `q8_0`/`q4_0`.
+- `-ctk` / `-ctv` — KV cache dtypes. amp uses `q8_0`/`q8_0`.
 - `--jinja` — must be enabled (default) for the chat template.
 - `--reasoning-format` — default `deepseek`; controls reasoning extraction.
 - `-t` / `-tb` — CPU threads. 8 cores.

@@ -74,7 +74,8 @@ not a ramp). Do not put the model there.
 |---|---|
 | MoE experts, all 40 layers | 12.188 GiB (330.00 MiB/layer Q3_K on 0-9 & 30-39, 294.00 MiB/layer IQ3_XXS on 10-29) |
 | non-expert weights (attn, SSM, shared experts, routers, embeddings, output) | 1.454 GiB |
-| KV cache @ 200k, k=q8_0 v=q4_0 | 1.55 GiB (8320 B/token) |
+| KV cache @ 200k, k=q8_0 v=q4_0 (historical) | 1.55 GiB (8320 B/token) |
+| KV cache @ 200k, k=q8_0 v=q8_0 (current)  | 2.03 GiB - measured |
 | KV cache @ 65k | 0.51 GiB |
 | SSM recurrent state, per sequence | 60 MiB |
 | compute buffer | ~0.72 MiB per ubatch token (1513 MiB at ubatch 2048) |

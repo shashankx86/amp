@@ -89,6 +89,12 @@ things worse:
 - **A smaller context to "free" VRAM.** The 200k target costs 2.6 % of decode (8,192 -> 35.61,
   65,536 -> 35.27, 200,000 -> 34.68 t/s). Use the context you need; the trade is not worth making.
 
+**The planner disables llama.cpp's RAM prompt cache, and that is deliberate.** `-cram 0`, not a
+reduced value: on a 14.3 GiB box carrying a 13.66 GiB model, any prompt cache competes with the page
+cache that both prefill and decode run on, and 512 MiB is still enough to lose ~3x on prompt
+processing. Pass `-cram N` if you want one back - the first request after a mid-conversation side
+request may then cost a full re-prefill.
+
 **VRAM is a real constraint, but placement saturates, so do not expect a win from it.** g=0 -> g=4
 measures +3.4 % for 10.6 % of expert bytes moved off the CPU, but g=4 -> g=7 then measures 28.89 ->
 26.44 t/s, i.e. slightly *worse*, and forcing g=6 at 200k OOMs at load. The GPU is 70 % idle during
