@@ -1018,10 +1018,29 @@ held at q8_0/q8_0 so this is the lever in isolation:
 | 512 | 85.0 t/s | 77.0 t/s |
 | 512 | 77.9 t/s | 54.3 t/s |
 
-**~3x on prompt processing**, reproducing in both orders. The shape inside a run is the tell: with
-`-cram 0` the sequence climbs and holds (133 -> 333 -> 231 -> 284 -> 272 -> 273) because the page
-cache is left alone; with `-cram 512` it collapses and never recovers (180 -> 93 -> 82 -> 98 -> 110 ->
-110) because the churn keeps evicting model pages.
+> **SUPERSEDED IN MAGNITUDE 2026-09-28 — the direction holds, the 3x does not. Re-measured
+> at the same 200k context with ten distinct 18k prompts: `-cram 0` median 559.8 t/s against
+> `-cram 512` median 509.5 t/s, so ~1.10x, not ~3x.** The original 85.0 t/s for `-cram 512` does
+> not reproduce and never did under this protocol; the collapse shape below was one session.
+> What survives is that `-cram 0` is not slower, which is why the default stands. Keep the
+> 3x figure out of any summary; quote ~1.1x or quote the direction.
+
+The shape that was read as the mechanism, re-run ten prompts deep:
+
+| `-cram` | sequence of prefill t/s, prompts 1..10 | median |
+|---|---|---:|
+| 0 | 267, 519, 558, 562, 559, 564, 560, 562, 564, 560 | **559.8** |
+| 512 | 288, 483, 517, 522, 496, 524, 528, 507, 495, 512 | **509.5** |
+
+Both climb out of the cold first request and then hold. Neither collapses. The original
+"180 -> 93 -> 82 -> 98 -> 110 -> 110" was the signature of a session that happened to be unlucky,
+read as a mechanism. A 512 MiB cache holding 143 MiB entries fills after 3.6 prompts, so ten
+prompts is where the effect *should* appear if it exists — and it does not.
+
+**A caution about the original protocol:** `bench_prefill.py --tokens N` builds prompts that land
+larger than N (8192 asked for, ~11.2k delivered). At 11.2k a 512 MiB cache needs 5.7 prompts to
+fill, so a 5-prompt run cannot show the effect even if it is real. Any future test of this lever
+has to run enough prompts to overflow the cache, which at 18k tokens means at least 4.
 
 It costs nothing in agentic terms, which is what the previous note assumed rather than checked. At
 35k context with a self-test request every second turn: `-cram 0` gives an **8.7 s worst turn**
@@ -1484,3 +1503,36 @@ The test that pinned the wrong constant, `cost_model_ubatch_efficiency_is_monoto
 2048, that 1024 is strictly below it, and that the 2048/1024 ratio brackets the measured 1.38x,
 so if the measurement stops being represented in the model the test fails rather than the
 constant quietly staying wrong.
+
+## 2026-09-28: the `cram` claim was overstated at 3x; it is about 1.1x
+
+Not a Strata item — this is a claim this project made in its own earlier work, re-measured while
+looking for the next thing and found to be wrong in magnitude. It matters because the same
+number appears in `AGENT.md` as an established invariant, and a 3x figure in a durable rule is
+the kind of thing that stops anyone from re-checking the next one.
+
+Re-measured at the target 200k context, ten distinct ~18k prompts, one server process per arm:
+
+| `-cram` | prefill t/s, prompts 1..10 | median |
+|---|---|---:|
+| **0** | 267, 519, 558, 562, 559, 564, 560, 562, 564, 560 | **559.8** |
+| 512 | 288, 483, 517, 522, 496, 524, 528, 507, 495, 512 | **509.5** |
+
+**~1.10x, not ~3x.** The earlier 85.0 t/s for `-cram 512` does not reproduce under this
+protocol at any prompt count tried. Both arms climb out of the cold first request and then hold;
+neither collapses. The "180 -> 93 -> 82 -> 98 -> 110 -> 110" sequence that was read as the
+eviction mechanism was one unlucky session, and a shape read off a single session is not a
+mechanism — the same mistake this project has already made twice and recorded.
+
+**The direction survives, so the default is unchanged**: `-cram 0` is not slower and is slightly
+faster, and at 4096 MiB (a plausible user value) the difference disappears entirely into the
+noise. The claim is now written as ~1.1x everywhere, with the 3x marked superseded in place
+rather than deleted, because "this was measured and was wrong" is more useful to the next
+reader than a quietly corrected number.
+
+**A protocol trap worth recording.** `bench_prefill.py --tokens N` builds prompts that land
+*larger* than N — 8192 requested, ~11.2k delivered. At 11.2k a 512 MiB cache needs 5.7 prompts
+to fill, so a 5-prompt run cannot expose an eviction effect even if it is real. This project's
+own earlier test used 18k prompts, which is why the effect, if it exists, needs at least 4
+prompts to appear. Any future test of a cache-vs-page-cache lever has to run past the point
+where the cache fills, and check that it did.

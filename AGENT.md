@@ -37,15 +37,24 @@ holds about 11 GiB of it. Decode at batch 1 touches 8 experts and stays resident
 from the prompt cache, and quote the median with the spread beside it. An entire `n_ubatch`
 sweep in this project was run on single requests and every conclusion had to be thrown out.
 
-`cache_ram_mib` is 0, and that is the largest prefill lever we have measured, at about 3x. The
-old clamp to 512 reasoned that a smaller prompt cache would protect the model's page cache.
-512 is still far too much for that: each 18k prompt caches about 200 MiB, so two or three fill
-the cache and the churn starts evicting model pages. With `-cram 0` the prefill sequence climbs
-and holds. With 512 it collapses and never recovers. Prefix reuse comes from the slot's own KV
-rather than this cache, and turning it off cost nothing agentically: an 8.7 s worst turn against
-10.0 s at 512.
+`cache_ram_mib` is 0. The old clamp to 512 reasoned that a smaller prompt cache would protect the
+model's page cache. The direction is right — 0 is not slower, and at 200k over ten distinct 18k
+prompts it measures 559.8 t/s against 509.5 t/s at 512, so **about 1.1x**. It was previously
+recorded here as 3x, which is wrong: the 85.0 t/s that supported it does not reproduce at any
+prompt count, and the "collapses and never recovers" sequence it was read from was one unlucky
+session. Re-measured, both arms climb out of the cold request and hold. Do not quote 3x. Prefix
+reuse comes from the slot's own KV rather than this cache, and turning it off cost nothing
+agentically: an 8.7 s worst turn against 10.0 s at 512.
 
-Decode splits roughly one third to the expert matvec and two thirds to everything else. Three
+One protocol trap, because it will hide an eviction effect even when the effect is real:
+`bench_prefill.py --tokens N` builds prompts that land *larger* than N (8192 requested, ~11.2k
+delivered). At 11.2k a 512 MiB cache needs 5.7 prompts to fill, so a 5-prompt run cannot show it.
+Run past the point where the cache fills, and check that it did.
+
+Decode splits 40% expert bandwidth and 60% everything else, measured 2026-09-28 by subtraction
+(349 MiB of experts at a measured 30.2 GB/s = 11.29 ms of a 28.25 ms token; `ggml mul_mat` at
+batch 1 runs at 30.2 GB/s on GDN layers and 29.5 on attention, against plain reads of 29.1 and
+29.0, so no expert kernel is running badly). The 60% is not an expert kernel. Three
 independent routes put the expert share at 30 to 36 %: 349 MiB per token at the measured
 29.21 GB/s is 12.5 ms of a 34.57 ms token, and the `-ncmoe` A/B solved two ways gives 29 % both
 times.
