@@ -1117,3 +1117,105 @@ reporting "100% tests passed" while 7 of the tests did nothing at all.** That is
 at the model and exits non-zero if there is not one, and the new expectations are asserted:
 `cache_ram_mib == 0`, `cache_type_v == GGML_TYPE_Q8_0`, and both surviving an explicit
 `-cram N` and `-ctv f16`.
+
+## 2026-09-28: mining Strata, and a harness built but not yet run
+
+### What Strata is, and why the ideas transfer
+
+`/home/e0u/localhost/Strata` is a from-scratch engine for Qwen3.8-Flash-Next: 53k lines, 48
+layers (36 Gated DeltaNet + 12 QSA), 512 experts/layer, top-10, its own CUDA kernels, an MTP
+draft layer, a VRAM-resident expert cache, and a single-request Python server.
+
+That model is **the same architecture class as Occamy**, which is what makes it worth mining
+rather than merely reading:
+
+| | Strata (Qwen3.8-Flash-Next) | amp (Occamy) |
+|---|---|---|
+| layers | 36 GDN + 12 QSA | **30 GDN + 10 QSA** (`full_attention_interval=4`) |
+| experts / used | 512 / 10 | 256 / 8 |
+| expert bytes per token | 663.6 MB | **349 MiB** |
+| measured bandwidth | ~40 GB/s | **29.21 GB/s** (101.8% of a plain read) |
+| CPU expert time per token | 16.2 ms | **12.5 ms** |
+| token time | ~53 ms | **34.57 ms** |
+| **expert share of a token** | 31% | **36%** |
+
+The last row is the whole argument. amp had already found, from the other direction, that the
+expert matvec runs at 101.8% of a plain read of the same bytes, i.e. bandwidth-bound with
+nothing left to prefetch. Strata measured the same shape and then did something about it. Its
+pool hides only 1.055 ms of 19.035 because the residual chain is strictly serial.
+
+### The expert cache: what it actually returned, and why we are not building it
+
+Strata's largest single idea is a VRAM-resident expert cache. It dominates the codebase - a
+`STRP` profile format, a `(layer, expert)` residency table, five grouped CUDA kernels, five
+wiring sites, an adaptive tier on its own thread.
+
+Measured, from their own source comments: pool drain **19.076 -> 10.312 ms/token**, and end to
+end **-2.7 ms on a ~48.7 ms token, i.e. -5.5%**, not the 36% the byte counts suggest. The hit
+rate is `h = 0.6447` (ten-fold leave-one-out, `[0.6110, 0.6750]`; their in-sample 0.6573 and
+single-prompt 0.4720 are explicitly labelled not-the-metric), the CPU's remaining half has to
+hide under GPU work with its own 26.32 ms/token floor, and their first buffer ordering dropped
+the drain from 18.2 to 10.2 ms while **the token did not move at all**.
+
+Not worth building here, for three independently sufficient reasons:
+
+1. **The ceiling is 5.5%.** That is the return on the most sophisticated idea in the project.
+2. **VRAM does not allow it.** Their 4,096 slots x 1,382,400 B is 4 GiB of expert cache on a
+   12 GB card. amp has 5.89 GiB usable and the current plan already spends 5.69 GiB of it
+   (measured: "ubatch 1024, compute buffer 977.28 MiB, total VRAM 5.69 GiB of 5.89 GiB free"),
+   leaving ~200 MiB - about 170 expert slots.
+3. **llama.cpp's offload is tensor-granular.** `-ncmoe` and `-ot` are per-layer. Per-*expert*
+   residency needs a new ggml op, a backend-scheduler change, and a kernel.
+
+Recorded so the next person does not re-derive it: **this is the idea to revisit first if amp
+ever stops being a llama.cpp derivative.**
+
+### What is ruled out permanently: MTP speculation
+
+Strata's MTP draft layer gives 1.6-1.8x (2.4-3.2 tokens per pass, 79-86% measured acceptance,
+verified bit-identical by construction). A byte scan of all 13.66 GB of the Occamy GGUF found
+**no `nextn`, `draft`, `mtp` or `eagle` tensor name and no such KV key**. There is no draft
+head on this model. Not a tuning problem, not a flag.
+
+### What IS open: n-gram prompt-lookup speculation
+
+Strata's `SuffixDrafter` is llama.cpp's `ngram-map-k`, almost exactly: 4 candidate m-grams per
+key n-gram (`COMMON_NGRAM_MAX_VALUES 4` against their `WAYS = 4`), per-candidate
+`n_accepted` tracking for acceptance statistics, and a match-length gate (`min_hits`) that is
+their "only where its measured acceptance says it pays". Defaults are 12-gram keys, 48-token
+drafts.
+
+Strata measured **6-11% on code edits, prose unchanged**, and recorded the negative result too:
+forcing the lookup drafter whenever it proposed more than the MTP **lost 2-8% on ordinary
+text**. So the question is not "is it faster" but two questions - does it help where it should,
+and does it hurt where it should not.
+
+**Status: harness built, not run.** The measurement was cut short by a reboot. Nothing is
+claimed about n-gram speculation's effect on this box.
+
+```
+python3 scripts/gen_spec_prompts.py                  # fixtures, derived from live source
+setsid nohup scripts/sweep_spec.sh 3 5 > /tmp/opencode/sweep.log 2>&1 < /dev/null &
+python3 scripts/summarise_spec.py /tmp/opencode      # paired differences + a noise verdict
+```
+
+Three things in the harness that are not obvious, each from a way this measurement could
+otherwise have lied:
+
+- **Readiness is a real completion, not `/health`.** `/health` answers 200 about two seconds in,
+  while the 13.66 GiB model is still being read off disk. The first version used it and would
+  have benchmarked an empty server while producing numbers that looked fine.
+- **The arm label must be corroborated by the server's own log.** The per-request
+  `speculative.type` override is compiled out (`tools/server/server-schema.cpp:197` is `#if
+  0`), so each arm costs a process start and a full model load. A driver that died between
+  restarting the server and writing its state file would mislabel every number, silently.
+  `bench_spec.py --require` refuses to record numbers it cannot corroborate.
+- **Summarise pairs on the sweep's pair index and reports the spread, not a ratio of pooled
+  medians.** With a 22% session-to-session drift, a ratio of pooled medians charges the drift
+  to whichever arm ran in the faster half of the afternoon. When the per-pair spread is wider
+  than 10 pp the summary prints that the effect is below this box's noise instead of quoting a
+  mean. Unit-tested against synthetic signal, synthetic noise, and a deliberately unmatched run.
+
+The code workload is generated from `src/plan/preflight.cpp` by brace-matching a live function
+rather than embedding a copy - the first version quoted a function that had already been
+rewritten, so it was asking the model to reproduce code that no longer existed.
