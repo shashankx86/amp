@@ -88,6 +88,9 @@ def main():
                     help="0 = use the whole standard bench prompt as the base context")
     ap.add_argument("--prompt-file", default="/tmp/opencode/amp_bench_prompt.txt")
     ap.add_argument("--timeout", type=int, default=7200)
+    ap.add_argument("--interleave", type=int, default=0,
+                    help="after every N turns, send one short unrelated request, the way an "
+                         "agent tests the API it is being served by")
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
 
@@ -100,6 +103,9 @@ def main():
     print(f"url     : {args.url}")
     print(f"plan    : 1 initial context + {args.turns} turns, each adding a ~{len(DELTA)}-char "
           f"tool result, {args.gen} tokens generated per turn")
+    if args.interleave:
+        print(f"          plus one short unrelated request every {args.interleave} turns, the way "
+              f"an agent tests the API it is being served by")
     print()
 
     context = prompt
@@ -142,7 +148,26 @@ def main():
         # The model replies, and the client's next turn appends the tool result.
         context = context + "\nassistant: ok\nuser:\n" + DELTA
 
-    turn_rows = rows[1:]
+        # An agent that tests its own API injects an unrelated short request into the same
+        # server. On a single-slot server that request is served by the slot holding the agent's
+        # context, and the context does not survive. This is the stall.
+        if args.interleave and turn and turn % args.interleave == 0:
+            probe = {"prompt": "Reply with the single word: pong",
+                     "n_predict": 8, "temperature": 0.0, "stream": False}
+            t1 = time.time()
+            try:
+                post(f"{args.url}/v1/completions", probe, args.timeout)
+                pw = time.time() - t1
+                rows.append({"turn": f"{turn}+probe", "prompt_n": 0, "prefill_ms": 0.0,
+                             "decode_ms": pw * 1000.0, "wall_s": pw, "kind": "probe"})
+                print(f"  probe  : unrelated 8-token request, wall {pw:.1f}s "
+                      f"(sent by the agent to its own host)")
+            except (urllib.error.URLError, urllib.error.HTTPError) as e:
+                print(f"  probe failed: {e}", file=sys.stderr)
+                return 1
+
+    turn_rows = [r for r in rows[1:] if isinstance(r["turn"], int)]
+    probes = [r for r in rows if r["kind"] == "probe"]
     walls = [r["wall_s"] for r in turn_rows]
     prefills = [r["prefill_ms"] for r in turn_rows]
     deltas = [r for r in turn_rows if r["kind"] == "delta"]
@@ -161,6 +186,9 @@ def main():
     if delta_walls:
         print(f"  cache-hit turns only    : median {statistics.median(delta_walls):.1f}s "
               f"over {len(delta_walls)}/{len(turn_rows)} turns")
+    if probes:
+        print(f"  self-test requests       : {len(probes)}, "
+              f"{sum(p['wall_s'] for p in probes):.1f}s total")
     print(f"  FULL RE-PREFILL stalls  : {len(stalls)}"
           + (f"  -> turns {[t for t, _, _ in stalls]}, "
              f"{max(w for _, _, w in stalls):.0f}s worst" if stalls else "  (none)"))

@@ -912,3 +912,49 @@ the explanation for the 234-second stall in the field.
 Squeezing 5 GiB of RAM to imitate a memory-starved session also did not reproduce it: prefill stayed
 at 383 t/s and the loop at 2.9 s median with 0 re-prefills. `MAP_POPULATE` at load refills the page
 cache, so a fresh server is warm even when the box is tight.
+
+### The tool-call stall, reproduced and fixed: it was the single slot
+
+The stall reported from the field was 234 seconds of "prompt processing" on one turn. The
+hypotheses above were all wrong. What actually happened is that **the model was testing the API it
+was being served by**: a simple prompt, then a request to configure the client, then self-test
+requests, then continued work. A self-test is a short unrelated prompt sent to the same server
+mid-conversation.
+
+amp forced `n_parallel: 1` to stop four concurrent slots thrashing the shared CPU expert set
+(measured 0.64 t/s against 28.4). The thrash protection was right. Forcing a **single** slot was
+not, and the consequence was the bug: with one slot, the self-test request is served *by the slot
+holding the conversation*, and the conversation's cached prefix does not survive it. The server log
+shows it exactly - a 34,774-token context, an 11-token probe, a release at `n_tokens = 216`, then
+a 35,603-token re-prefill at 151 t/s.
+
+Reproduced with `scripts/bench_agentic.py --interleave`, 35,001-token context, a self-test request
+after every second turn, 6 turns:
+
+| `--parallel` | full re-prefills | median turn | **worst turn** | total, 6 turns |
+|---|---|---|---|---|
+| 1 | **2** | 5.5 s | **110.6 s** | 239.3 s |
+| 2 | **0** | 4.6 s | **6.3 s** | **27.1 s** |
+
+**8.8x on the number a user actually waits through.** Two slots costs nothing in decode:
+
+| `--parallel` | 1 | 2 | 4 |
+|---|---|---|---|
+| steady decode | 27.42 | 27.25 | 27.67 t/s |
+
+All inside the run-to-run spread. The 0.64 t/s collapse needs several slots generating
+**simultaneously** against the shared expert set, and an agentic turn never does that - it finishes
+generating, then runs tools. So the fix keeps the thrash protection and drops the single-slot trap:
+`n_parallel` now defaults to 2. `--parallel 1` still works for anyone who wants it.
+
+Note this only reproduces at scale. At an 18,265-token context the same probe caused 0 re-prefills,
+because the prefix still fits comfortably; at 35,001 tokens it cost 110 s. The bug was invisible at
+the size the rest of this file benchmarks.
+
+### An unexplained truncation, left open
+
+While building the 35k fixture, a 104,884-character prompt (36,530 tokens, verified via
+`/tokenize`) was reported by the server as processing 18,269 prompt tokens. Repeated content is not
+a plausible explanation, since 4x the text tokenises to 106,239 tokens as one string. Something
+truncates a long prompt to about half. Not investigated, and recorded here rather than forgotten:
+if a real prompt is silently halved, that is worse than any speed question.

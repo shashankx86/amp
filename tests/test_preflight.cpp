@@ -227,11 +227,15 @@ AMP_TEST(preflight_plan_failure_still_leaves_a_usable_config) {
     AMP_CHECK_MSG(p.n_ctx > 0, "n_ctx must be set even without a plan, got " + std::to_string(p.n_ctx));
 }
 
-AMP_TEST(preflight_forces_one_slot_unless_asked) {
+AMP_TEST(preflight_forces_two_slots_unless_asked) {
     // The server example sets n_parallel = -1 ("auto", arg.cpp:1400), which server.cpp:156-159
     // expands to FOUR concurrent slots. On this box that is a 44x decode collapse, because every
-    // concurrent generation wants the same shared ~10.9 GiB CPU expert set. An agentic client
-    // has two requests open by design, so the default is a guaranteed slowdown.
+    // concurrent generation wants the same shared ~10.9 GiB CPU expert set.
+    //
+    // Two, not one. A single slot means a mid-conversation side request - an agent testing the
+    // API it is being served by - is served by the slot holding the conversation and destroys
+    // its cached prefix. Measured at 35,001 tokens of context: 2 full re-prefills and a 110.6 s
+    // worst turn at one slot, 0 re-prefills and 6.3 s at two.
     const char * m = model_path();
     if (!m) {
         return;
@@ -244,10 +248,10 @@ AMP_TEST(preflight_forces_one_slot_unless_asked) {
         o.n_ctx = 4096;
         const auto r = apply_preflight(o, p, std::vector<std::string>{ "amp-server", "-m", m });
         AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
-        AMP_CHECK_EQ(p.n_parallel, 1);
+        AMP_CHECK_EQ(p.n_parallel, 2);
     }
     {
-        // ...unless the user asked for more.
+        // ...unless the user asked for a specific count, in either direction.
         common_params   p = parsed_like_llama_cpp();
         p.model.path    = m;
         // As common_params_parse would leave it: the flag's VALUE is already applied, and the
@@ -259,6 +263,19 @@ AMP_TEST(preflight_forces_one_slot_unless_asked) {
                                        std::vector<std::string>{ "amp-server", "-m", m, "--parallel", "3" });
         AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
         AMP_CHECK_EQ(p.n_parallel, 3);
+    }
+    {
+        // A user who genuinely wants one slot still gets one. This is the case that motivated
+        // the original clamp, so it must stay overridable in the direction that costs speed.
+        common_params   p = parsed_like_llama_cpp();
+        p.model.path    = m;
+        p.n_parallel    = 1;
+        PreflightOptions o;
+        o.n_ctx = 4096;
+        const auto r = apply_preflight(o, p,
+                                       std::vector<std::string>{ "amp-server", "-m", m, "--parallel", "1" });
+        AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
+        AMP_CHECK_EQ(p.n_parallel, 1);
     }
 }
 

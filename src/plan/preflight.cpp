@@ -240,10 +240,28 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
     //
     //    Overridable with --parallel N, because someone batching independent prompts may want
     //    the throughput and accept the memory cost.
-    if (!f.np && params.n_parallel != 1) {
-        note("n_parallel: 1 (llama-server defaults to 4 concurrent slots, which thrashes the "
-             "shared CPU expert set on this box; use --parallel N to override)");
-        params.n_parallel = 1;
+    //
+    //    It is 2, not 1. Forcing a single slot was right about the thrash and wrong about the
+    //    consequence, and the second mistake cost real time in the field. An agentic client that
+    //    tests the API it is being served by - which is what a model asked to verify a config
+    //    does - sends a short unrelated request mid-conversation. With one slot that request is
+    //    served *by the slot holding the conversation*, and the conversation's cached prefix does
+    //    not survive it. Measured at a 35,001-token context with a self-test request after every
+    //    second turn: **2 full re-prefills, worst turn 110.6 s, 239.3 s over 6 turns.** With two
+    //    slots the self-test goes to the other slot: **0 re-prefills, worst turn 6.3 s, 27.1 s.**
+    //    An 8.8x difference on the number a user actually waits through.
+    //
+    //    Two slots costs nothing in decode: 27.42 t/s at one slot against 27.25 at two and 27.67
+    //    at four, all inside the run-to-run spread. The 0.64 t/s collapse needs several slots
+    //    generating *simultaneously* against the shared expert set, which an agentic turn never
+    //    does - it finishes generating, then runs tools. So keep the thrash protection, lose the
+    //    single-slot trap.
+    if (!f.np && params.n_parallel < 2) {
+        note("n_parallel: 2 (llama-server defaults to 4 concurrent slots, which thrash the "
+             "shared CPU expert set on this box; 2 keeps a self-test or side request from "
+             "evicting the conversation's cached prefix, which costs an 8.8x worse worst turn. "
+             "Use --parallel N to override)");
+        params.n_parallel = 2;
     }
 
     //    fit_params belongs with them. Default is true (common/common.h:476), and the fitter

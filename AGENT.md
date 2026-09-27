@@ -184,14 +184,23 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
       ~1000 barriers per token and the 8 threads spin at each: **53.6 % of CPU cycles**. That is load
       balancing, not waste — spinning measures 29.56 t/s against 22.53 t/s for sleeping, a 31 %
       penalty. That 53.6 % is the price of 8-thread efficiency, not a bug to fix.
-- [ ] **Tool-call latency: three hypotheses falsified, cause still unidentified.** Use
-      `scripts/bench_agentic.py` (per-turn latency and full-re-prefill count), not tokens/second.
-      Measured: `cache_ram_mib` 512 / 2048 / 4096 all give 0 full re-prefills and a ~2.2 s median
-      turn; squeezing 5 GiB of RAM also gives 0 re-prefills and 2.9 s. So neither the prompt-cache
-      clamp nor memory pressure explains a 234 s stall seen in the field. The signature to look for
-      in the server log is `selected slot by LRU` (no `f_sim_best`) or `f_sim_best` well below 0.9,
-      followed by `release ... n_tokens` collapsing to a few hundred — that is the prefix being lost
-      and the next turn paying a full prefill. Do not re-test the two falsified ones.
+- [x] **Tool-call latency: root-caused, reproduced and fixed.** It was `n_parallel: 1`. A model asked
+      to verify a config sends a short self-test request to the API it is being served by; with one
+      slot that request is served by the slot holding the conversation and the cached prefix does
+      not survive it. At a 35,001-token context that costs **2 full re-prefills and a 110.6 s worst
+      turn**; at 2 slots, **0 re-prefills and 6.3 s**. Decode is unaffected (27.42 / 27.25 / 27.67
+      t/s at 1 / 2 / 4 slots) because the 44x collapse needs *concurrent* generation, which an
+      agentic turn never does. **Default is now 2.** Reproduce with
+      `scripts/bench_agentic.py --interleave N`; it only bites above ~30k tokens of context, so a
+      small-context benchmark will show 0 re-prefills and hide the bug entirely.
+- [ ] Three latency hypotheses were falsified on the way and are recorded so they are not retested:
+      `cache_ram_mib` 512 / 2048 / 4096 all give 0 re-prefills and ~2.2 s median turns; squeezing
+      5 GiB of RAM does the same (`MAP_POPULATE` refills the page cache at load, so a fresh server
+      is warm even on a tight box); and OpenMP barrier spinning is not a cost but a benefit.
+- [ ] **Unexplained: long prompts are truncated to about half.** A 104,884-char prompt (36,530
+      tokens by `/tokenize`) was processed as 18,269 tokens. Not the tokenizer, which tokenises 4x
+      the text to 106,239 as one string. If a real prompt is silently halved that is worse than any
+      speed problem here. Uninvestigated.
 - [x] Fold the two forward paths into one — resolved by deletion rather than refactoring. The server
       (`InferenceService`) is gone; `amp-server` is llama.cpp's server. `ModelRuntime` survives as
       `amp-infer`, the measurement harness, because it has the prefetcher and can be A/B'd against
