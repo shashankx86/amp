@@ -69,6 +69,33 @@ that the CPU expert set fits the page cache (10.90 GiB) where llama-server's doc
 not (~11.5 GiB), so amp does not collapse — llama-server's first request runs at 1.96 t/s, amp's at
 26 t/s. See `docs/BENCH.md`.
 
+### Performance: what to tune, and what to leave alone
+
+**Leave `-t` alone.** Decode is compute-bound, and `-t 8` (one thread per physical core) is already
+the measured peak. Raising it makes things worse:
+
+| `-t` | 4 | **8 (default)** | 12 | 16 |
+|---|---|---|---|---|
+| steady decode | 27.95 | **32.97** | 29.96 | 21.19 t/s |
+
+**Do not reach for these**, all measured to be worth nothing on this model:
+
+- **N-gram speculative decoding** (`--spec-type ngram-simple`) — lossless, but +0.2 % on templated
+  output, which is where it should pay best. The model is too entropic for drafts to match.
+- **More VRAM / more GPU expert layers.** Expert weight fetching is 3.7 % of decode, so even moving
+  every expert to the GPU extrapolates to 1.04x. g=4 is the VRAM ceiling at 200k and g=8 would only
+  have been worth ~3 %.
+- **A smaller context to "free" VRAM.** The 200k target costs 2.6 % of decode (8,192 -> 35.61,
+  65,536 -> 35.27, 200,000 -> 34.68 t/s). Use the context you need; the trade is not worth making.
+
+The one measurement still missing is a per-op profile. **30 of the 40 layers are recurrent**, and a
+sequential SSM recurrence parallelises badly — the obvious suspect for the 96 % that is not expert
+fetching. Their weights are already on the GPU; whether the recurrence is efficient is untested.
+
+Beware the noise: steady decode varies **~22 % between sessions** with page-cache warmth
+(28.39-34.68 t/s at 200k across one day). Compare two configurations inside the same session, or
+the difference is meaningless.
+
 ### Thinking models
 
 This is a reasoning model, and its template renders the generation prompt already **inside** a

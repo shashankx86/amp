@@ -27,6 +27,27 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 
 ## Established by measurement (see docs/BENCH.md — do not re-derive)
 
+- **Decode is compute-bound, not memory-bound, and not VRAM-bound.** Expert weight fetching is
+  **3.7 %** of decode time; the other 96.3 % is arithmetic. Three independent consequences:
+  (a) the 6 GB VRAM limit is *not* the binding constraint — g=8 would only be worth ~3 %, so more or
+  faster GPU changes little for this model; (b) the ~4 GiB that streams from NVMe (cache holds
+  7.27 GiB of a 12.19 GiB working set) is already well overlapped, which is why the working set
+  exceeding cache costs so little; (c) prefetching expert reads — M3c — has a ~4 % ceiling.
+- **Decode threads are already optimal.** `-t 8` (one per physical core) measures 32.97 t/s against
+  27.95 at 4, 29.96 at 12 and 21.19 at 16. The planner's `ncpu / 2` default is right; SMT siblings
+  contend. Do not "improve" this.
+- **N-gram speculative decoding does nothing here.** Lossless and therefore the one remaining lever
+  that avoids the arithmetic: +3 % on a counting prompt (inside the 22 % session variance) and
+  **+0.2 %** on a 300-token templated list, which is where drafting should pay best. The model is too
+  entropic at the token level for n-grams to find matches.
+- **Context length barely costs decode.** 8,192 -> 35.61, 65,536 -> 35.27, 200,000 -> 34.68 t/s.
+  The 200k target costs **2.6 %** even though the planner gives up GPU expert layers (8 -> 4) as the
+  KV grows.
+- **Steady decode varies ~22 % between sessions** on this box (28.39 / 30.39 / 31.44 / 33.94 /
+  34.68 t/s at 200k), driven by page-cache warmth. A single-session A/B is only trustworthy if both
+  engines are measured in that same session. This is how the project came to hold both "35.25 t/s"
+  and "28.39 t/s" without either being a lie.
+
 - Demand paging **with readahead** runs at **1.8 GiB/s** and leaves **100 % of pages resident**
   (mincore-verified). Fully resident reads run at **3.5 GiB/s**. The 555 MB/s O_DIRECT fio number is
   random access without readahead and is NOT the right constant — the cost model was wrong until
@@ -117,10 +138,19 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
 - [x] M5 page-cache warming at start-up; decode-time prefetch of active experts **removed** on purpose
 - [x] M6 server: OpenAI-compatible API, SSE, token-level prefix cache, prompt-boundary checkpoints,
       reasoning alias fix — `amp-server`, driven by `scripts/parity_test.py`
-- [ ] M3c amp's own ggml graph, so the router is observable and the 8 active experts per layer can be
-      prefetched during decode (the only remaining decode win; impossible through `llama.h`)
-- [ ] M7 close the gap between amp's decode and the measured ceiling (25.6 t/s was with a plan chosen
-      for 6 GPU expert layers; the server currently plans 8 at short ctx)
+- [x] M3c — **REFUTED by measurement, do not build it.** It was carried as "the only remaining
+      decode win" on the premise that decode is bound by CPU memory latency on the expert reads.
+      Measured: expert weight fetching is **3.7 %** of decode (from the `-ncmoe` sweep, solved as
+      `t = a + b`), so prefetching has a ~4 % ceiling and hides latency rather than bytes anyway.
+      Putting *every* expert on the GPU extrapolates to 1.04x. See docs/BENCH.md.
+- [ ] M7 **reframed.** There is no gap to close: every quality-neutral decode lever has been
+      measured and spent. Threads are already optimal (`-t 8` beats 4/12/16), expert placement is
+      worth 3.4 %, context length costs 2.6 %, and n-gram speculation is worth 0.2 %. Decode is
+      ~96 % CPU arithmetic at the optimal thread count with its I/O already overlapped.
+- [ ] Profile the **30 recurrent layers** (of 40). A sequential SSM recurrence parallelises badly
+      and is the obvious suspect for the 96 %, yet it is the opposite of the MoE framing M3c was
+      built on. No per-op profile has been taken. This is the only untested avenue left, and it is
+      where custom work would actually start.
 - [x] Fold the two forward paths into one — resolved by deletion rather than refactoring. The server
       (`InferenceService`) is gone; `amp-server` is llama.cpp's server. `ModelRuntime` survives as
       `amp-infer`, the measurement harness, because it has the prefetcher and can be A/B'd against
