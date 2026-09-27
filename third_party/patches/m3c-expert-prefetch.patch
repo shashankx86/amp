@@ -1,0 +1,135 @@
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 8bb0ff7..a7a9b48 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1662,6 +1662,130 @@ static void ggml_compute_forward_mul_mat_id(
+         }
+     }
+ 
++// amp M3c: prefetch the experts this token selected.
++// The router output is already in host memory here, because ids->data is
++// dereferenced directly just above, so the active experts are known with no
++// sync. A prefetch is a pure hint and cannot change a result.
++#define AMP_M3C_MAX_LAYERS 64
++#define AMP_M3C_MAX_IDS    16
++{
++        static int    m3c_kib      = 0;
++        static int    m3c_init     = 0;
++        static char   m3c_path[256] = {0};
++        static double m3c_checked  = 0.0;
++
++        if (!m3c_init) {
++            m3c_init = 1;
++
++            const char * env = getenv("AMP_M3C_PREFETCH_KIB");
++            m3c_kib = env ? atoi(env) : 0;
++
++            const char * path = getenv("AMP_M3C_PREFETCH_FILE");
++            if (path) {
++                snprintf(m3c_path, sizeof(m3c_path), "%s", path);
++            }
++        }
++
++        // A control file lets one server process A/B the depth without a
++        // restart, which is the only way to compare inside a single session.
++        // Re-read it at most twice a second; a torn read can only pick a
++        // different hint depth, never a different result.
++        if (m3c_path[0] && ith == 0) {
++            const double now = (double) ggml_time_us()/1000.0;
++
++            if (now - m3c_checked > 500.0) {
++                m3c_checked = now;
++
++                FILE * f = fopen(m3c_path, "r");
++                if (f) {
++                    int v = 0;
++                    if (fscanf(f, "%d", &v) == 1) {
++                        m3c_kib = v;
++                    }
++                    fclose(f);
++                }
++            }
++        }
++
++        if (m3c_kib > 0) {
++            const char * const wdata_src0 = (const char *) src0->data;
++
++            const int64_t expert_bytes = ne01*nb01;
++            const int64_t want = (int64_t) m3c_kib*1024;
++            const int64_t span = want < expert_bytes ? want : expert_bytes;
++
++            // Positive depth: prefetch the experts this token just selected. The
++            // hint is issued in the same node that consumes it, so there is
++            // almost no time lead, only memory-level parallelism across the
++            // selected experts.
++            //
++            // Negative depth: predictive. Expert routing is stable across
++            // adjacent tokens, so prefetch what the *previous* token selected
++            // for the *next* layer, while this layer computes. That gives one
++            // layer of compute, roughly 0.9 ms here, as lead time, which is four
++            // orders of magnitude more than a DRAM latency and is the only form
++            // of this that can hide anything.
++            const int pred = m3c_kib < 0;
++
++            if (pred) {
++                // Layer index comes from the tensor name, "blk.N.ffn_*_exps.weight".
++                int layer = -1;
++
++                if (sscanf(src0->name, "blk.%d.", &layer) != 1) {
++                    layer = -1;
++                }
++
++                if (layer >= 0 && layer < AMP_M3C_MAX_LAYERS) {
++                    static int sel[AMP_M3C_MAX_LAYERS][AMP_M3C_MAX_IDS];
++
++                    // Record this token's selection for the next token to use.
++                    for (int id = 0; id < n_ids && id < AMP_M3C_MAX_IDS; ++id) {
++                        sel[layer][id] = *(const int32_t *) ((const char *) ids->data + id*ids->nb[0]);
++                    }
++
++                    // Prefetch the next layer's previous selection.
++                    const int32_t * next = layer + 1 < AMP_M3C_MAX_LAYERS ? sel[layer + 1] : NULL;
++
++                    if (next) {
++                        for (int id = ith; id < n_ids; id += nth) {
++                            if (id >= AMP_M3C_MAX_IDS) {
++                                break;
++                            }
++
++                            const int32_t i02 = next[id];
++
++                            if (i02 < 0 || i02 >= n_as) {
++                                continue;
++                            }
++
++                            const char * const expert = wdata_src0 + i02*expert_bytes;
++
++                            for (int64_t off = 0; off < span; off += 64) {
++                                __builtin_prefetch(expert + off, 0, 3);
++                            }
++                        }
++                    }
++                }
++            } else {
++                for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
++                    for (int id = ith; id < n_ids; id += nth) {
++                        const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
++
++                        if (i02 < 0 || i02 >= n_as) {
++                            continue;
++                        }
++
++                        const char * const expert = wdata_src0 + i02*expert_bytes;
++
++                        for (int64_t off = 0; off < span; off += 64) {
++                            __builtin_prefetch(expert + off, 0, 3);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
+     // reset current_chunk
+     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
