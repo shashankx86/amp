@@ -1,4 +1,4 @@
-# BENCH.md — measurements taken by amp on this machine
+# BENCH.md, measurements taken by amp on this machine
 
 All numbers measured on the target box (CachyOS 7.2.6, RTX 4050 Laptop 6 GB, Ryzen 7 7735HS,
 14 GiB RAM, Kingston QLC NVMe under LUKS+btrfs). Raw context in `../NOTES.md`.
@@ -15,7 +15,7 @@ cmake --build build -j$(nproc)
 
 ---
 
-## 1. Demand paging vs direct I/O — the number that matters most
+## 1. Demand paging vs direct I/O: the number that matters most
 
 `mincore()` over a read-only mmap of the model, touching one byte per 4 KiB page. This is the
 exact access pattern both llama.cpp and amp produce.
@@ -35,7 +35,7 @@ like. The cost model now uses 1.85 GB/s for the fault path and 3.5 GB/s for the 
 Consequence for the design: the 12 t/s catastrophe in llama.cpp was never a bandwidth problem. With
 a 12.19 GiB working set cyclically scanned through a smaller cache, LRU yields ~0 % reuse, every
 ubatch re-reads the whole set, and *synchronous* faults on the compute thread cannot build queue
-depth — that latency, not throughput, is what collapses prefill. The fixes are residency control
+depth. Latency, not throughput, is what collapses prefill. The fixes are residency control
 and I/O/compute overlap, not faster disks.
 
 ## 2. Warming the whole expert working set
@@ -51,7 +51,7 @@ re-read           = 2.20 GiB/s
 **The entire expert working set can be pulled into the page cache in 6.3 seconds.** Whether it
 *stays* there is the open question: after the warm, `Cached` was only 5.46 GiB with 4.3 GiB of RAM
 still free, i.e. roughly 7 GiB of the 12.19 GiB had been evicted again. Memory in use by other
-processes at the time was 5.2 GiB, so the practical cache ceiling is ~9.6 GiB — below the working
+processes at the time was 5.2 GiB, so the practical cache ceiling is about 9.6 GiB, below the working
 set. That is the structural reason `amp` plans a resident hot set *plus* an explicitly streamed
 tail instead of assuming everything fits.
 
@@ -103,9 +103,9 @@ predicted         prefill 225 t/s, decode 12.4 t/s
    5    1024   5.26 GiB   yes   3.88 GiB     213.9     12.9
 ```
 
-The planner independently rediscovers the measured llama.cpp optimum — a large ubatch beats
+The planner independently rediscovers the measured llama.cpp optimum, that a large ubatch beats
 GPU-resident experts, because misses per token scale as `1/ubatch` while GPU residency only helps
-decode — and then goes one step further by weighting decode, which moves the choice to 6 GPU layers
+decode, and then goes one step further by weighting decode, which moves the choice to 6 GPU layers
 at ubatch 1024 (215.8 t/s prefill, 13.5 t/s decode).
 
 For reference, measured llama.cpp on this box: 45-86 t/s prefill steady state, 11-14 t/s decode,
@@ -113,7 +113,7 @@ For reference, measured llama.cpp on this box: 45-86 t/s prefill steady state, 1
 
 ## 6. amp vs llama-server, head to head
 
-`scripts/head2head.sh` — identical prompt (52,713 bytes = 18,265 tokens), identical quant, identical
+`scripts/head2head.sh`: identical prompt (52,713 bytes = 18,265 tokens), identical quant, identical
 box, page cache warmed first so both engines start from the same state. llama-server runs the best
 config from `../RUN.md` (`-ncmoe 38 -ub 2048`); amp uses the planner's choice (6 expert layers on the
 GPU, ubatch 1024).
@@ -128,7 +128,7 @@ expert set page-cache resident and 45-86 t/s in the steady state the user actual
 
 ### What actually produces the win
 
-Not the prefetcher, at least not for prefill — the *plan*. Putting 6 expert layers on the GPU instead
+Not the prefetcher, at least not for prefill, but the *plan*. Putting 6 expert layers on the GPU instead
 of 2 shrinks the CPU-resident expert set from 11.54 GiB to 10.25 GiB, which is the difference between
 a working set that thrashes a 9-11 GiB cache and one that mostly fits. The prefetcher then covers the
 remainder.
@@ -163,7 +163,7 @@ Interpretation:
 * Moving expert weights between CPU and GPU shifts tail logprobs by up to ~0.5 and does not change
   the output. llama.cpp has exactly the same property between its own `-ngl` values, so this is
   floating-point non-associativity, not a difference in what is computed.
-* The single cross-engine argmax flip happens at a position where the top-1/top-2 gap is 0.37 — inside
+* The single cross-engine argmax flip happens at a position where the top-1/top-2 gap is 0.37, inside
   the same drift band. The second "flip" (position 23) is meaningless because the contexts had already
   diverged at 22.
 
@@ -189,14 +189,14 @@ Protocol traps found while building this, all of which first looked like numeric
    fits and decode is compute-bound (~1.79 ms per CPU layer predicts 13-16 t/s, measured 25-30 t/s,
    so the model is conservative). The interesting case is the *overflow* regime: 2.8 t/s at 357 ms per
    token is ~12,600 page faults serialising. Prefetching the 8 active experts per layer needs router
-   output, which the llama.h path does not expose — that argues for amp building its own graph (M3b)
+   output, which the llama.h path does not expose. That argues for amp building its own graph (M3b)
    rather than driving llama.h.
 4. **Prefill regression to 104 t/s** in the head-to-head versus 166-170 t/s measured earlier for the
    same config. The difference is page-cache state: after warming 12.19 GiB only ~4.5 GiB stayed
    resident because other processes hold ~4 GiB, so the head-to-head was run in a partially cold
    state. Needs a controlled cold/warm matrix before quoting either number.
 
-## 2026-09-26 — the server, and what the planner had to be corrected about
+## 2026-09-26: the server, and what the planner had to be corrected about
 
 Reproduce with:
 
@@ -232,7 +232,7 @@ Two other things worth knowing, both measured today:
 
 - `--gpu-layers 6` at 200k context does not work, and the failure is not graceful:
   `llama_init_from_model` fails to allocate a 782 MB compute buffer, and the over-budget fallback then
-  serves requests with 178 MiB of VRAM free. The arithmetic says so beforehand — 200k of KV is
+  serves requests with 178 MiB of VRAM free. The arithmetic says so beforehand, because 200k of KV is
   1.55 GiB, dense weights 1.45 GiB, 6 expert layers 1.93 GiB, which leaves under 0.9 GiB for compute.
   g=4 is the most that fits, and that is what the planner now picks.
 - The first request is worth its own optimisation pass (it is 3x slower than steady state). The warm
@@ -249,7 +249,7 @@ prompt with the same cache state: **35.25 t/s is 7.4x that.**
    compute buffer is an estimate. The factor now applies to the compute estimate alone, and the total
    must fit. Effect: the runtime's VRAM backoff stopped halving the ubatch three times
    (1024 → 512 → 256 → 128) and the server comes up at ubatch 1024.
-2. **The CUDA context's own cost was unmodelled** — 450 MiB, measured as the gap between the estimate
+2. **The CUDA context's own cost was unmodelled**, at 450 MiB measured as the gap between the estimate
    and the 119 MiB the driver reported free after init at 200k context. Now in the fixed cost.
 3. **The decode cliff could never fire.** The planning budget was the theoretical page cache
    (RAM − OS reserve ≈ 12.9 GiB), so every candidate looked fully resident, including the ones that
@@ -259,7 +259,7 @@ prompt with the same cache state: **35.25 t/s is 7.4x that.**
 4. **The ubatch backoff stopped at its floor while VRAM was still over budget**, accepting a context
    with 119 MiB free. It now says so explicitly and names the flags that would fix it.
 
-## 2026-09-26 — serving correctness, measured
+## 2026-09-26: serving correctness, measured
 
 Reproduce: `./scripts/build.sh`, start `amp-server`, then `python3 scripts/parity_test.py --url ...`
 (sections 6b, 6c and 7 below are the regressions; they are now sections 12, 14 and 15 of
@@ -295,7 +295,7 @@ failed with `prefill batch full at token 2048` and a 500. After splitting in `n_
 | `/v1/completions`, 4000-word prompt | 4001 | 807 t/s prefill |
 | `/v1/chat/completions`, 4000-word history | 4010 | 825 t/s prefill |
 
-(The rate is high because the prompt is one repeated word — almost no real compute. The number that
+(The rate is high because the prompt is one repeated word, so almost no real compute. The number that
 matters here is that 4000+ tokens complete at all.)
 
 ### Reasoning split, and the thinking budget
@@ -313,7 +313,7 @@ Two findings:
 - **The split must start "inside" the block.** The template's generation prompt ends with `<think>\n`,
   so the model never emits the opening tag and a tag-triggered split never fires. That is how a
   conversation title came back as *"The user said \"hi\". This is a short, conversational greeting.
-  According to the rules, I should cr..."* — a chain of thought delivered as the answer.
+  According to the rules, I should cr..."*, a chain of thought delivered as the answer.
 - **The closing tag arrives with variable whitespace**: `\n</think>` naturally, `</think>` when the
   budget forces it. Matching only the exact string silently puts the answer in `reasoning_content`.
 
@@ -337,7 +337,7 @@ ubatch 1024, 10.90 GiB warmed in 3.7 s):
 Against the `llama-server` baseline's 4.76 t/s on the same prompt and cache state, that is **7.4x**.
 Report a sequence, never a single request.
 
-## 2026-09-26 — quality baseline: the measurement noise floor is exactly zero
+## 2026-09-26: quality baseline: the measurement noise floor is exactly zero
 
 Before the server swap can be claimed lossless, two things have to be true: there must be a
 reference to compare against, and the *measurement itself* must have a known noise floor.
@@ -365,7 +365,7 @@ Comparing the two runs of the **same** server with the **same** flags:
 
 **The noise floor is exactly zero, not "small".** llama.cpp at `temperature 0` is bit-identical
 run to run through the HTTP API, on this model, with this quant. So the acceptance threshold for
-the post-swap capture is not "below some tolerance" — it is *exactly zero*, and any deviation is
+the post-swap capture is not "below some tolerance" but *exactly zero*, and any deviation is
 a real finding rather than jitter. This is a stronger and cheaper test than a statistical one.
 
 `min` captured mass is 0.935363 at one position: a flatter-than-usual distribution where the top 32
@@ -375,12 +375,12 @@ over the joint support, but it is why the tool reports captured mass rather than
 ### The pre-swap server cannot be captured this way
 
 The hand-rolled `amp-server` set `logprobs` to `null` unconditionally
-(`src/server/openai_api.cpp:516`) — it never implemented `n_probs` at all. So a KL reference from
+(`src/server/openai_api.cpp:516`), because it never implemented `n_probs` at all. So a KL reference from
 the engine being replaced is not obtainable over HTTP, and that capability is one of the things
 the swap gains. The pre-swap engine's own quality evidence remains the top-5 logprob parity in
 `scripts/parity.py` and the determinism result in the table above.
 
-## 2026-09-26 — the server swap is bit-identical (KL = 0)
+## 2026-09-26: the server swap is bit-identical (KL = 0)
 
 The hard constraint is zero quality loss, so the swap had to be *proven*, not asserted. Same
 `kl_parity.py` protocol as the noise-floor section above: 512 greedy tokens, `n_probs=32`, no
@@ -396,7 +396,7 @@ Three captures:
 
 ### Matched placement: exactly zero
 
-`llama-matched` vs `amp-post-swap` — same placement, same ctx, same ubatch, same KV dtypes, so the
+`llama-matched` vs `amp-post-swap`: same placement, same ctx, same ubatch, same KV dtypes, so the
 only variable is the server:
 
 | metric | value |
@@ -408,7 +408,7 @@ only variable is the server:
 | max abs Δ logprob on shared tokens | **0.000000e+00** |
 | captured mass, both sides | mean 0.998339, min 0.906032 (identical) |
 
-**Not "within tolerance" — exactly zero.** Replacing 2,200 lines of hand-rolled server with
+**Not "within tolerance", exactly zero.** Replacing 2,200 lines of hand-rolled server with
 llama.cpp's changed nothing about the arithmetic, which is the expected result given the same
 kernels, weights and sampler, and is now measured rather than argued.
 
@@ -427,7 +427,7 @@ It is not a regression. Inspecting the captures position by position:
 
 - the **first 10 tokens are identical**, and position 0's top-1 logprob differs by **0.012**
   (−0.1196 vs −0.1316)
-- the sequences agree early and diverge later — 58/512 over the full run
+- the sequences agree early and diverge later, 58/512 over the full run
 
 That is butterfly amplification from a 0.012 numerical difference caused by a different CPU/GPU
 split of the experts changing summation order. Once one near-tie flips, the contexts differ and
@@ -435,14 +435,14 @@ every subsequent position is a different question. The 11 % figure measures *pla
 `AGENT.md` already characterised as shifting tail logprobs by up to ~0.5; it says nothing about the
 swap.
 
-**Method rule this establishes:** a KL comparison between two engines is only meaningful when
+The method rule this establishes is that a KL comparison between two engines is only meaningful when
 placement is held fixed. amp's preflight *chooses* placement for speed, so "amp vs llama-server with
 llama.cpp's default layout" is guaranteed to diverge and is not a quality test. Match the layout
 first, then compare. The 0.012 at position 0 is also the right order of magnitude for placement
 drift, which is a useful sanity check that the two captures differ for the stated reason and no
 other.
 
-## 2026-09-26 — post-swap benchmark: the 7.4x decode claim does not reproduce
+## 2026-09-26: post-swap benchmark: the 7.4x decode claim does not reproduce
 
 The goal was explicit about this: re-measure decode on the new server rather than assume the
 previously recorded 35.25 t/s carried over. It does not, and neither does the 7.4x.
@@ -458,7 +458,7 @@ Rates are the server's own `timings` object.
 
 ### The correction
 
-**At steady state the two engines are the same, within noise** — amp 28.39 t/s vs llama-server
+**At steady state the two engines are the same, within noise.** Amp 28.39 t/s vs llama-server
 30.05 t/s, and llama-server is if anything ~6 % ahead on this particular run. The previously
 recorded "35.25 t/s vs 4.76 t/s = 7.4x" compared **amp's warm state against llama-server's cold
 one**. That is precisely the mistake this file's own methodology section warns against, and it
@@ -472,7 +472,7 @@ Not raw steady-state decode. **Graceful degradation, and a working set that fits
 `llama-server`'s documented best config puts ~11.5 GiB of expert weights on the CPU, which does
 not fit the ~10.9 GiB the page cache can actually hold, so it thrashes: **1.96 t/s** on its first
 request, then recovers once the OS has pulled the set in. amp's plan keeps the CPU expert set at
-10.90 GiB, inside the budget, and never collapses — 26.01 t/s on its very first request, then
+10.90 GiB, inside the budget, and never collapses: 26.01 t/s on its very first request, then
 28-29 t/s.
 
 That difference is worth having: a cold or contended cache costs llama-server 15x on the first
@@ -502,7 +502,7 @@ Both were invisible until the plan was run at 200k and compared against `amp-pla
    actually be in effect, using the same user-intent test as the rule that applies them.
 
 Both bugs made the plan *pessimistic*, so they cost performance without ever causing a wrong
-answer — which is the dangerous class of bug, because nothing fails loudly.
+answer, which is the dangerous class of bug because nothing fails loudly.
 
 ### Concurrency: llama-server's 4 default slots cost 44x on this model
 
@@ -518,8 +518,8 @@ Every concurrent generation wants the same shared ~10.9 GiB CPU expert working s
 with ~10.9 GiB of usable page cache that is not sharing, it is thrashing. Decode fell from 28.4 t/s
 to **0.64 t/s**, a 44x collapse, and prefill from 45 t/s to 19 t/s.
 
-This is not a corner case. An agentic client has two requests open *by design* — OpenCode asks for a
-conversation title while the main answer is streaming — so the default is a guaranteed slowdown for
+This is not a corner case. An agentic client has two requests open *by design*: OpenCode asks for a
+conversation title while the main answer streams. So the default is a guaranteed slowdown for
 exactly the workload this server exists for. The deleted hand-rolled server serialised generations
 for this reason; llama.cpp's server does not.
 
@@ -536,7 +536,7 @@ test, after:
 Requests now take turns instead of interfering, which is what `--parallel 1` has always meant.
 `--parallel N` still works for anyone who wants the batching and accepts the memory cost.
 
-## 2026-09-27 — acceptance: the real OpenCode client, 3 tool-using prompts
+## 2026-09-27: acceptance: the real OpenCode client, 3 tool-using prompts
 
 `scripts/harness/run.sh` drives the installed `opencode` CLI (`opencode run --auto --format json`)
 against the running server, in a pristine copy of a small fixture project, three times.
@@ -550,8 +550,8 @@ against the running server, in a pristine copy of a small fixture project, three
 `exit 0` only means the client process succeeded, so the transcripts were read to confirm the model
 actually did the work:
 
-- **02** ran the suite three times (before, after, verify) and made exactly one edit — removing the
-  `/ 100` from `total_value_cents` — then reported all four tests passing. That is the correct
+- **02** ran the suite three times (before, after, verify) and made exactly one edit, removing the
+  `/ 100` from `total_value_cents`, then reported all four tests passing. That is the correct
   diagnosis and the minimal fix; it did not change the test to make it pass, which the prompt
   explicitly warned against.
 - **03** made three edits (the new function reusing the existing `low_stock` helper, its import,
@@ -584,7 +584,7 @@ Same question ("What is 2+2? Answer with just the number."), thinking on, `max_t
 | 16 | 20 | `4` | 1, clean |
 | 8 | 12 | `4` | 2 clean, **1 returned `4\n</think>\n\n4`** |
 
-So the mechanism works and is effective — 100 tokens down to 12 — but a **very** tight budget is
+So the mechanism works and is effective, 100 tokens down to 12, but a **very** tight budget is
 genuinely risky: at 8 tokens, one sample in three came back with a visibly doubled answer. The
 severe looping described in earlier notes (`2+2 = 4. </think> 2+2 = 4. </think> ...`) was measured on
 the deleted hand-rolled server's sampling path and did **not** reproduce here; 4 of 4 samples at
@@ -592,13 +592,13 @@ the deleted hand-rolled server's sampling path and did **not** reproduce here; 4
 
 **Decision: it stays opt-in, off by default.** Not because it is broken, but because forcing a close
 mid-thought alters generation for every request that sets it, and at tight budgets it can visibly
-degrade the answer. `enable_thinking: false` remains the supported way to get a direct answer — it is
+degrade the answer. `enable_thinking: false` remains the supported way to get a direct answer. It is
 free of that risk because the template pre-closes the block instead of the sampler forcing it.
 
-## 2026-09-27 — where decode is *not* bound: expert placement is worth 3.4%
+## 2026-09-27: where decode is *not* bound: expert placement is worth 3.4%
 
-`README.md` and `AGENT.md` have carried M3c — amp's own ggml graph, so the router is observable
-and the 8 active experts per layer can be prefetched during decode — as "the only remaining decode
+`README.md` and `AGENT.md` have carried M3c, amp's own ggml graph so the router is observable
+and the 8 active experts per layer can be prefetched during decode, as "the only remaining decode
 win" for months. Its thesis is that decode is bound by **CPU memory latency** on the expert reads.
 That is testable without writing a graph: if it is true, moving expert layers from the CPU to the
 GPU should help substantially, because VRAM is both faster and lower-latency than RAM.
@@ -618,7 +618,7 @@ working set by 1.3 GiB, so this is not placement-neutral in either direction.
 
 **What this does and does not say.** It is a bound, not a proof: if decode were dominated by the CPU
 expert-memory path, g=4 versus g=0 would have shown a large gap, and it shows 3 %. So the CPU memory
-path is not the dominant cost, which substantially lowers the expected value of M3c — prefetching
+path is not the dominant cost, which substantially lowers the expected value of M3c. Prefetching
 hides the latency of a path that is not where the time goes. It does not prove prefetch is worthless
 (latency inside the CPU path could still matter), and it says nothing about a better *kernel
 schedule*, which M3c would also allow. But building a graph on the strength of a hypothesis this
@@ -626,7 +626,7 @@ size would be betting on an unmeasured guess, and the honest next step is a per-
 before any of it.
 
 It also fixes the VRAM ceiling with a measurement rather than an estimate: **g=4 is the maximum at
-200k context** — g=8 does not fit. That matches the planner's choice and `AGENT.md`'s earlier note.
+200k context**, because g=8 does not fit. That matches the planner's choice and `AGENT.md`'s earlier note.
 
 ### The page cache cannot hold the CPU expert set
 
@@ -670,7 +670,7 @@ alternating on one machine rather than quoted from two different days. It also e
 project came to believe both "35.25 t/s" and "28.39 t/s" at different times without either being a
 lie: they are different cache states. Neither is a speedup over llama-server.
 
-## 2026-09-27 — every quality-neutral decode lever, exhausted
+## 2026-09-27: every quality-neutral decode lever, exhausted
 
 Follow-up to the placement result above. The remaining levers were parallelism, prefetching, and
 speculation. All three were measured; prefetching is recorded below in full.
@@ -982,7 +982,7 @@ so 6 GB caps this at g=4 to g=5. The remaining honest trade is context length ag
 that is worth it depends on how often you re-prefill, and for a cached agentic loop the answer is
 usually no, because steady-state turns are decode-bound.
 
-## 2026-09-27 — prefill-first retune: q8_0/q8_0 KV and no RAM prompt cache
+## 2026-09-27: prefill-first retune: q8_0/q8_0 KV and no RAM prompt cache
 
 The objective: maximise prompt processing, keep decode above 15 t/s (aim 20+), switch the KV cache
 to q8_0/q8_0, land it all at 200k context, and lose no quality.
@@ -1028,7 +1028,7 @@ It costs nothing in agentic terms, which is what the previous note assumed rathe
 against 10.0 s at 512, still 6/6 cache hits and 0 full re-prefills. Prefix reuse comes from the
 slot's own KV, not from this RAM cache.
 
-**Unresolved:** the old configuration (`-ctv q4_0 -cram 512`) measured 205.1 and 229.7 t/s in a
+Still unexplained: the old configuration (`-ctv q4_0 -cram 512`) measured 205.1 and 229.7 t/s in a
 back-to-back head-to-head, which is far above the 77.9-85.0 t/s that `-cram 512` gives with
 q8_0/q8_0. The only difference is the V dtype, which should not move prefill by 2.5x, and that arm
 also got g=4 where the q8_0 arm got g=3 - the wrong direction to explain it. Recorded as a loose

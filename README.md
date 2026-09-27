@@ -18,8 +18,8 @@ argv ──► common_params_parse ──► apply_preflight ──► llama_ser
 ## Why this model needs a plan
 
 The expert working set is 12.19 GiB (256 experts/layer, 8 active) and has to be cyclically re-read
-for every ubatch, competing against a ~10.9 GiB page cache on a 6 GB card. The arithmetic is cheap —
-~240 t/s prefill when the weights are resident — so the *memory system* is the product. Where the
+for every ubatch, competing against a ~10.9 GiB page cache on a 6 GB card. The arithmetic is cheap,
+around 240 t/s prefill with the weights resident, so the *memory system* is the product. Where the
 experts live is worth 44x on decode under concurrency and 15x on a cold cache, and that is
 expressible through public API (`tensor_buft_overrides`, the same mechanism as `-ncmoe`), so it
 belongs in a preflight rather than a hand-written inference loop.

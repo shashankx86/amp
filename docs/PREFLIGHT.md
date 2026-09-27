@@ -41,7 +41,7 @@ All citations are to the vendored llama.cpp at `third_party/llama.cpp` (git `1ab
 | 14 | `routes.update_meta`, `ctx_http.is_ready = true` | `server.cpp:482-483` | first request can be served |
 | 15 | `ctx_server.start_loop()` | `server.cpp:542` | blocks |
 
-**Where the warm goes (section 6):** the warm must be **after the plan** (it warms
+The warm must go **after the plan** (section 6) (it warms
 `plan.resident`) and its effect must survive the load. Because step 12 fault-in would evict a
 pre-load warm, the warm either (a) is skipped by default, or (b) opts in with
 `lazy_mode = ON` so step 12 does not populate. Both are implemented inside `apply_preflight`
@@ -68,7 +68,7 @@ this tree; `cparams.warmup` is forced `false` at `src/llama-context.cpp:123`; th
 if it ran, would load the model a **second** time with `no_alloc` (`common/fit.cpp:56-60`,
 reached from `common/common.cpp:1320`). Disabling the fit (Rule 2) removes that second read.
 
-**Consequence for the warm:** a warm *before* the load cannot leave the hot set more
+So a warm placed *before* the load cannot leave the hot set any more
 resident than the load's own tail-heavy eviction allows, because the sequential populate evicts the
 file front (where the hot set lives), so a pre-load warm front-loads I/O but leaves a
 *deeper* cold spot than not warming. Hence the default is **no warm**; `opts.warm` opts into
@@ -78,7 +78,7 @@ the old amp-warm behavior with `lazy_mode = ON` to protect it.
 
 ## 3. Field table: who sets it, how we detect user intent, default when unset
 
-**The core problem:** llama.cpp's parser keeps **no** record of which args were supplied.
+The core problem is that llama.cpp's parser keeps **no** record of which args were supplied.
 `seen_args` (`common/arg.cpp:814`) is local to `parse_cli_args` and discarded on return.
 Most fields have no surviving unset sentinel: `postprocess_cpu_params` resolves
 `n_threads < 0` *during* the parse (`common/common.cpp:291-298`), and `n_batch`/`n_ubatch`/
@@ -142,7 +142,7 @@ first time. `-ctk`/`-ctv` are the reachable mappings for `type_k`/`type_v`
 
 ## 4. The `tensor_buft_overrides` padding and segfault question, definitive answer
 
-**Claim:** the preflight can safely write overrides into `params.tensor_buft_overrides`
+The claim being defended here is that the preflight can safely write overrides into `params.tensor_buft_overrides`
 because llama.cpp has *already padded the buffer* by the time the preflight runs.
 
 **Call order (all inside step 2):**
@@ -173,7 +173,7 @@ overrides into slots `[0, k)` and keeps slot `k` and beyond null (`write_expert_
   missing sentinel reads past the array end: segfault, or silent garbage (a regex built from
   a wild pointer). This is the failure mode AGENT.md:214-215 records.
 
-**Pattern lifetime:** the override patterns are `const char *` into strings that must
+Pattern lifetime matters because the override patterns are `const char *` into strings that must
 outlive the load. The preflight keeps them in a function-local `static std::list<std::string>`
 , the same technique llama.cpp's own `llm_add_n_cpu_ffn_overrides` uses
 (`common/common.h:1147-1154`); `std::list` never moves existing nodes, so the `c_str()`
@@ -190,7 +190,7 @@ assigns layers/devices back-to-front (`fit.cpp:488-876`), writing `n_gpu_layers`
 `tensor_split` and `tensor_buft_overrides` as it goes. Its target is "leave `fit_params_target`
 (default 1 GiB, `common.h:481`) free per device".
 
-**When it runs:** inside `common_init_result`'s constructor (`common/common.cpp:1295-1327`),
+This runs inside `common_init_result`'s constructor (`common/common.cpp:1295-1327`),
 i.e. **after** our preflight (step 3) and **before** `llama_model_load_from_file`
 (`common.cpp:1329`). It receives `params.tensor_buft_overrides.data()` as a writable
 4096-entry buffer (`common.cpp:1322`), the second consumer that depends on the arg.cpp
@@ -208,7 +208,7 @@ padding.
    re-fill the GPU to leave 1 GiB free, the opposite of the planner's 6-8-expert-layer
    choice. And it would reduce `n_ctx` if the user left it at 0 (`fit.cpp:393-457`).
 
-**Resolution:** the preflight sets `fit_params = false` (Rule 2) unless the user explicitly
+The resolution is that the preflight sets `fit_params = false` (Rule 2) unless the user explicitly
 passed `-fit on` (full no-op, section 3). This is not overriding an explicit choice,
 `fit_params` defaults to `true` (`common.h:476`) and the user did not ask for it. Setting
 `n_ctx` explicitly (Rule 3) additionally protects the context from reduction
@@ -234,7 +234,7 @@ behaviour: the process still never dies from a too-large ubatch, because the pla
 *rejects* candidates that do not fit (`memory_plan.cpp:209-216`) and picks the largest that
 does.
 
-**Tradeoff (be explicit about it):** the old loop measured *actual* free VRAM after init;
+The tradeoff is worth stating: the old loop measured *actual* free VRAM after init,
 the analytic path estimates it. If the estimate is wrong by more than the safety margin,
 `llama_init_from_model` returns `NULL` and llama-server exits with a clear
 `failed to create context` (`common/common.cpp:1398-1402`) instead of backing off. The
@@ -316,7 +316,7 @@ WILLNEED load path (`llama-model.cpp:1748`, `llama-mmap.cpp:475-507`), the serve
 kv_unified/n_parallel forcing (`server.cpp:156-161`), the context param clamps
 (`llama-context.cpp:246-248`), and the absence of a warmup inference and of `llama_model_warmup`.
 
-**Assumed / not yet measured:** that the planner's `vram_bytes` matches reality within the
+Assumed but not yet measured: that the planner's `vram_bytes` matches reality within the
 0.92 margin on the first run (section 6 tradeoff); the exact LRU behaviour under `MAP_POPULATE`
 (section 8); and that `opts.warm`'s one-time ~5 s tail upload is acceptable. All three are
 empirical and should be measured when the module is first compiled and run.

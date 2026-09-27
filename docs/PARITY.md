@@ -1,4 +1,4 @@
-# PARITY.md — llama.cpp server functional parity contract
+# PARITY.md, llama.cpp server functional parity contract
 
 This document defines what "100% functional parity with llama.cpp's server" means for
 `amp-server`. It is written so that `scripts/parity_test.py` (or any automated smoke
@@ -36,23 +36,23 @@ route requires the API key (if `--api-key` is set) and is gated by the
 | GET | `/models`, `/v1/models` | `get_models` (`server-context.cpp:5072`) | — | models JSON (§3.11) | no | Served from cache while sleeping. |
 | POST | `/completion` (legacy), `/completions` (legacy), `/v1/completions` | `post_completions` / `post_completions_oai` (`server-context.cpp:4906-4928`) | completion body (§2.2) | completion JSON (§3.4) | no | `/completion`+`/completions` return llama-native format; `/v1/completions` returns OAI `text_completion`. |
 | POST | `/chat/completions` (legacy), `/v1/chat/completions` | `post_chat_completions` (`server-context.cpp:4930`) | chat body (§2.1) | chat JSON (§3.1–3.3) | no | Both paths are identical. |
-| POST | `/v1/chat/completions/control` | `post_control` (`server-context.cpp:4950`) | `{"id":"<cmpl_id>","action":"reasoning_end"}` | `{"success":bool,"message"?:str}` | no | Only `action="reasoning_end"` is accepted; anything else → 400 `unknown control action`. Requires the original request to have set `reasoning_control:true`; else `{"success":false,"message":"reasoning control not enabled for this completion"}`. |
+| POST | `/v1/chat/completions/control` | `post_control` (`server-context.cpp:4950`) | `{"id":"<cmpl_id>","action":"reasoning_end"}` | `{"success":bool,"message"?:str}` | no | Only `action="reasoning_end"` is accepted; anything else -> 400 `unknown control action`. Requires the original request to have set `reasoning_control:true`; else `{"success":false,"message":"reasoning control not enabled for this completion"}`. |
 | POST | `/v1/responses`, `/responses` | `post_responses_oai` (`server-context.cpp:4987`) | Responses API body, converted to chat (`server-chat.cpp:6`) | Responses JSON (§3.5) | no | `previous_response_id` is rejected (`server-chat.cpp:10-12`). |
 | POST | `/v1/audio/transcriptions`, `/audio/transcriptions` | `post_transcriptions_oai` (`server-context.cpp:5009`) | multipart or JSON with `file` | `{"type":"transcript.text.done","text":...,"usage":{...}}` | no | **Requires mtmd + audio**; else 501 `The current model does not support audio input.` |
 | POST | `/v1/messages` | `post_anthropic_messages` (`server-context.cpp:5037`) | Anthropic Messages body, converted (`server-chat.cpp:348`) | Anthropic JSON (§3.6) | no | |
 | POST | `/infill` | `post_infill` (`server-context.cpp:4828`) | `{"input_prefix":str,"input_suffix":str,"prompt"?:str,"input_extra"?:[{text,filename?}]}` | llama-native completion JSON | no | Requires FIM tokens in vocab; else 501 `Infill is not supported by this model: ...`. |
-| POST | `/embedding` (legacy), `/embeddings` (legacy), `/v1/embeddings` | `post_embeddings` / `post_embeddings_oai` (`server-context.cpp:5139-5145`) | `{"input":str|array,"encoding_format"?:"float"|"base64"}` | embeddings JSON (§3.7) | no | Requires `--embeddings`; else 501. `/v1/embeddings` with pooling `none` → 400 `Pooling type 'none' is not OAI compatible`. |
-| POST | `/rerank` (legacy), `/reranking` (legacy), `/v1/rerank`, `/v1/reranking` | `post_rerank` (`server-context.cpp:5147`) | `{"query":str,"documents"|"texts":[str],"top_n"?:int,"return_text"?:bool}` | rerank JSON (§3.8) | no | Requires `--reranking`; else 501. `texts` key → TEI format; `documents` → Jina format. |
+| POST | `/embedding` (legacy), `/embeddings` (legacy), `/v1/embeddings` | `post_embeddings` / `post_embeddings_oai` (`server-context.cpp:5139-5145`) | `{"input":str|array,"encoding_format"?:"float"|"base64"}` | embeddings JSON (§3.7) | no | Requires `--embeddings`; else 501. `/v1/embeddings` with pooling `none` -> 400 `Pooling type 'none' is not OAI compatible`. |
+| POST | `/rerank` (legacy), `/reranking` (legacy), `/v1/rerank`, `/v1/reranking` | `post_rerank` (`server-context.cpp:5147`) | `{"query":str,"documents"|"texts":[str],"top_n"?:int,"return_text"?:bool}` | rerank JSON (§3.8) | no | Requires `--reranking`; else 501. `texts` key -> TEI format; `documents` -> Jina format. |
 | POST | `/tokenize` | `post_tokenize` (`server-context.cpp:5084`) | `{"content":str|array,"add_special"?:bool,"parse_special"?:bool,"with_pieces"?:bool}` | `{"tokens":[...]}` or `{"tokens":[{"id":n,"piece":str\|[bytes]}]}` | no | `with_pieces:true` returns per-token pieces. |
 | POST | `/detokenize` | `post_detokenize` (`server-context.cpp:5125`) | `{"tokens":[int]}` | `{"content":str}` | no | |
 | POST | `/apply-template` | `post_apply_template` (`server-context.cpp:5060`) | chat body (same as `/v1/chat/completions`) | `{"prompt":str}` | no | Renders the template without running inference. |
-| POST | `/chat/completions/input_tokens` (legacy), `/v1/chat/completions/input_tokens` | `post_chat_completions_tok` → `handle_count_tokens` (`server-context.cpp:5488`) | chat body | `{"input_tokens":N,"object":"response.input_tokens"}` | no | |
-| POST | `/responses/input_tokens` (legacy), `/v1/responses/input_tokens` | `post_responses_tok_oai` → `handle_count_tokens` | Responses body | `{"input_tokens":N,"object":"response.input_tokens"}` | no | |
-| POST | `/v1/messages/count_tokens` | `post_anthropic_count_tokens` → `handle_count_tokens` | Anthropic Messages body | `{"input_tokens":N}` | no | No `object` key (Anthropic format). |
+| POST | `/chat/completions/input_tokens` (legacy), `/v1/chat/completions/input_tokens` | `post_chat_completions_tok` -> `handle_count_tokens` (`server-context.cpp:5488`) | chat body | `{"input_tokens":N,"object":"response.input_tokens"}` | no | |
+| POST | `/responses/input_tokens` (legacy), `/v1/responses/input_tokens` | `post_responses_tok_oai` -> `handle_count_tokens` | Responses body | `{"input_tokens":N,"object":"response.input_tokens"}` | no | |
+| POST | `/v1/messages/count_tokens` | `post_anthropic_count_tokens` -> `handle_count_tokens` | Anthropic Messages body | `{"input_tokens":N}` | no | No `object` key (Anthropic format). |
 | GET | `/lora-adapters` | `get_lora_adapters` (`server-context.cpp:5227`) | — | `[{"id":n,"path":str,"scale":f,"task_name":str,"prompt_prefix":str,"alora_invocation_string"?:str,"alora_invocation_tokens"?:[int]}]` | no | |
 | POST | `/lora-adapters` | `post_lora_adapters` (`server-context.cpp:5255`) | `[{"id":n,"scale":f},...]` | `{"success":true}` | no | Body must be an array; else 400 `Request body must be an array`. |
-| GET | `/slots` | `get_slots` (`server-context.cpp:4729`) | query: `fail_on_no_slot` | `[{slot...}]` (§3.12) | no | Requires `--slots`; else 501. `?fail_on_no_slot=1` with 0 idle → 503 `no slot available`. |
-| POST | `/slots/:id_slot` | `post_slots` (`server-context.cpp:4771`) | query: `action=save\|restore\|erase`; body for save/restore: `{"filename":str}` | action-specific JSON (§3.13) | no | Requires `--slot-save-path`; else 501. Invalid slot id → 400 `Invalid slot ID`. Invalid action → 400 `Invalid action`. |
+| GET | `/slots` | `get_slots` (`server-context.cpp:4729`) | query: `fail_on_no_slot` | `[{slot...}]` (§3.12) | no | Requires `--slots`; else 501. `?fail_on_no_slot=1` with 0 idle -> 503 `no slot available`. |
+| POST | `/slots/:id_slot` | `post_slots` (`server-context.cpp:4771`) | query: `action=save\|restore\|erase`; body for save/restore: `{"filename":str}` | action-specific JSON (§3.13) | no | Requires `--slot-save-path`; else 501. Invalid slot id -> 400 `Invalid slot ID`. Invalid action -> 400 `Invalid action`. |
 | GET | `/v1/stream` | `server_stream_make_get_handler` (`server-stream.cpp:454`) | query: `conv_id=str`,`from`=int | `text/event-stream` replay | no | Resumable streaming. 400 if `conv_id` missing or `from` lost; 404 if session gone. |
 | POST | `/v1/streams/lookup` | `server_stream_make_lookup_handler` (`server-stream.cpp:503`) | `{"conversation_ids":[str]}` | `[{"conversation_id":str,"is_done":bool,"total_bytes":n,"started_at":n,"completed_at":n}]` | no | Matches exact id and `<id>::<model>` prefixes. |
 | DELETE | `/v1/stream` | `server_stream_make_delete_handler` (`server-stream.cpp:561`) | query: `conv_id=str` | 204 empty | no | Idempotent. |
@@ -69,7 +69,7 @@ route requires the API key (if `--api-key` is set) and is gated by the
 `GET <AIP_HEALTH_ROUTE>`. The predict route dispatches on a `@requestFormat` field
 (`server-http.cpp:823-922`). This is env-var activated, not a normal flag.
 
-**Unknown routes** return 404 with `{"error":{"message":"File Not Found","type":"not_found_error","code":404}}`
+Unknown routes return 404 with `{"error":{"message":"File Not Found","type":"not_found_error","code":404}}`
 (`server-http.cpp:199-213`).
 
 ---
@@ -92,13 +92,13 @@ Parsed by `oaicompat_chat_params_parse` (`server-common.cpp:1151-1427`) then
 | `add_generation_prompt` | bool | `true` | `inputs.add_generation_prompt` (`server-common.cpp:1298`) | |
 | `continue_final_message` | bool | `false` | `inputs.continue_final_message` (`server-common.cpp:1299-1301`) | Mutually exclusive with `add_generation_prompt` (`server-common.cpp:1310-1312`). |
 | `reasoning_format` | string | CLI `--reasoning-format` (default `deepseek`) | `inputs.reasoning_format` (`server-common.cpp:1320-1322`) | One of `none`,`auto`,`deepseek`,`deepseek-legacy`; else runtime error (`chat.cpp:889-903`). |
-| `chat_template_kwargs` | object | CLI `--chat-template-kwargs` | `inputs.chat_template_kwargs` (`server-common.cpp:1332-1336`) | Merged over CLI defaults. `enable_thinking` must be unquoted `true`/`false`; quoted string → 400 (`server-common.cpp:1339-1346`). |
+| `chat_template_kwargs` | object | CLI `--chat-template-kwargs` | `inputs.chat_template_kwargs` (`server-common.cpp:1332-1336`) | Merged over CLI defaults. `enable_thinking` must be unquoted `true`/`false`; quoted string -> 400 (`server-common.cpp:1339-1346`). |
 | `reasoning_effort` | string | — | `inputs.enable_thinking` / `chat_template_kwargs` (`server-common.cpp:1349-1357`) | `"none"` disables thinking; other values stored as `reasoning_effort` kwarg. |
 | `reasoning_budget_tokens` / `thinking_budget_tokens` | int | CLI `--reasoning-budget` (default `-1`) | `llama_params["reasoning_budget_tokens"]` (`server-common.cpp:1390-1394`) | Only active when template has thinking end tags (`server-common.cpp:1396`). |
 | `reasoning_budget_message` | string | CLI `--reasoning-budget-message` | `llama_params["reasoning_budget_message"]` (`server-common.cpp:1400`) | |
 | `reasoning_control` | bool | `false` | `llama_params["reasoning_control"]` (`server-common.cpp:1401`) | Enables runtime reasoning-end via `/v1/chat/completions/control`. |
-| `response_format` | object | — | `json_schema` (`server-common.cpp:1186-1199`) | `type:"json_object"` → `response_format.schema`; `type:"json_schema"` → `response_format.json_schema.schema`; `type:"text"` or absent → no constraint; other → 400. |
-| `json_schema` | object\|string | — | `inputs.json_schema` (`server-common.cpp:1294`) | Empty object `{}` → `{"type":"object"}` (`server-common.cpp:1202-1204`). Mutually exclusive with `grammar` (`server-common.cpp:1181-1183`). |
+| `response_format` | object | — | `json_schema` (`server-common.cpp:1186-1199`) | `type:"json_object"` -> `response_format.schema`; `type:"json_schema"` -> `response_format.json_schema.schema`; `type:"text"` or absent -> no constraint; other -> 400. |
+| `json_schema` | object\|string | — | `inputs.json_schema` (`server-common.cpp:1294`) | Empty object `{}` -> `{"type":"object"}` (`server-common.cpp:1202-1204`). Mutually exclusive with `grammar` (`server-common.cpp:1181-1183`). |
 | `grammar` | string | `""` | `inputs.grammar` (`server-common.cpp:1295`) | |
 | `logprobs` | bool | `false` | `llama_params["n_probs"]` (`server-common.cpp:1407-1411`) | Value = `top_logprobs` (default 20). Rejected with tools+stream (`server-common.cpp:1408-1410`). |
 | `top_logprobs` | int\|null | — | — | Requires `logprobs:true`; else 400 (`server-common.cpp:1412-1414`). |
@@ -118,7 +118,7 @@ Parsed by `oaicompat_chat_params_parse` (`server-common.cpp:1151-1427`) then
 | `name` | string | `msg.tool_name` | (`chat.cpp:456-458`). |
 
 **Note:** `reasoning_text` and `reasoning` are **not** accepted as input message fields
-by `common_chat_msgs_parse_oaicompat` — only `reasoning_content`. (The response side
+by `common_chat_msgs_parse_oaicompat`, only `reasoning_content`. (The response side
 emits `reasoning_content`; see §3.1.)
 
 **Passthrough fields.** Any field not listed above is copied verbatim into
@@ -139,9 +139,9 @@ Parsed by `oaicompat_completion_params_parse` (`server-common.cpp:1036-1072`) th
 
 | Field | Type | Default | Lands in | Notes |
 |---|---|---|---|---|
-| `prompt` | string\|array\|mixed | **required** | `llama_params["prompt"]` | Missing → runtime error `"prompt" is required` (`server-common.cpp:1039-1041`). |
+| `prompt` | string\|array\|mixed | **required** | `llama_params["prompt"]` | Missing -> runtime error `"prompt" is required` (`server-common.cpp:1039-1041`). |
 | `stop` | string\|array | `[]` | `llama_params["stop"]` | String wrapped in array (`server-common.cpp:1044-1048`). |
-| `echo` | bool | `false` | — | `true` → runtime error `Only no echo is supported` (`server-common.cpp:1051-1053`). |
+| `echo` | bool | `false` | — | `true` -> runtime error `Only no echo is supported` (`server-common.cpp:1051-1053`). |
 | `best_of` | — | — | — | **Rejected**: `Unsupported param: best_of` (`server-common.cpp:1056-1061`). |
 | `suffix` | — | — | — | **Rejected**: `Unsupported param: suffix` (`server-common.cpp:1056-1061`). |
 | `n_predict` | int | CLI `--predict` | `task_params.n_predict` | Overrides `max_tokens` if both present (`server-common.cpp:1065-1068`). |
@@ -249,9 +249,9 @@ All shapes below are the exact JSON keys emitted by the cited `to_json_*` functi
 `content` is `""` when empty (`chat.cpp:230-232`); `reasoning_content` omitted when empty (`chat.cpp:233-235`).
 
 `finish_reason` (`server-task.cpp:415-425`):
-- `"stop"` — stopped by EOS or stop word, no tool calls.
-- `"tool_calls"` — stopped by EOS or stop word, with tool calls.
-- `"length"` — hit `n_predict` limit or context limit.
+- `"stop"`: stopped by EOS or stop word, no tool calls.
+- `"tool_calls"`: stopped by EOS or stop word, with tool calls.
+- `"length"`: hit `n_predict` limit or context limit.
 
 Optional: `logprobs` (if `n_probs>0`), `timings` (if stats set), `__verbose` (if `verbose`).
 
@@ -377,7 +377,7 @@ Gauges: `prompt_tokens_seconds`, `predicted_tokens_seconds`, `requests_processin
 All errors are `{"error":{"code":int,"message":str,"type":str}}`
 (`format_error_response`, `server-common.cpp:36-78`).
 
-### 4.2 `error_type` → HTTP status mapping (`server-common.cpp:39-72`)
+### 4.2 `error_type` -> HTTP status mapping (`server-common.cpp:39-72`)
 
 | `error_type` | HTTP | `type` string | OpenAI-spec? |
 |---|---|---|---|
@@ -394,18 +394,18 @@ All errors are `{"error":{"code":int,"message":str,"type":str}}`
 400-with-`exceed_context_size_error` body. These are llama.cpp's own taxonomy, not
 OpenAI's. A smoke test must accept them as correct.
 
-### 4.3 Exception → status mapping (`ex_wrapper`, `server.cpp:54-86`)
+### 4.3 Exception -> status mapping (`ex_wrapper`, `server.cpp:54-86`)
 
-- `std::invalid_argument` → 400 `invalid_request_error`.
-- Other `std::exception` → 500 `server_error`.
-- Unknown → 500 `server_error`.
+- `std::invalid_argument` -> 400 `invalid_request_error`.
+- Other `std::exception` -> 500 `server_error`.
+- Unknown -> 500 `server_error`.
 
 ### 4.4 Middleware errors (bypass `ex_wrapper`)
 
-- 401 `authentication_error` — invalid/missing API key (`server-http.cpp:290-304`).
-- 503 `unavailable_error` — server not ready (model loading) (`server-http.cpp:307-328`).
-- 404 `not_found_error` — unknown route (`server-http.cpp:199-213`).
-- 403 `feature_disabled` — `/tools` or `/cors-proxy` when not enabled (`server.cpp:315-325`).
+- 401 `authentication_error`: invalid/missing API key (`server-http.cpp:290-304`).
+- 503 `unavailable_error`: server not ready (model loading) (`server-http.cpp:307-328`).
+- 404 `not_found_error`: unknown route (`server-http.cpp:199-213`).
+- 403 `feature_disabled`: `/tools` or `/cors-proxy` when not enabled (`server.cpp:315-325`).
 
 ### 4.5 Context-size errors (`server-context.cpp:3196-3215`)
 
@@ -641,27 +641,27 @@ ngram config. **Not usable with this model** (no draft model available).
 ### 5.11 Load-bearing for THIS model on THIS machine
 
 **Critical (must be set correctly):**
-- `-m` — model path.
-- `-ngl` — GPU layers. The 12.19 GiB expert set cannot fit in 6 GB VRAM; most layers must stay on CPU.
-- `-c` — context size. Native 262144; KV is 8320 B/token → 1.55 GiB at 200k, 0.51 GiB at 65k.
-- `-ncmoe` / `-cmoe` — CPU MoE control (amp's `-ncmoe` maps to this).
-- `-np` — parallel slots. Default -1 (auto).
-- `-b` / `-ub` — batch sizes. Prefill must be split to ubatch.
-- `-ctk` / `-ctv` — KV cache dtypes. amp uses `q8_0`/`q8_0`.
-- `--jinja` — must be enabled (default) for the chat template.
-- `--reasoning-format` — default `deepseek`; controls reasoning extraction.
-- `-t` / `-tb` — CPU threads. 8 cores.
+- `-m`: model path.
+- `-ngl`: GPU layers. The 12.19 GiB expert set cannot fit in 6 GB VRAM; most layers must stay on CPU.
+- `-c`: context size. Native 262144; KV is about 10.9 KB/token now, 2.03 GiB at 200k, 0.51 GiB at 65k.
+- `-ncmoe` / `-cmoe`, CPU MoE control (amp's `-ncmoe` maps to this).
+- `-np`: parallel slots. Default -1 (auto).
+- `-b` / `-ub`, batch sizes. Prefill must be split to ubatch.
+- `-ctk` / `-ctv`, KV cache dtypes. amp uses `q8_0`/`q8_0`.
+- `--jinja`: must be enabled (default) for the chat template.
+- `--reasoning-format`: default `deepseek`; controls reasoning extraction.
+- `-t` / `-tb`, CPU threads. 8 cores.
 
 **Dangerous here:**
-- `-ngl 999` (default) — attempts to offload all layers; will OOM on 6 GB VRAM with this model.
-- `-c 262144` (native) — 1.55 GiB KV at 200k; may be too large with 14 GiB RAM.
-- `--cache-ram -1` (default) — no prompt cache limit; could consume all RAM.
-- `--models-autoload` — router mode only; not applicable.
-- `--spec-*` — no draft model available.
-- `--lora` — no adapter file available.
-- `--mmproj` — no mmproj file; multimodal routes will 501.
-- `--mcp-servers-config` — no MCP server available.
-- `--sleep-idle-seconds` — sleep mode changes `/props`, `/metrics`, `/v1/models` to serve cached responses.
+- `-ngl 999` (default), attempts to offload all layers; will OOM on 6 GB VRAM with this model.
+- `-c 262144` (native), 1.55 GiB KV at 200k; may be too large with 14 GiB RAM.
+- `--cache-ram -1` (default), no prompt cache limit; could consume all RAM.
+- `--models-autoload`: router mode only; not applicable.
+- `--spec-*`: no draft model available.
+- `--lora`: no adapter file available.
+- `--mmproj`: no mmproj file; multimodal routes will 501.
+- `--mcp-servers-config`: no MCP server available.
+- `--sleep-idle-seconds`: sleep mode changes `/props`, `/metrics`, `/v1/models` to serve cached responses.
 
 ---
 
@@ -681,7 +681,7 @@ help text says "(default: auto)" (`arg.cpp:3680`) but the actual default is `dee
 `auto` and `deepseek` behave identically (`common.h:421`).
 
 Set per-request via the `reasoning_format` field (`server-common.cpp:1320-1322`) or
-via `--reasoning-format` CLI (`arg.cpp:3674-3684`). Unknown value → runtime error
+via `--reasoning-format` CLI (`arg.cpp:3674-3684`). Unknown value -> runtime error
 `Unknown reasoning format: <value>` (`chat.cpp:902`).
 
 ### 6.2 Thinking budget mechanism
@@ -697,7 +697,7 @@ IDLE -> COUNTING -> WAITING_UTF8 -> FORCING -> DONE
 - **IDLE**: passthrough, watching for start sequence.
 - **COUNTING**: counting down tokens, watching for natural end sequence.
 - **WAITING_UTF8**: budget exhausted, allowing UTF-8 completion.
-- **FORCING**: forces `forced_tokens` token-by-token (all other logits → -inf).
+- **FORCING**: forces `forced_tokens` token-by-token (all other logits -> -inf).
 - **DONE**: passthrough forever.
 
 Armed when (`sampling.cpp:311-323`):
@@ -709,9 +709,9 @@ The budget is fed by replaying prefill tokens through `llama_sampler_accept`
 tokens".
 
 Request fields (`server-common.cpp:1388-1403`):
-- `reasoning_budget_tokens` / `thinking_budget_tokens` — budget in tokens. `-1` = disabled (default), `0` = immediate end, `N` = budget.
-- `reasoning_budget_message` — prepended to the forced end tag.
-- `reasoning_control` — if true, the budget sampler is created on demand so reasoning can be ended at runtime via `/v1/chat/completions/control` with `action:"reasoning_end"` (`server-context.cpp:2479-2489`).
+- `reasoning_budget_tokens` / `thinking_budget_tokens`, budget in tokens. `-1` = disabled (default), `0` = immediate end, `N` = budget.
+- `reasoning_budget_message`: prepended to the forced end tag.
+- `reasoning_control`: if true, the budget sampler is created on demand so reasoning can be ended at runtime via `/v1/chat/completions/control` with `action:"reasoning_end"` (`server-context.cpp:2479-2489`).
 
 CLI: `--reasoning-budget N` (`arg.cpp:3715-3722`), `--reasoning-budget-message`
 (`arg.cpp:3723-3729`).
@@ -733,14 +733,14 @@ CLI: `--reasoning-budget N` (`arg.cpp:3715-3722`), `--reasoning-budget-message`
    and `tmpl_params.extra_context["enable_thinking"] = params.enable_thinking`
    (`chat-auto-parser-helpers.cpp:317,322`).
 
-**Note (from AGENT.md):** the autoparser's reasoning-mode detection
+Per AGENT.md, the autoparser's reasoning-mode detection
 (`autoparser::reasoning_mode`, `chat-auto-parser.h:85-89`) is derived from template
 analysis (R1-R3 comparisons in `chat-diff-analyzer.cpp`), not directly from
 `enable_thinking`. The `enable_thinking` flag controls whether the template renders
 a thinking block; the autoparser independently detects whether the template has
 reasoning markers.
 
-### 6.4 `preserve_reasoning` → `preserve_thinking` capability mapping
+### 6.4 `preserve_reasoning` -> `preserve_thinking` capability mapping
 
 `jinja::caps_apply_preserve_reasoning` (`caps.cpp:22-27`):
 
@@ -771,7 +771,7 @@ otherwise the kwarg is ignored with a warning (`server-context.cpp:1499-1509`).
   `reasoning_effort` and `reasoning_strength`.
 - Template must have `supports_reasoning_effort` cap (`caps.cpp:96,564`).
 
-**Note (from AGENT.md):** this template does **not** support `reasoning_effort` /
+Per AGENT.md, this template does **not** support `reasoning_effort` /
 `reasoning_strength`. The kwarg is accepted but ignored.
 
 ---
@@ -855,7 +855,7 @@ otherwise the kwarg is ignored with a warning (`server-context.cpp:1499-1509`).
 | Feature | Behavior |
 |---|---|
 | `POST /props` | Returns `{"success":true}` but does nothing (`server-context.cpp:4822` comment: `// update any props here`). |
-| `reasoning_effort` | Accepted, stored as kwarg, but template does not support it → ignored. |
+| `reasoning_effort` | Accepted, stored as kwarg, but template does not support it -> ignored. |
 | `t_max_prompt_ms` | Not implemented (`server-schema.cpp:71-72` TODO). |
 | `echo` (completions) | Rejected: `Only no echo is supported` (`server-common.cpp:1051-1053`). |
 | `best_of`, `suffix` (completions) | Rejected: `Unsupported param: ...` (`server-common.cpp:1056-1061`). |
@@ -867,8 +867,8 @@ otherwise the kwarg is ignored with a warning (`server-context.cpp:1499-1509`).
 
 ## 8. Key differences from the old amp server
 
-1. **Route count:** 7 endpoints → 40+ (including legacy aliases).
-2. **Error taxonomy:** OpenAI `type` strings → llama.cpp's own (`not_found_error`,
+1. **Route count:** 7 endpoints -> 40+ (including legacy aliases).
+2. **Error taxonomy:** OpenAI `type` strings -> llama.cpp's own (`not_found_error`,
    `not_supported_error`, `unavailable_error`, `exceed_context_size_error`,
    `permission_error`, `authentication_error`). Status codes 401/403/404/501/503 are
    emitted intentionally.
