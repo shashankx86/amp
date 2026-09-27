@@ -1610,3 +1610,52 @@ before claiming q8_0 is near-lossless on this model.
 Per-block, the divergence does not compound with position (v1: 1.0e-02 early, 3.6e-04 late;
 v2: 1.1e-02 early, 5.7e-04 late), so this is a stationary per-token rounding cost, not an
 error that accumulates down a long context.
+
+## 2026-09-28: two bugs in the measurement instrument, and the logits-scan idea does not transfer
+
+Chasing Strata's "993 KB D2H plus a 248,320-float host NaN scan every token, 16% of the token"
+needed `amp-infer --repeat` to average out run-to-run noise, and `--repeat` was broken twice over.
+
+### Bug 1: a NULL context
+
+`--repeat` reset its KV with `llama_memory_clear(llama_get_memory((llama_context *) nullptr), true)`
+— a **null context**, which is undefined behaviour. `ModelRuntime::reset()` now uses the real
+context, and `prefill()` calls it so every pass starts from an empty cache rather than appending
+to the previous one's.
+
+### Bug 2: the reported rate was wrong by exactly the repeat count
+
+`pp_toks`/`tg_toks` were **assigned** from the last pass while `pp_sum`/`tg_sum` **accumulated**
+across passes, so `--repeat 3` reported 512 tokens over three passes' worth of time. Every
+repeated measurement read 1/3 of the true rate. That is why `--repeat 3` looked like a 3x
+slowdown (9.5 t/s) while a single pass in the same session read 31.7 t/s — and it is a strong
+reason this instrument was never used to average noise, because it reported a number that was
+wrong by construction.
+
+Fixed to `+=`. Now consistent: `--repeat 1` 19.27 t/s over 512 tokens, `--repeat 3` 29.71 t/s
+over 1536 (the single-pass figure is lower because one 512-token pass still pays graph build).
+**1536 tokens per measurement is the trustworthy number this instrument produces**, which is
+what makes the next section possible.
+
+### Strata's logits-scan finding does NOT transfer, and now it is measured rather than assumed
+
+Their per-token host phase is 993 KB of D2H plus a 248,320-float NaN scan, 16% of a 53 ms token.
+**amp's vocabulary is 3,115,143 tokens** — 12.5x theirs — so the same shape would be 11.9 MiB of
+f32 logits per token, a 3.1M-element `partial_sort`, and a 3.1M-term `exp()` loop, every token.
+
+Measured with the fixed instrument, 1536 tokens per arm:
+
+| arm | decode |
+|---|---:|
+| `--logprobs-n 0` (no top-k capture at all) | 28.04 t/s |
+| `--logprobs-n 32` (the 3.1M partial_sort + exp) | 28.87 t/s |
+
+**Indistinguishable.** The whole vocab scan is inside the noise of a ~28 ms token, so it is
+under ~3 ms and therefore not a lever. The reason Strata's version cost 16% and this does not is
+scale in the wrong direction for them: 248k floats is a small fraction of a 53 ms token's
+attention and expert work, while 3.1M pairs of `partial_sort` work is a different thing — but
+measured, it still does not matter, because decode here is 40% expert bandwidth and the
+remaining time is GPU-side layer work, not host-side scanning.
+
+**Consequence: the `top_k_track_` 5 -> 32 widening stays**, because it is free and it fixed the
+quality instrument. It is recorded here as measured-free rather than assumed-free.

@@ -131,7 +131,17 @@ public:
     Result<std::vector<llama_token>> tokenize(const std::string & text, bool add_special = true) const;
 
     // Processes the whole prompt in ubatches, priming the page cache ahead of each one.
+    // Prefills `tokens` into a FRESH KV, discarding whatever was there. Every repetition in
+    // amp-infer --repeat depends on this: it used to call
+    // llama_memory_clear(llama_get_memory((llama_context *) nullptr), true), i.e. pass a NULL
+    // context, which is undefined behaviour and left the cache in a state that read ~11 t/s
+    // against ~30 t/s for a clean pass. Any --repeat benchmark in this project was measuring a
+    // corrupted cache rather than the engine.
     Status prefill(const std::vector<llama_token> & tokens);
+
+    // Drops all cached state without touching weights. Same intent as the prefill reset above,
+    // exposed so callers can time a pass with nothing prefilled.
+    Status reset();
 
     // Generates up to max_new tokens. Returns the generated tokens.
     Result<std::vector<llama_token>> generate(int32_t max_new, std::string * text_out = nullptr);

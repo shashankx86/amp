@@ -217,12 +217,17 @@ int main(int argc, char ** argv) {
         if (!gen.ok()) { fprintf(stderr, "amp-infer: %s\n", gen.message().c_str()); return 1; }
         pp_sum  += rt->stats().prefill_ms;
         tg_sum  += rt->stats().decode_ms;
-        pp_toks  = rt->stats().prefill_tokens;
-        tg_toks  = rt->stats().decode_tokens;
-        if (r + 1 < repeat) {
-            // Reset the KV for the next repetition.
-            llama_memory_clear(llama_get_memory((llama_context *) nullptr), true);
-        }
+        // Token counts must ACCUMULATE across passes like the times do. They used to be
+        // assigned (=) rather than accumulated (+=), so `--repeat 3` reported 512 tokens over
+        // three passes' worth of time: every repeated measurement read exactly 1/3 of the true
+        // rate. That is why --repeat looked like a 3x slowdown (9.5 t/s) when a single pass read
+        // 31.7 t/s in the same session, and it is a strong reason nobody used this to average
+        // out noise: the instrument reported a number that was wrong by the repeat count.
+        pp_toks += rt->stats().prefill_tokens;
+        tg_toks += rt->stats().decode_tokens;
+        // prefill() resets the cache itself now, so there is nothing to do between passes.
+        // This used to call llama_memory_clear(llama_get_memory((llama_context *) nullptr)),
+        // i.e. a NULL context: undefined behaviour that read ~11 t/s against ~30 t/s.
     }
 
     if (!dump_output.empty()) {

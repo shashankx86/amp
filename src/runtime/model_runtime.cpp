@@ -297,9 +297,24 @@ Result<std::vector<llama_token>> ModelRuntime::tokenize(const std::string & text
     return out;
 }
 
+Status ModelRuntime::reset() {
+    // The real context, not a null one. See the header for why that distinction mattered.
+    llama_memory_clear(llama_get_memory(ctx_), true);
+    n_past_ = 0;
+    last_text_.clear();
+    logprobs_.clear();
+    return Status::OK();
+}
+
 Status ModelRuntime::prefill(const std::vector<llama_token> & tokens) {
     if (tokens.empty()) {
         return Status::Error("nothing to prefill");
+    }
+    // Prefill always starts from an empty cache, so a second call cannot silently append to the
+    // previous one's KV and produce a sequence that is neither the prompt nor the prompt twice.
+    const Status rst = reset();
+    if (!rst.ok()) {
+        return rst;
     }
     const int32_t ub = (int32_t) std::max<int64_t>(1, cfg_.n_ubatch);
 
