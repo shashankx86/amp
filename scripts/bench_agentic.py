@@ -70,6 +70,42 @@ Result: src/plan/preflight.cpp
 """
 
 
+def ntok(tokenize_url, text, timeout):
+    body = {"content": text}
+    req = urllib.request.Request(tokenize_url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return len(json.loads(r.read())["tokens"])
+
+
+def grow_to_tokens(tokenize_url, seed, target, timeout):
+    """Append numbered filler until the context is about `target` tokens.
+
+    Numbered so the text does not repeat: a prompt that is the same block twice is not a
+    realistic context, and a benchmark should not depend on the server's prompt cache being
+    cold for a block it has already seen.
+    """
+    import math
+    step = 400
+    n = 0
+    while n < target:
+        seed += f"\n\n## Appendix {n}\n\n" + "\n".join(
+            f"note {n}.{j}: the planner records a decision and a reason for every override."
+            for j in range(step))
+        n = ntok(tokenize_url, seed, timeout)
+        if n > target * 1.15:
+            # Binary search down by characters rather than appending another whole block.
+            lo, hi = 0, len(seed)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if ntok(tokenize_url, seed[:mid], timeout) <= target:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return seed[:lo]
+    return seed[:len(seed) - (n - target) * 4]
+
+
 def post(url, body, timeout):
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
@@ -86,6 +122,11 @@ def main():
     ap.add_argument("--gen", type=int, default=48, help="tokens generated per turn")
     ap.add_argument("--base-chars", type=int, default=0,
                     help="0 = use the whole standard bench prompt as the base context")
+    ap.add_argument("--base-tokens", type=int, default=0,
+                    help="grow the base context to roughly this many tokens by appending numbered "
+                         "notes. Needed because the n_parallel stall only appears above ~30k "
+                         "tokens of context: at 18k the same probe causes 0 re-prefills, so a "
+                         "small-context run hides the bug completely. Requires /tokenize.")
     ap.add_argument("--prompt-file", default="/tmp/opencode/amp_bench_prompt.txt")
     ap.add_argument("--timeout", type=int, default=7200)
     ap.add_argument("--interleave", type=int, default=0,
@@ -96,6 +137,12 @@ def main():
 
     with open(args.prompt_file, encoding="utf-8") as f:
         prompt = f.read()
+
+    if args.base_tokens:
+        prompt = grow_to_tokens(f"{args.url}/tokenize", prompt, args.base_tokens, args.timeout)
+        print(f"base    : grown to ~{args.base_tokens} tokens "
+              f"({ntok(f'{args.url}/tokenize', prompt, args.timeout)} tokens, {len(prompt)} chars)")
+
     if args.base_chars:
         prompt = prompt[:args.base_chars]
 

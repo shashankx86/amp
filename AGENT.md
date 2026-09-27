@@ -191,8 +191,10 @@ order of operations, same KV cache dtypes (`-ctk q8_0 -ctv q4_0`), same sampling
       turn**; at 2 slots, **0 re-prefills and 6.3 s**. Decode is unaffected (27.42 / 27.25 / 27.67
       t/s at 1 / 2 / 4 slots) because the 44x collapse needs *concurrent* generation, which an
       agentic turn never does. **Default is now 2.** Reproduce with
-      `scripts/bench_agentic.py --interleave N`; it only bites above ~30k tokens of context, so a
-      small-context benchmark will show 0 re-prefills and hide the bug entirely.
+      `scripts/bench_agentic.py --interleave N --base-tokens 35000`; it only bites above ~30k tokens
+      of context, so a small-context benchmark will show 0 re-prefills and hide the bug entirely.
+      `get_perf.sh` installs the profiler unprivileged and `build/` is gitignored, so neither
+      leaves the tree dirty.
 - [ ] Three latency hypotheses were falsified on the way and are recorded so they are not retested:
       `cache_ram_mib` 512 / 2048 / 4096 all give 0 re-prefills and ~2.2 s median turns; squeezing
       5 GiB of RAM does the same (`MAP_POPULATE` refills the page cache at load, so a fresh server
