@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "Named model configurations for amp. Selected with --model-config NAME:VARIANT,",
+    "for example:",
+    "",
+    "    amp-server --model /path/to/model.gguf --port 8081 --model-config occamy:v2",
+    "",
+    "A variant is a set of DEFAULTS, never an override. Any flag you pass on the command line",
+    "still wins: --model-config occamy:v2 -ctv f16 -c 131072 gives you v2's prompt-cache and",
+    "checkpoint settings with your own KV dtype and context. That is the whole point of putting",
+    "this in a file rather than in code - you can retune a variant without rebuilding, and you",
+    "can always escape one.",
+    "",
+    "Because n_parallel defaults to 2, the context you actually get PER CONVERSATION is",
+    "n_ctx / n_parallel. v2 is sized so that 400000 / 2 = 200000 per conversation.",
+    "",
+    "Keys, all optional, all of which fall back to the built-in default when absent:",
+    "  n_ctx              total context across all slots",
+    "  cache_type_k       KV dtype for keys",
+    "  cache_type_v       KV dtype for values",
+    "  cache_ram_mib      llama.cpp RAM prompt cache, MiB. 0 disables it.",
+    "  n_ctx_checkpoints  context checkpoint ring",
+    "  n_ubatch           physical batch size for prompt processing",
+    "  n_threads          CPU threads"
+  ],
+
+  "configs": {
+    "occamy": {
+      "description": "Occamy-1.0 APEX-I MiniPlus V2.1 (qwen35moe hybrid: 30 recurrent + 10 attention layers of 40, 256 experts, 8 active)",
+      "model_hint": "Occamy",
+
+      "variants": {
+        "v1": {
+          "quality": 1,
+          "label": "v1 q8_0/q4_0, 200k total (the pre-2026-09-27 default)",
+          "n_ctx": 200000,
+          "cache_type_k": "q8_0",
+          "cache_type_v": "q4_0",
+          "cache_ram_mib": 512,
+          "n_ctx_checkpoints": 2,
+          "n_ubatch": 1024,
+          "_measured": "sustained prefill ~85-100 t/s, decode ~27.7 t/s, median KL 1.809e-06 from f16. Kept because it is the only variant measured on more than one prompt at the old setting, and because it needs the least VRAM."
+        },
+
+        "v2": {
+          "quality": 2,
+          "label": "v2 q8_0/q8_0, 200k per conversation (current default)",
+          "n_ctx": 400000,
+          "cache_type_k": "q8_0",
+          "cache_type_v": "q8_0",
+          "cache_ram_mib": 0,
+          "n_ctx_checkpoints": 1,
+          "n_ubatch": 1024,
+          "_measured": "sustained prefill ~245 t/s (3x v1, the prompt cache was evicting the model page cache), decode ~28.3 t/s, median KL 2.065e-07 from f16 which is 8.8x closer to f16 than v1. n_ctx_checkpoints is 1 rather than 2 because a checkpoint stores the full memory state and at 400k two of them is several GiB of anonymous RAM on a 14.3 GiB box."
+        },
+
+        "v3": {
+          "quality": 3,
+          "label": "v3 f16/f16, 131k total - highest precision that FITS on 6 GB",
+          "n_ctx": 131072,
+          "cache_type_k": "f16",
+          "cache_type_v": "f16",
+          "cache_ram_mib": 0,
+          "n_ctx_checkpoints": 1,
+          "n_ubatch": 1024,
+          "_measured": "f16/f16 does NOT fit at 200k on this box at all: it fails with 'failed to allocate compute pp buffers' even at 0 GPU expert layers, because the KV cache alone would need about 3.9 GiB of the 5.89 GiB budget. 131072 is the largest context measured to start, and it does, with 3 GPU expert layers. Per conversation that is 65536 at the default 2 slots; pass --parallel 1 for 131072 per conversation, at the cost of the mid-conversation stall that single-slot serving has (see AGENT.md). This is the closest available to the reference, not a claim of zero divergence from it: both q8_0 variants measure a real, bounded difference from f16 on this model."
+        }
+      }
+    }
+  }
+}

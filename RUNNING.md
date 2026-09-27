@@ -69,6 +69,49 @@ that the CPU expert set fits the page cache (10.90 GiB) where llama-server's doc
 not (~11.5 GiB), so amp does not collapse — llama-server's first request runs at 1.96 t/s, amp's at
 26 t/s. See `docs/BENCH.md`.
 
+### Quality variants: `--model-config <name>:v<N>`
+
+Named presets, ordered by KV quality, in `configs/model-configs.conf`:
+
+| variant | KV | measured distance from f16 | notes |
+|---|---|---|---|
+| `:v1` | q8_0 / q4_0 | 1.809e-06 | smallest KV; the old default |
+| **`:v2`** | **q8_0 / q8_0** | **2.065e-07** | **the default**, 8.8x closer to f16 than v1 |
+| `:v3` | f16 / f16 | 0 by definition | f16 KV; `n_ctx` cut to 131072 because f16 does **not** fit at 200k on this box |
+
+```bash
+./build/bin/amp-server --model $M --port 8081 --model-config occamy-1.0-apex-i-miniplus:v3
+./build/bin/amp-server --model $M --port 8081 --model-config occamy-1.0-apex-i-miniplus   # lists variants
+```
+
+A preset is **exactly equivalent to typing its flags** - it sets the same fields and marks them
+user-supplied, so there is one code path, not two. An explicit flag always wins:
+
+```bash
+--model-config occamy-1.0-apex-i-miniplus:v3 -ctv q8_0    # f16 for K, q8_0 for V, rest from the preset
+```
+
+`v3` cannot run at 200k: f16 KV fails to allocate the prefill compute buffers even with 0 GPU
+expert layers. The preset sets `n_ctx 131072` itself so it starts. An unknown key in the file is a
+hard error, never a silent no-op.
+
+`n_ctx` is the **total across slots**, which is llama.cpp's own semantics and is not "corrected"
+here. See the next section for why that matters.
+
+### Concurrency: one slot, so `-c` is your conversation's context
+
+`n_parallel` defaults to **1**, so `-c 200000` gives **`n_ctx_slot = 200192` for a single
+conversation**. That is the reason for the default, and it is a real trade:
+
+- llama.cpp's own default is 4 slots, which thrash the shared CPU expert set (0.64 t/s measured,
+  against 28.4 with one).
+- 2 slots removes the worst-turn stall when the agent tests its own API mid-conversation (110.6 s ->
+  6.3 s at 35k context), **but halves the context per conversation** to 100096.
+
+One slot is the default because a 200k single conversation is worth more than surviving a rare side
+request. If you would rather have the stall-proofing, `--parallel 2` is there and the context
+halving is the price.
+
 ### Performance: what to tune, and what to leave alone
 
 **Leave `-t` alone.** `-t 8` (one thread per physical core) is the measured peak. Raising it makes

@@ -364,3 +364,47 @@ so the plan and the applied configuration cannot drift apart.
 
 **The general rule: a planner must be given the configuration it is planning for.** Reading a
 "resolved" field before your own rules have run is the same bug wearing a different hat.
+
+## Model configs: `--model-config <name>:v<N>`
+
+Named presets with a quality dial, in `configs/model-configs.conf`. Three variants for
+`occamy-1.0-apex-i-miniplus`, ordered by KV quality:
+
+| variant | KV | median KL vs f16/f16 | notes |
+|---|---|---|---|
+| `:v1` | q8_0 / q4_0 | 1.809e-06 | the old default, smallest KV |
+| `:v2` | q8_0 / q8_0 | 2.065e-07 | the default now, 8.8x closer to f16 |
+| `:v3` | f16 / f16 | 0 | f16 KV; `n_ctx` cut to 131072 because f16 does not fit at 200k |
+
+Three design decisions, each of which cost something to get right:
+
+**A preset is exactly equivalent to typing its flags.** It sets the same `common_params` fields and
+raises the same `UserFlags` bits a typed flag raises, so every downstream rule treats it as a user
+choice and leaves it alone. There is no second code path. The alternative - a separate "preset
+applies after the rules" step - would have meant two places where a setting can be decided, and
+therefore two places to be wrong.
+
+**An explicit flag outranks the preset.** The first version had this inverted and the symptom was
+silent: `--model-config ...:v3 -c 200000 -ctv q8_0` applied the *preset's* 131072 and f16, because
+the preset wrote `params` unconditionally after `scan_user_flags` had already recorded the flags.
+The guard has to skip a key *before* the dispatch chain rather than by compounding each condition,
+because a compound condition falls through to the unknown-key branch and rejects a perfectly good
+key. The log now reports which settings the preset set and which were kept from the command line.
+
+**The file is found relative to the executable, not the working directory.** A relative path works
+when the server is started from the repo root and silently finds nothing from `build/`, which is
+where ctest runs. That is how the config was missing during development. Resolved via
+`/proc/self/exe`; `AMP_MODEL_CONFIGS` overrides.
+
+Two smaller things, both of which bit:
+
+- `--model-config` is amp's flag and `common_params_parse` rejects anything it does not know, so it
+  is filtered out of the vector handed to llama.cpp and kept for the preflight. This reverses the
+  earlier decision to use environment variables only, which is what a comment in
+  `tools/amp_server.cpp` used to justify.
+- `--model-config <name>` with no variant is a *query*, and must not fall through to serving. It
+  prints the variants and exits 0; the first version printed the listing and then loaded 13.66 GiB
+  behind it.
+
+An unknown key or variant is a hard error, never a silent no-op: a quality dial that quietly does
+nothing is the worst failure mode it can have.

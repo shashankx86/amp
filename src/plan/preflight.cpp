@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <unistd.h>
 #include <list>
 #include <string>
 #include <vector>
@@ -54,6 +55,138 @@ const char * argv_value(const std::vector<std::string> & argv, const std::string
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// Model configs: named presets with a quality dial.
+//
+// A preset is applied as if the user had typed its flags - the same fields are set and the same
+// UserFlags bits are raised - so the planner will not override them and there is only one code
+// path. An explicit flag still wins, because scan_user_flags() sees the flag and the preset only
+// fills in what the flag did not set.
+//
+// The file format is "key = value" under a "[name:vN]" header, parsed here rather than with a
+// library, because the preflight is the one piece of amp that has to stay small and dependency
+// free. An unknown key is a hard error: a typo in a quality dial that silently does nothing is
+// worse than a refusal to start.
+static std::string trim(const std::string & in) {
+    size_t a = in.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) {
+        return "";
+    }
+    size_t b = in.find_last_not_of(" \t\r\n");
+    return in.substr(a, b - a + 1);
+}
+
+static std::string model_configs_path() {
+    if (const char * env = getenv("AMP_MODEL_CONFIGS")) {
+        return env;
+    }
+
+    // Resolve next to the repository root via /proc/self/exe, so the file is found no matter what
+    // the working directory is. This was a real bug: a relative path works when the server is
+    // started from the repo root and silently finds nothing from build/, which is exactly where
+    // ctest runs from. A quality dial that cannot find its own file is worse than none.
+    char        self[4096];
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (n > 0) {
+        self[n] = '\0';
+        std::string dir(self);
+        size_t slash = dir.find_last_of('/');
+        if (slash != std::string::npos) {
+            // <root>/build/bin/amp-server -> <root>/configs/model-configs.conf
+            dir = dir.substr(0, slash);
+            slash = dir.find_last_of('/');
+            if (slash != std::string::npos) {
+                dir = dir.substr(0, slash);
+                slash = dir.find_last_of('/');
+                if (slash != std::string::npos) {
+                    return dir.substr(0, slash) + "/configs/model-configs.conf";
+                }
+            }
+        }
+    }
+
+    return "configs/model-configs.conf";
+}
+
+// Reads one "[name:vN]" block. `section` is the BARE name, e.g. "occamy:v2" - the brackets are
+// the file's syntax, not part of the name, and mixing the two is an easy way to never match.
+static bool read_variant(const std::string & path, const std::string & section,
+                        std::vector<std::pair<std::string, std::string>> & out,
+                        std::string & err) {
+    FILE * fp = fopen(path.c_str(), "r");
+    if (!fp) {
+        err = "cannot open " + path;
+        return false;
+    }
+    char   raw[1024];
+    bool   in = false, found = false;
+    while (fgets(raw, sizeof(raw), fp)) {
+        std::string line = trim(raw);
+        // Strip comments, but only outside a value, so a '#' can appear in one.
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) {
+            line = trim(line.substr(0, hash));
+        }
+        if (line.empty()) {
+            continue;
+        }
+        if (line.front() == '[') {
+            if (in) {
+                break;                      // left the section without finding anything more
+            }
+            std::string header = line.substr(1, line.size() - 2);
+            if (header == section) {
+                in = true;
+            }
+            continue;
+        }
+        if (!in) {
+            continue;
+        }
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            err = path + ": malformed line in [" + section + "]: " + line;
+            fclose(fp);
+            return false;
+        }
+        out.emplace_back(trim(line.substr(0, eq)), trim(line.substr(eq + 1)));
+        found = true;
+    }
+    fclose(fp);
+    if (!found) {
+        err = path + ": no such variant [" + section + "]";
+    }
+    return found;
+}
+
+static bool list_variants(const std::string & path, const std::string & name, std::string & out) {
+    FILE * fp = fopen(path.c_str(), "r");
+    if (!fp) {
+        return false;
+    }
+    const std::string prefix = name + ":v";
+    char raw[1024];
+    out  = "variants of \"" + name + "\" in " + path + ":\n";
+    bool any = false;
+    while (fgets(raw, sizeof(raw), fp)) {
+        std::string line = trim(raw);
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) {
+            line = trim(line.substr(0, hash));
+        }
+        if (line.size() < prefix.size() + 2 || line.front() != '[' || line.back() != ']') {
+            continue;
+        }
+        const std::string header = line.substr(1, line.size() - 2);
+        if (header.compare(0, prefix.size(), prefix) == 0) {
+            out += "  --model-config " + header + "\n";
+            any = true;
+        }
+    }
+    fclose(fp);
+    return any;
+}
+
 struct UserFlags {
     bool fit_on = false;   // explicit "--fit on": the fitter is in charge, full no-op
     bool fit_off = false;  // explicit "--fit off"
@@ -62,6 +195,7 @@ struct UserFlags {
     bool t = false, tb = false;
     bool ctxcp = false, cms = false, cram = false, lzm = false;
     bool np = false;   // explicit --parallel/-np: the user wants N concurrent slots
+    bool mc = false;   // explicit --model-config: a preset supplies some settings
 };
 
 UserFlags scan_user_flags(const std::vector<std::string> & argv) {
@@ -78,6 +212,7 @@ UserFlags scan_user_flags(const std::vector<std::string> & argv) {
     f.cms   = argv_has(argv, "-cms") || argv_has(argv, "--checkpoint-min-step");
     f.cram  = argv_has(argv, "-cram") || argv_has(argv, "--cache-ram");
     f.np    = argv_has(argv, "-np") || argv_has(argv, "--parallel");
+    f.mc    = argv_has(argv, "-mc") || argv_has(argv, "--model-config");
     f.lzm   = argv_has(argv, "-lzm") || argv_has(argv, "--lazy-mode");
     if (argv_has(argv, "-fit") || argv_has(argv, "--fit")) {
         const char * v = argv_value(argv, "-fit");
@@ -201,11 +336,143 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
                                                  common_params & params,
                                                  const std::vector<std::string> & argv) {
     std::vector<std::string> notes;
+    // A model config may set n_ubatch, but PlannerOptions does not exist until the plan is set
+    // up further down, so the value is carried here and applied there alongside the -ub path.
+    int64_t mc_ubatch = 0;
     auto note = [&](const std::string & s) {
         notes.push_back(s);
         AMP_INFO("amp-preflight: ", s);
     };
-    const UserFlags f = scan_user_flags(argv);
+    UserFlags f = scan_user_flags(argv);
+
+    // -- Model config preset. Applied first, before every rule, because it works by raising the
+    //    same UserFlags bits a typed flag would raise: everything downstream then treats these as
+    //    user choices and leaves them alone, and an explicit flag still wins because
+    //    scan_user_flags() already saw it. One code path, no special cases in the rules.
+    if (f.mc) {
+        const char * spec = argv_value(argv, "-mc");
+        if (!spec) {
+            spec = argv_value(argv, "--model-config");
+        }
+        if (!spec) {
+            note("--model-config needs a value, as <name>:v<N> or <name> to list");
+            return Status::Error("bad --model-config");
+        }
+
+        const std::string path  = model_configs_path();
+        const std::string arg  = spec;
+        std::string       name  = arg;
+        std::string       want;
+
+        const size_t colon = arg.find(':');
+        if (colon != std::string::npos) {
+            name = arg.substr(0, colon);
+            // Accept both "name:2" and "name:v2". The listing prints the "v" form, so it is the
+            // canonical one, but a bare number is the obvious thing to type and there is no
+            // reason to make it an error.
+            std::string num = arg.substr(colon + 1);
+            if (num.size() > 1 && (num[0] == 'v' || num[0] == 'V')) {
+                num = num.substr(1);
+            }
+            want = name + ":v" + num;
+        }
+
+        if (want.empty()) {
+            std::string listing;
+            if (!list_variants(path, name, listing)) {
+                note("no variants of \"" + name + "\" in " + path);
+                return Status::Error("unknown model config");
+            }
+            note(listing);
+            return Status::Error("no variant selected");
+        }
+
+        std::vector<std::pair<std::string, std::string>> kv;
+        std::string err;
+        if (!read_variant(path, want, kv, err)) {
+            note("model-config: " + err);
+            return Status::Error("model config not found");
+        }
+
+        std::string applied, skipped, label;
+        for (const auto & p : kv) {
+            const std::string & k = p.first;
+            const std::string & v = p.second;
+
+            if (k == "label") { label = v; continue; }
+
+            // If the command line already set this one, the preset must not touch it: an
+            // explicit flag outranks a preset, and silently overwriting it would be the exact
+            // opposite of what --model-config promises.
+            const bool already = (k == "cache_type_k"   && f.ctk)   ||
+                                 (k == "cache_type_v"   && f.ctv)   ||
+                                 (k == "n_ctx"          && f.c)     ||
+                                 (k == "cache_ram_mib"  && f.cram)  ||
+                                 (k == "n_parallel"     && f.np)    ||
+                                 (k == "n_ubatch"       && f.ub)    ||
+                                 (k == "n_threads"      && f.t);
+            if (already) {
+                // Skip before the dispatch chain, not by compounding its conditions: a compound
+                // condition would fall through to the unknown-key branch and reject a perfectly
+                // good key just because the user also passed the flag.
+                if (!skipped.empty()) {
+                    skipped += ", ";
+                }
+                skipped += k;
+                continue;
+            }
+
+            if (k == "cache_type_k") {
+                params.cache_type_k = to_ggml(cache_type_from_string(v));
+                if (params.cache_type_k == GGML_TYPE_COUNT) {
+                    note("model-config: unknown cache_type_k \"" + v + "\"");
+                    return Status::Error("bad model config");
+                }
+                f.ctk = true;
+            } else if (k == "cache_type_v") {
+                params.cache_type_v = to_ggml(cache_type_from_string(v));
+                if (params.cache_type_v == GGML_TYPE_COUNT) {
+                    note("model-config: unknown cache_type_v \"" + v + "\"");
+                    return Status::Error("bad model config");
+                }
+                f.ctv = true;
+            } else if (k == "n_ctx") {
+                params.n_ctx = (int32_t) atoi(v.c_str());
+                f.c = true;
+            } else if (k == "cache_ram_mib") {
+                params.cache_ram_mib = (int32_t) atoi(v.c_str());
+                f.cram = true;
+            } else if (k == "n_parallel") {
+                params.n_parallel = (int32_t) atoi(v.c_str());
+                f.np = true;
+            } else if (k == "n_ubatch") {
+                // `po` does not exist yet this early; carried out and applied with the -ub path.
+                mc_ubatch = std::max<int64_t>(32, atoll(v.c_str()));
+                f.ub = true;
+            } else if (k == "n_threads") {
+                params.cpuparams.n_threads      = (int32_t) atoi(v.c_str());
+                params.cpuparams_batch.n_threads = (int32_t) atoi(v.c_str());
+                f.t = true;
+            } else {
+                // Never silently ignore a key. A config file that quietly does nothing is the
+                // worst failure mode a quality dial can have.
+                note("model-config: unknown key \"" + k + "\" in " + want);
+                return Status::Error("bad model config");
+            }
+
+            if (!applied.empty()) {
+                applied += ", ";
+            }
+            applied += k + "=" + v;
+        }
+
+        std::string line = "model-config " + name + (label.empty() ? "" : " (" + label + ")") +
+                           ": " + (applied.empty() ? "nothing new" : applied);
+        if (!skipped.empty()) {
+            line += "; kept from the command line: " + skipped;
+        }
+        note(line);
+    }
 
     // -- Rule 0: the user explicitly asked for llama.cpp's fitter. It is in charge of
     //    device memory and would throw on any layout we set (common/fit.cpp:463-465,
@@ -227,42 +494,31 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
     //
     //    They stay *after* the --fit check, so an explicit --fit on remains a total no-op.
 
-    //    n_parallel is the same kind of trap, and a much bigger one. The server example sets
-    //    params.n_parallel = -1 ("auto", common/arg.cpp:1400), which server.cpp:156-159 expands
-    //    to FOUR concurrent slots with kv_unified. Four concurrent generations each want the same
-    //    shared ~10.9 GiB CPU expert working set, and on this box that thrashes rather than
-    //    shares: measured 0.64 t/s with two slots active, against 28.4 t/s with one.
+    //    n_parallel is 1, deliberately. llama.cpp's own default is -1 ("auto",
+    //    common/arg.cpp:1400), which server.cpp:156-159 expands to FOUR concurrent slots.
+    //    Four concurrent generations each want the same shared ~10.9 GiB CPU expert working set,
+    //    and on this box that thrashes rather than shares: measured 0.64 t/s with two slots
+    //    active, against 28.4 t/s with one. So one slot it is.
     //
-    //    This is not hypothetical and not a corner case. An agentic client has two requests open
-    //    by design - OpenCode asks for a conversation title while the main answer streams - so
-    //    the default is a guaranteed slowdown for the exact workload this server exists for.
-    //    The deleted hand-rolled server serialised generations for this reason.
+    //    It was briefly 2, because a mid-conversation side request - a model testing the API it
+    //    is being served by - is served by the slot holding the conversation and destroys its
+    //    cached prefix. At 35k context that cost a 110.6 s worst turn against 6.3 s with two
+    //    slots. But two slots also halve the context each conversation gets, because llama.cpp's
+    //    n_ctx is the total across slots: -c 200000 with two slots is 100096 per conversation,
+    //    not 200192.
     //
-    //    Overridable with --parallel N, because someone batching independent prompts may want
-    //    the throughput and accept the memory cost.
-    //
-    //    It is 2, not 1. Forcing a single slot was right about the thrash and wrong about the
-    //    consequence, and the second mistake cost real time in the field. An agentic client that
-    //    tests the API it is being served by - which is what a model asked to verify a config
-    //    does - sends a short unrelated request mid-conversation. With one slot that request is
-    //    served *by the slot holding the conversation*, and the conversation's cached prefix does
-    //    not survive it. Measured at a 35,001-token context with a self-test request after every
-    //    second turn: **2 full re-prefills, worst turn 110.6 s, 239.3 s over 6 turns.** With two
-    //    slots the self-test goes to the other slot: **0 re-prefills, worst turn 6.3 s, 27.1 s.**
-    //    An 8.8x difference on the number a user actually waits through.
-    //
-    //    Two slots costs nothing in decode: 27.42 t/s at one slot against 27.25 at two and 27.67
-    //    at four, all inside the run-to-run spread. The 0.64 t/s collapse needs several slots
-    //    generating *simultaneously* against the shared expert set, which an agentic turn never
-    //    does - it finishes generating, then runs tools. So keep the thrash protection, lose the
-    //    single-slot trap.
-    if (!f.np && params.n_parallel < 2) {
-        note("n_parallel: 2 (llama-server defaults to 4 concurrent slots, which thrash the "
-             "shared CPU expert set on this box; 2 keeps a self-test or side request from "
-             "evicting the conversation's cached prefix, which costs an 8.8x worse worst turn. "
-             "Use --parallel N to override)");
-        params.n_parallel = 2;
+    //    One slot is the right default here because a 200k single conversation is worth more than
+    //    surviving an occasional side request, and the side request is rare while the context is
+    //    not. The trade is real and measured in both directions; if you are willing to give up
+    //    half the context, --parallel 2 removes the stall.
+    if (!f.np && params.n_parallel != 1) {
+        note("n_parallel: 1 (llama-server defaults to 4 concurrent slots, which thrash the "
+             "shared CPU expert set on this box; 1 also keeps the full -c as one conversation's "
+             "context, since n_ctx is the total across slots. --parallel 2 avoids a stall when "
+             "the agent tests its own API, at half the context per conversation)");
+        params.n_parallel = 1;
     }
+
 
     //    fit_params belongs with them. Default is true (common/common.h:476), and the fitter
     //    would fight whatever layout we set (fit.cpp:463-486, with the failure ignored at
@@ -371,7 +627,9 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
         note("plan against the requested KV dtypes: " + std::string(ggml_type_name(params.cache_type_k)) +
              "/" + std::string(ggml_type_name(params.cache_type_v)));
     }
-    if (f.ub) {
+    if (f.ub && mc_ubatch > 0) {
+        po.ubatch_min = po.ubatch_max = mc_ubatch;
+    } else if (f.ub) {
         const char * v = argv_value(argv, "-ub");
         if (!v) {
             v = argv_value(argv, "--ubatch-size");

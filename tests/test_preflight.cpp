@@ -243,15 +243,14 @@ AMP_TEST(preflight_plan_failure_still_leaves_a_usable_config) {
     AMP_CHECK_MSG(p.n_ctx > 0, "n_ctx must be set even without a plan, got " + std::to_string(p.n_ctx));
 }
 
-AMP_TEST(preflight_forces_two_slots_unless_asked) {
+AMP_TEST(preflight_forces_one_slot_unless_asked) {
     // The server example sets n_parallel = -1 ("auto", arg.cpp:1400), which server.cpp:156-159
     // expands to FOUR concurrent slots. On this box that is a 44x decode collapse, because every
     // concurrent generation wants the same shared ~10.9 GiB CPU expert set.
     //
-    // Two, not one. A single slot means a mid-conversation side request - an agent testing the
-    // API it is being served by - is served by the slot holding the conversation and destroys
-    // its cached prefix. Measured at 35,001 tokens of context: 2 full re-prefills and a 110.6 s
-    // worst turn at one slot, 0 re-prefills and 6.3 s at two.
+    // One, and the cost is deliberate. n_ctx is the total across slots, so two slots would halve
+    // the context a single conversation gets: -c 200000 becomes 100096. That is worse than the
+    // stall it avoids for anyone who wants 200k in one session. --parallel 2 still works.
     const char * m = model_path();
     if (!m) {
         return;
@@ -264,7 +263,7 @@ AMP_TEST(preflight_forces_two_slots_unless_asked) {
         o.n_ctx = 4096;
         const auto r = apply_preflight(o, p, std::vector<std::string>{ "amp-server", "-m", m });
         AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
-        AMP_CHECK_EQ(p.n_parallel, 2);
+        AMP_CHECK_EQ(p.n_parallel, 1);
     }
     {
         // ...unless the user asked for a specific count, in either direction.
@@ -281,8 +280,6 @@ AMP_TEST(preflight_forces_two_slots_unless_asked) {
         AMP_CHECK_EQ(p.n_parallel, 3);
     }
     {
-        // A user who genuinely wants one slot still gets one. This is the case that motivated
-        // the original clamp, so it must stay overridable in the direction that costs speed.
         common_params   p = parsed_like_llama_cpp();
         p.model.path    = m;
         p.n_parallel    = 1;
@@ -333,5 +330,105 @@ AMP_TEST(preflight_applies_the_measured_kv_dtypes) {
         AMP_CHECK_MSG(r2.ok(), "should not fail: " + r2.message());
         AMP_CHECK_MSG(q.cache_type_v == GGML_TYPE_F16,
                       std::string("an explicit -ctv must survive, got ") + ggml_type_name(q.cache_type_v));
+    }
+}
+
+AMP_TEST(model_config_variant_sets_kv_dtypes) {
+    // A preset must be indistinguishable from typing its flags: same fields, and the same
+    // "the user asked" bits so the planner does not undo it.
+    const char * m = model_path();
+    if (!m) {
+        return;
+    }
+    PreflightOptions o;
+    o.n_ctx = 4096;
+
+    {
+        common_params   p = parsed_like_llama_cpp();
+        p.model.path    = m;
+        p.cache_type_k  = GGML_TYPE_F16;
+        p.cache_type_v  = GGML_TYPE_F16;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{
+            "amp-server", "-m", m, "--model-config", "occamy-1.0-apex-i-miniplus:v1" });
+        AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
+        AMP_CHECK_MSG(p.cache_type_v == GGML_TYPE_Q4_0,
+                      std::string("v1 must set q4_0 V, got ") + ggml_type_name(p.cache_type_v));
+    }
+    {
+        common_params   p = parsed_like_llama_cpp();
+        p.model.path    = m;
+        p.cache_type_k  = GGML_TYPE_F16;
+        p.cache_type_v  = GGML_TYPE_F16;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{
+            "amp-server", "-m", m, "--model-config", "occamy-1.0-apex-i-miniplus:v3" });
+        AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
+        AMP_CHECK_MSG(p.cache_type_v == GGML_TYPE_F16,
+                      std::string("v3 must set f16 V, got ") + ggml_type_name(p.cache_type_v));
+        // f16 KV does not fit at 200k on this box, so the preset has to bring its own context.
+        AMP_CHECK_MSG(p.n_ctx == 131072,
+                      "v3 must lower n_ctx to fit f16, got " + std::to_string(p.n_ctx));
+    }
+}
+
+AMP_TEST(model_config_yields_to_an_explicit_flag) {
+    // The whole point of a preset: it fills gaps, it does not fight the command line. This was
+    // briefly inverted, and the symptom was silent - the preset's values won and nothing said so.
+    const char * m = model_path();
+    if (!m) {
+        return;
+    }
+    PreflightOptions o;
+    o.n_ctx = 4096;
+
+    common_params   p = parsed_like_llama_cpp();
+    p.model.path    = m;
+    p.n_ctx         = 200000;                       // as "-c 200000" would have left it
+    p.cache_type_v  = GGML_TYPE_Q8_0;               // as "-ctv q8_0" would have left it
+    const auto r = apply_preflight(o, p, std::vector<std::string>{
+        "amp-server", "-m", m, "--model-config", "occamy-1.0-apex-i-miniplus:v3", "-c", "200000", "-ctv", "q8_0" });
+    AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
+    AMP_CHECK_MSG(p.cache_type_v == GGML_TYPE_Q8_0,
+                  std::string("an explicit -ctv must beat the preset, got ") + ggml_type_name(p.cache_type_v));
+    AMP_CHECK_MSG(p.n_ctx == 200000,
+                  "an explicit -c must beat the preset, got " + std::to_string(p.n_ctx));
+}
+
+AMP_TEST(model_config_rejects_a_bad_spec_instead_of_guessing) {
+    // A quality dial that quietly does nothing is the worst failure mode it can have, so an
+    // unknown variant is a hard error. Bare numbers are accepted as well as the vN spelling.
+    const char * m = model_path();
+    if (!m) {
+        return;
+    }
+    PreflightOptions o;
+    o.n_ctx = 4096;
+
+    {
+        common_params p = parsed_like_llama_cpp();
+        p.model.path  = m;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{
+            "amp-server", "-m", m, "--model-config", "occamy-1.0-apex-i-miniplus:v2" });
+        AMP_CHECK_MSG(r.ok(), "the bare vN form must work: " + r.message());
+    }
+    {
+        common_params p = parsed_like_llama_cpp();
+        p.model.path  = m;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{
+            "amp-server", "-m", m, "--model-config", "occamy-1.0-apex-i-miniplus:2" });
+        AMP_CHECK_MSG(r.ok(), "a bare number must work too: " + r.message());
+    }
+    {
+        common_params p = parsed_like_llama_cpp();
+        p.model.path  = m;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{
+            "amp-server", "-m", m, "--model-config", "occamy-1.0-apex-i-miniplus:v99" });
+        AMP_CHECK_MSG(!r.ok(), "an unknown variant must fail rather than fall back to a default");
+    }
+    {
+        common_params p = parsed_like_llama_cpp();
+        p.model.path  = m;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{
+            "amp-server", "-m", m, "--model-config", "no-such-model:v1" });
+        AMP_CHECK_MSG(!r.ok(), "an unknown preset must fail rather than fall back to a default");
     }
 }

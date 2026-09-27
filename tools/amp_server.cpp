@@ -16,6 +16,7 @@
 //
 // Every flag llama-server accepts is accepted here, because argv goes straight to
 // `common_params_parse`. The preflight never overrides one the user passed explicitly.
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -49,15 +50,61 @@ int main(int argc, char ** argv) {
     // out, so the two halves share one logging setup.
     common_init();
 
-    common_params params;
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
-        return 1;
+    // --model-config is amp's own flag, and common_params_parse rejects anything it does not
+    // know, so it is removed from the vector handed to llama.cpp and kept in the one handed to
+    // the preflight. This is a single well-defined filter rather than a second argument parser,
+    // which is what "intercept and strip" would otherwise have meant; everything else in argv
+    // still goes straight through, and llama.cpp stays the only owner of its own flags.
+    // Other preflight knobs remain environment variables for the same reason. See
+    // docs/PREFLIGHT.md.
+    std::vector<std::string> args;
+    args.reserve((size_t) argc);
+    for (int i = 0; i < argc; i++) {
+        args.emplace_back(argv[i]);
     }
 
-    // Preflight knobs are environment variables rather than new flags on purpose: argv is
-    // llama.cpp's, and inventing flags here would mean intercepting and stripping them before
-    // common_params_parse sees them. That is a parser we would have to keep in sync with
-    // upstream for no benefit. See docs/PREFLIGHT.md.
+    const bool has_mc =
+        std::find(args.begin(), args.end(), "--model-config") != args.end() ||
+        std::find(args.begin(), args.end(), "-mc") != args.end();
+
+    // The value, however it was spelled: "--model-config x", "--model-config=x", same for -mc.
+    std::string mc_value;
+    for (size_t i = 0; i < args.size(); i++) {
+        const std::string & a = args[i];
+        if ((a == "--model-config" || a == "-mc") && i + 1 < args.size()) {
+            mc_value = args[i + 1];
+            break;
+        }
+        if (a.rfind("--model-config=", 0) == 0) { mc_value = a.substr(15); break; }
+        if (a.rfind("-mc=", 0) == 0)            { mc_value = a.substr(4);  break; }
+    }
+    const std::string * mc_spec = mc_value.empty() ? nullptr : &mc_value;
+
+    std::vector<std::string> llama_argv;
+    llama_argv.reserve((size_t) argc);
+    for (size_t i = 0; i < args.size(); i++) {
+        if (args[i] == "--model-config" || args[i] == "-mc") {
+            i++;   // skip the value too
+            continue;
+        }
+        if (args[i].rfind("--model-config=", 0) == 0 || args[i].rfind("-mc=", 0) == 0) {
+            continue;
+        }
+        llama_argv.push_back(args[i]);
+    }
+
+    // common_params_parse takes char**, so the filtered vector needs a stable char* per entry.
+    std::vector<char *> llama_argp;
+    llama_argp.reserve(llama_argv.size());
+    for (std::string & a : llama_argv) {
+        llama_argp.push_back(a.data());
+    }
+
+    common_params params;
+    if (!common_params_parse((int) llama_argp.size(), llama_argp.data(), params,
+                             LLAMA_EXAMPLE_SERVER)) {
+        return 1;
+    }
     amp::PreflightOptions opts;
     opts.warm     = env_flag("AMP_WARM", false);
     opts.verbose  = env_flag("AMP_VERBOSE", false);
@@ -65,16 +112,25 @@ int main(int argc, char ** argv) {
         opts.n_ctx = std::strtoll(ctx, nullptr, 10);
     }
 
-    std::vector<std::string> args;
-    args.reserve((size_t) argc);
-    for (int i = 0; i < argc; i++) {
-        args.emplace_back(argv[i]);
-    }
+    // "--model-config <name>" with no ":vN" is a query, not a configuration. Serving after it
+    // would mean the listing is printed and then a 13.66 GiB model is loaded behind it, which is
+    // not what someone asking what variants exist wants. Run the preflight to produce the
+    // listing, print it, and stop.
+    const bool mc_query = has_mc && mc_spec &&
+                          mc_spec->find(':') == std::string::npos;
 
     // Mutates params in place. No backend init, no model load, no context: llama_server() owns
     // all of that, and doing any of it here would either double-initialise the backend or read
     // the 12 GB of weights twice.
     const amp::Result<std::vector<std::string>> notes = amp::apply_preflight(opts, params, args);
+
+    if (mc_query) {
+        for (const std::string & n : *notes) {
+            AMP_INFO("amp: ", n);
+        }
+        return 0;
+    }
+
     if (!notes.ok()) {
         // A failed plan is a performance problem, not a correctness one. Say so and let the
         // server start on its own defaults rather than refusing to serve.
