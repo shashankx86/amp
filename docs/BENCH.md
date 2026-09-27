@@ -668,3 +668,82 @@ both engines are measured in that same session**, which is why the 28.39-vs-30.0
 alternating on one machine rather than quoted from two different days. It also explains how the
 project came to believe both "35.25 t/s" and "28.39 t/s" at different times without either being a
 lie: they are different cache states. Neither is a speedup over llama-server.
+
+## 2026-09-27 — every quality-neutral decode lever, exhausted
+
+Follow-up to the placement result above. If decode is compute-bound, then the remaining levers are
+parallelism, prefetching, and speculation. All three were measured.
+
+### M3c is refuted with a number, not an opinion
+
+From the `-ncmoe` sweep: g=0 -> 30.39 t/s, g=4 -> 31.44 t/s. g=4 removes 1.29 GiB of 12.19 GiB
+(10.7 %) of expert weights from the CPU path. Writing decode time as `t = a + b` with `b`
+proportional to CPU expert bytes and solving for the split:
+
+| | share of decode time |
+|---|---|
+| expert weight fetching (`b`) | **3.7 %** |
+| everything else (`a`) | **96.3 %** |
+
+**Expert memory is 3.7 % of decode.** M3c's entire premise is that prefetching the 8 active experts
+recovers meaningful time, and the ceiling on that is ~4 % — and prefetch hides *latency*, not bytes,
+so the realisable figure is lower still. Extrapolating as if the model were linear, moving **every**
+expert to the GPU would give **1.04x**. M3c should not be built on this evidence.
+
+That 3.7 % also says the ~4 GiB that streams from NVMe (the page cache holds 7.27 GiB of the
+12.19 GiB working set) is already well overlapped with compute. Demand paging and readahead are
+doing their job; the I/O is not what hurts.
+
+### Threads: already optimal
+
+`-t` varies generation threads, `-tb` held at 8. 200k, warm cache, 4 requests each, steady median:
+
+| `-t` | steady decode |
+|---|---|
+| 4 | 27.95 t/s |
+| **8 (default)** | **32.97 t/s** |
+| 12 | 29.96 t/s |
+| 16 | 21.19 t/s |
+
+Eight is one thread per physical core on this 8C/16T part, and it is already the peak. Twelve and
+sixteen are SMT siblings contending for the same execution units and are *worse*. The planner's
+`ncpu / 2 = 8` default is right, so there is nothing to win here.
+
+### N-gram speculative decoding: no win on this model
+
+`--spec-type ngram-simple` is lossless - drafts are verified against the target distribution - so
+it was the one remaining lever that does not touch the arithmetic. It does nothing here:
+
+| prompt | baseline | ngram-simple 8/4 |
+|---|---|---|
+| "Count from one to forty", 64 tokens | 32.32 t/s | 33.36 t/s (+3 %, inside the 22 % session variance) |
+| templated status-code list, 300 tokens | 33.51 t/s | 33.57 t/s (+0.2 %) |
+
+The 300-token templated case was the fair test: n-gram prediction should pay best on output that
+repeats a structure, and it still moved nothing. This model is too entropic at the token level for
+drafting to find matches.
+
+### What this leaves
+
+Measured and spent: concurrency (**44x**, the only large win), the KV-dtype planning fix (2.3x on
+plan quality), expert placement (**3.4 %**), context length (**2.6 %**), threads (**already
+optimal**), n-gram speculation (**0.2 %**).
+
+**Decode is ~96 % CPU arithmetic, running at the optimal thread count, on a working set whose I/O is
+already overlapped.** The only things left would change the arithmetic — custom dequant/matmul
+kernels for the MoE, or more aggressive expert quantization. The first breaks the "literally the
+same ggml code" guarantee that makes zero quality loss structural rather than merely measured; the
+second is the quality change the project rules out. Neither is a free win.
+
+A consequence worth stating plainly, because it reframes the hardware question: **the 6 GB of VRAM
+is not the binding constraint.** g=8 does not fit, but g=8 would only have been worth ~3 %. Buying
+more VRAM, or a faster GPU, would change very little for this model. It is compute-bound on eight
+Zen 3 cores.
+
+### The one thing still unmeasured
+
+30 of the 40 layers are recurrent (linear attention). They are the obvious suspect for the 96 %,
+because an SSM recurrence is sequential and parallelises badly — and nobody would guess that from
+"MoE precompute" framing. Those layers' weights are already on the GPU (only expert weights are
+pinned to CPU), but the *recurrence* may still be running badly. No per-op profile has been taken.
+That is where a genuinely custom optimisation would start, and it is the opposite of M3c.
