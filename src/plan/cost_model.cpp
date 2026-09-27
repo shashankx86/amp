@@ -14,6 +14,11 @@ double env_double(const char * name, double def) {
     const char * v = getenv(name);
     return v ? atof(v) : def;
 }
+
+int64_t env_int(const char * name, int64_t def) {
+    const char * v = getenv(name);
+    return v ? (int64_t) atoll(v) : def;
+}
 } // namespace
 
 CostModel CostModel::for_this_machine() {
@@ -37,6 +42,10 @@ CostModel CostModel::from_environment() {
                                       c.cache_ceiling_bytes / (1024.0 * 1024.0 * 1024.0)) *
                            1024.0 * 1024.0 * 1024.0;
     c.decode_ms_per_cpu_layer    = env_double("AMP_DECODE_MS_PER_LAYER", c.decode_ms_per_cpu_layer);
+    // Overridable because it is a measured, context-dependent constant rather than a physical
+    // one: 2048 saturates this box at 32k context and does not fit at 200k, and someone
+    // measuring on different silicon should not have to edit a header to test that.
+    c.ubatch_saturation         = env_int("AMP_UBATCH_SATURATION", c.ubatch_saturation);
     return CostModel(c);
 }
 

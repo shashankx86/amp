@@ -34,8 +34,20 @@ AMP_TEST(cost_model_ubatch_efficiency_is_monotonic) {
         AMP_CHECK(e > 0.0 && e <= 1.0);
         prev = e;
     }
-    AMP_CHECK_NEAR(c.ubatch_efficiency(1024), 1.0, 1e-9);
-    AMP_CHECK(c.ubatch_efficiency(2048) >= 0.999);
+    // Saturation is at 2048, not 1024. Measured 2026-09-28 with bench_prefill.py, five distinct
+    // ~8192-token prompts, 32768 ctx: 1024 -> 604.4 t/s, 2048 -> 836.5 t/s, and identical with
+    // placement pinned at g=7, so the win is the batch size rather than a VRAM side effect. This
+    // assertion used to demand 1.0 at 1024, which is how the constant survived being wrong by 2x.
+    AMP_CHECK_NEAR(c.ubatch_efficiency(2048), 1.0, 1e-9);
+    // 1024 must be strictly below saturation now. If this ever returns to 1.0, the measured
+    // +38% has stopped being represented in the model and the planner will pick 1024 again.
+    AMP_CHECK_MSG(c.ubatch_efficiency(1024) < 0.999,
+                  format("1024 must not read as saturated; got %.6f", c.ubatch_efficiency(1024)));
+    // The measured ratio, to within the spread those two numbers carried.
+    const double ratio = c.ubatch_efficiency(2048) / c.ubatch_efficiency(1024);
+    AMP_CHECK_MSG(ratio > 1.3 && ratio < 1.7,
+                  format("2048/1024 efficiency ratio %.3f should bracket the measured 1.38x",
+                         ratio));
 }
 
 AMP_TEST(cost_model_io_bounds_prefill) {

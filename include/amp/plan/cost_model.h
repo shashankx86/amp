@@ -22,8 +22,27 @@ enum class IoMode { kPageFault, kPrefetch };
 struct CostModelConstants {
     // Prefill, cache-resident (i.e. pure compute). Measured: 11,568-token prompt in 47.6 s.
     double prefill_ceiling_tps      = 240.0;
-    // Ubatch at which GEMM efficiency saturates (measured sweet spot).
-    int64_t ubatch_saturation      = 1024;
+    // Ubatch at which GEMM efficiency saturates. MEASURED 2026-09-28, and it was wrong before.
+    //
+    // This used to be 1024, on the strength of a single-request sweep whose own spread was
+    // later measured at 2.35x. Re-measured with scripts/bench_prefill.py (five distinct
+    // ~8192-token prompts, one server process, 32768 ctx):
+    //
+    //   ub=1024  604.4 t/s   g=7  5.57/5.89 GiB   spread 3.42x
+    //   ub=2048  836.5 t/s   g=6  5.84/5.89 GiB   spread 1.28x
+    //
+    // +38%, and identical with placement pinned at g=7 via -ncmoe 33 (836.8 t/s), so the
+    // "a bigger buffer displaces GPU expert layers" argument does not explain it: a
+    // 2048-token batch activates so many experts that one more resident layer is a rounding
+    // error. Strata chunks prompts at 2048 for the same reason.
+    //
+    // The shape of the curve was always right - sub-linear, saturating - the saturation point
+    // was just set at half the true value, which made every ubatch above 1024 look free of
+    // benefit. It is a context-dependent constant, not a box-wide one: 2048 needs a 1.91 GiB
+    // compute buffer and leaves 50 MiB of VRAM, which is fine at 32k and does not fit at 200k.
+    // That is why the planner still lands on 1024 at 200k, and why it should be allowed to
+    // pick 2048 where the budget allows. See docs/BENCH.md, 2026-09-28.
+    int64_t ubatch_saturation      = 2048;
     double ubatch_efficiency_floor = 0.35;
     // NVMe under *demand paging with readahead* (measured with mincore, this is the path amp
     // and llama.cpp both use): 1737-1804 MiB/s cold, 100% of pages stay resident afterwards.
