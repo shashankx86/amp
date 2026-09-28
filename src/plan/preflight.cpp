@@ -332,6 +332,28 @@ static bool read_variant(const std::string & path, const std::string & section,
     return found;
 }
 
+// Splits a --model-config value into the preset name and the "[name:suffix]" header to look for.
+// Returns false when no variant was named, which the caller reports as a listing.
+//
+// The suffix is whatever the config file's headers use, so a second axis can be added without
+// touching the parser: ":v2" is the KV quality dial, ":s2" a sampler profile. A bare number still
+// means the v axis, because "name:2" is the obvious thing to type and there is no reason to make
+// it an error.
+static bool resolve_variant(const std::string & arg, std::string & name, std::string & want) {
+    name = arg;
+    want.clear();
+    const size_t colon = arg.find(':');
+    if (colon == std::string::npos) {
+        return false;
+    }
+    name = arg.substr(0, colon);
+    const std::string suffix = arg.substr(colon + 1);
+    const bool bare_number =
+        !suffix.empty() && suffix.find_first_not_of("0123456789") == std::string::npos;
+    want = name + (bare_number ? ":v" : ":") + suffix;
+    return true;
+}
+
 static bool list_variants(const std::string & path, const std::string & name, std::string & out) {
     FILE * fp = fopen(path.c_str(), "r");
     if (!fp) {
@@ -507,6 +529,54 @@ bool user_set_layout(const common_params & params) {
 
 } // namespace
 
+// Splits an extra_args value into argv tokens: whitespace-separated, with double quotes grouping a
+// token that contains spaces. The quoting is the only concession to path arguments, and it is
+// there because "--chat-template-file /some dir/template.jinja" is a real flag and silently
+// splitting it into two arguments would be a confusing way to fail.
+static std::vector<std::string> split_args(const std::string & v) {
+    std::vector<std::string> out;
+    std::string              cur;
+    bool                     in_quote = false, have = false;
+    for (const char c : v) {
+        if (c == '"') {
+            in_quote = !in_quote;
+            have     = true;
+        } else if (!in_quote && (c == ' ' || c == '\t')) {
+            if (have) {
+                out.push_back(cur);
+            }
+            cur.clear();
+            have = false;
+        } else {
+            cur += c;
+            have = true;
+        }
+    }
+    if (have) {
+        out.push_back(cur);
+    }
+    return out;
+}
+
+std::vector<std::string> model_config_extra_args(const std::string & spec, std::string & err) {
+    err.clear();
+    std::string name, want;
+    if (spec.empty() || !resolve_variant(spec, name, want)) {
+        return {};
+    }
+    std::vector<std::pair<std::string, std::string>> kv;
+    if (!read_variant(model_configs_path(), want, kv, err)) {
+        err.clear();   // apply_preflight() raises the authoritative error for a bad spec
+        return {};
+    }
+    for (const auto & p : kv) {
+        if (p.first == "extra_args") {
+            return split_args(p.second);
+        }
+    }
+    return {};
+}
+
 Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
                                                  common_params & params,
                                                  const std::vector<std::string> & argv) {
@@ -536,23 +606,9 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
 
         const std::string path  = model_configs_path();
         const std::string arg  = spec;
-        std::string       name  = arg;
+        std::string       name;
         std::string       want;
-
-        const size_t colon = arg.find(':');
-        if (colon != std::string::npos) {
-            name = arg.substr(0, colon);
-            // The suffix is whatever the config file's headers use, so a second axis can be added
-            // without touching the parser: ":v2" is the KV quality dial, ":s2" a sampler profile.
-            // A bare number still means the v axis, because "name:2" is the obvious thing to type
-            // and there is no reason to make it an error.
-            const std::string suffix = arg.substr(colon + 1);
-            const bool bare_number = !suffix.empty() &&
-                                     suffix.find_first_not_of("0123456789") == std::string::npos;
-            want = name + (bare_number ? ":v" : ":") + suffix;
-        }
-
-        if (want.empty()) {
+        if (!resolve_variant(arg, name, want)) {
             std::string listing;
             if (!list_variants(path, name, listing)) {
                 note("no variants of \"" + name + "\" in " + path);
@@ -575,6 +631,17 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
             const std::string & v = p.second;
 
             if (k == "label") { label = v; continue; }
+
+            // extra_args was already spliced into argv by amp-server before common_params_parse
+            // ran, so llama.cpp has parsed it and the preflight has seen it in argv like any other
+            // flag. Re-applying it here would double every argument in it.
+            if (k == "extra_args") {
+                if (!skipped.empty()) {
+                    skipped += ", ";
+                }
+                skipped += k + " (already on the command line)";
+                continue;
+            }
 
             // If the command line already set this one, the preset must not touch it: an
             // explicit flag outranks a preset, and silently overwriting it would be the exact

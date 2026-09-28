@@ -78,4 +78,21 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
                                                  common_params & params,
                                                  const std::vector<std::string> & argv);
 
+// The command-line arguments a model config contributes through its `extra_args` key, already
+// split into tokens.
+//
+// This exists because argv is built and parsed by llama.cpp before apply_preflight() runs, so
+// args that a config file names have to be in argv before common_params_parse, not after. Rather
+// than teach the preflight a second argument parser, the config's extra_args are handed back here
+// for amp-server to splice into argv, and llama.cpp parses them exactly as it would parse a
+// user's own. Every llama-server flag is therefore reachable from a config file, including ones
+// that did not exist when the preflight was written, and the preflight still sees them in argv,
+// so a flag supplied by a config counts as user-supplied and is not overridden.
+//
+// `spec` is the same spelling as --model-config's value, and an empty spec, a bare name, or an
+// unknown variant yields an empty vector and an empty `err` rather than an error: this is a
+// lookup on the startup path, and the authoritative hard error for a bad spec is raised by
+// apply_preflight() afterwards.
+std::vector<std::string> model_config_extra_args(const std::string & spec, std::string & err);
+
 } // namespace amp

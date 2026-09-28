@@ -1,0 +1,52 @@
+# DeepSWE via pier, driving the opencode agent against a local amp-server.
+#
+# Two facts about this setup that are not obvious from the DeepSWE quickstart:
+#
+#   1. pier drives `opencode` directly (pier/agents/factory.py registers OpenCode alongside
+#      claude-code, codex, gemini-cli and mini-swe-agent). The quickstart only shows
+#      mini-swe-agent because that is what the leaderboard was run with, not because the
+#      others are the only option. So amp is benchmarked through the agent the user already
+#      runs, with no proxy in between.
+#
+#   2. The agent runs INSIDE a sandbox container, so it cannot reach a server on the host's
+#      127.0.0.1. It reaches it at the bridge address instead. On this box that is
+#      192.168.122.1 (virbr0), which is a virtual bridge rather than the LAN address
+#      192.168.1.23 - deliberately, so binding amp does not expose it to the network.
+#
+# The provider block is injected with --ak opencode_config because pier only auto-wires
+# OPENAI_BASE_URL when the provider is literally named "openai" (pier/agents/installed/
+# opencode.py:430-433), and naming it "amp" is what lets the model keep its own name in the
+# trajectory metadata. The shape used here is npm + options.baseURL, which is what the
+# OpenCode config schema documents and what pier itself emits; the package + settings spelling
+# in the user's own opencode.json also loads, so either is acceptable.
+#
+# No sampler keys appear in the OpenCode config, and that is deliberate. The provider package
+# filters out any options key it owns and passes the rest into the request body, but the
+# measurements showed OpenCode never actually forwards them: a request carrying
+# temperature/top_p/top_k/min_p in the body arrives at llama-server with llama-server's own
+# defaults. So the samplers are pinned on the server, by --model-config, where they are
+# verified to arrive. Putting them in the client config would be decoration.
+agents:
+  - agent: opencode
+    model: amp/occamy
+    kwargs:
+      opencode_config:
+        model: amp/occamy
+        provider:
+          amp:
+            npm: "@opencode/ai/providers/openai-compatible"
+            options:
+              baseURL: "http://192.168.122.1:8081/v1"
+              apiKey: "none"
+            models:
+              occamy:
+                name: "Occamy via amp"
+                capabilities:
+                  tools: true
+                  input: ["text"]
+                  output: ["text"]
+                limit:
+                  context: 200192
+                  output: 8192
+                compatibility:
+                  reasoningField: "reasoning_content"

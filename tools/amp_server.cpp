@@ -80,6 +80,29 @@ int main(int argc, char ** argv) {
     }
     const std::string * mc_spec = mc_value.empty() ? nullptr : &mc_value;
 
+    // A model config's `extra_args` become real argv entries, here and before common_params_parse.
+    // Putting them any later would mean the preflight had to learn a second argument parser and
+    // that every flag llama.cpp has would need a matching case here; this way llama.cpp parses
+    // them exactly as it parses the user's own, and the preflight then sees them in argv and so
+    // treats them as user-supplied. That last part is the point of doing it this early: a flag
+    // that arrived via a config is a flag the user asked for, and must not be planner-overridden.
+    //
+    // Inserted straight after argv[0], and before the user's own arguments, so that a flag present
+    // in both the config and the command line is won by the command line: llama.cpp assigns each
+    // occurrence in turn, so the last one parsed is the one in effect (common/arg.cpp:790-812
+    // applies each handler as it walks argv). This is the same precedence every other key in the
+    // config file already has, and putting these last would silently invert it for every flag.
+    if (mc_spec) {
+        std::string err;
+        const std::vector<std::string> extra = amp::model_config_extra_args(*mc_spec, err);
+        if (!err.empty()) {
+            fprintf(stderr, "amp: model-config %s: %s\n", mc_spec->c_str(), err.c_str());
+        }
+        if (!extra.empty()) {
+            args.insert(args.begin() + 1, extra.begin(), extra.end());
+        }
+    }
+
     std::vector<std::string> llama_argv;
     llama_argv.reserve((size_t) argc);
     for (size_t i = 0; i < args.size(); i++) {
