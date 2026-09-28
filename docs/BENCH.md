@@ -1732,3 +1732,64 @@ planner's VRAM-driven choice lands at g=3..6 at 200k, well inside the paying reg
 `--gpu-layers 14` is **refused** by the planner (fails model load) but prints the refusal to
 stderr only, so a script that captures stdout sees an empty file and reads it as a hang. Worth
 knowing: `amp-infer --gpu-layers 14` never starts, it does not run slowly.
+
+## 2026-09-28: the 1.36x is not threads, and its cheap fix does not exist on this kernel
+
+Two follow-ups on the g-sweep's marginal cost of **0.461 ms per CPU expert layer against 0.339 ms
+of pure bandwidth**. If that 0.12 ms/layer (~4 ms/token, 13% of decode) is recoverable, it is the
+last lever left, and it is a kernel question rather than a bandwidth one. Strata's answer to
+exactly this shape is `moe_grouped_s2`, motivated by their `h_layer = 0.0456` ruling out the
+cheap kernel shapes.
+
+### Not thread count
+
+g=6, `-c 8192`, `--repeat 3`, 1536 tokens per point, 2 runs each. nproc = 16.
+
+| threads | ms/token | vs 8 |
+|---:|---:|---:|
+| 4 | 37.42 | +7.8% |
+| 6 | 35.32 | +1.7% |
+| **8 (planner default, ncpu/2)** | **34.72** | - |
+| 12 | 35.94 | +3.5% |
+| 16 | 43.75 | **+26.0%** |
+
+**8 is optimal and 16 is 26% worse.** If the overhead were latency in the gather/scatter, extra
+threads would recover some of it; they lose instead, which is the signature of a
+bandwidth-and-barrier-bound path rather than an under-parallelised one. The planner's `ncpu/2`
+default is right and there is nothing here.
+
+### The mechanism, and why its cheap fix does not exist here
+
+`ggml_compute_forward_mul_mat_id` (ggml-cpu.c:1550) parallelises **over output rows within one
+expert** (`nchunk1`/`dr1`) and iterates experts **serially** in the outer loop. At batch 1 that is
+8 sequential expert matvecs per layer, 40 layers, so ~320 serial chunks per token. And the
+isolated matvec measures 29-30 GB/s on one *contiguous* expert tensor, while real decode does 320
+*scattered* ~10 MiB reads out of a 12.19 GiB set. Scattered reads cost TLB walks, and the 1.36x
+is consistent with that.
+
+The cheap fix for TLB pressure is huge pages, and the expert set is 3.2 million 4 KiB pages:
+
+```
+/sys/kernel/mm/transparent_hugepage/enabled   ->  [always] madvise never
+/proc/meminfo: FileHugePages:    0 kB          <- the GGUF mapping gets none
+```
+
+Tested directly rather than assumed (`/tmp/opencode/thp/thp.c`, 3 GiB file, mmap + touch, with
+and without `madvise(MADV_HUGEPAGE)`): `madvise` **returns success** and `FileHugePages` stays
+**0 kB**, and the plain-mmap control is also 0. **THP on file mappings is unavailable on this
+kernel**, so the TLB fix cannot be had by advising the existing mapping.
+
+The only route to huge pages here is Strata's: copy the experts into an **anonymous** arena and
+advise that (`ArenaExpertSource`, 33.97 GB anonymous + `lock_resident`, measured 1.79x better
+than a warm mmap). AnonHugePages does work on this box. **That is exactly the
+`--load-mode none` path this project has already recorded as freezing the box** — a 14.75 GB
+anonymous load, once. So the one remaining version of this idea is the one version already known
+to be unsafe here.
+
+**Conclusion: the ~4 ms/token of non-bandwidth cost in the expert path is real, measured, and
+not reachable on this box by threads, by huge pages, or by any memory layout short of the
+anonymous load that has already crashed it.** Writing a grouped expert kernel against
+`ggml_compute_forward_mul_mat_id` would be the remaining move, and it is a genuine upstream-scale
+change — a new `ggml` op plus a kernel — for a ceiling of ~13% of decode, on a path whose
+measured penalty is 1.36x bandwidth rather than the 4-5x that would make it worth the build.
+Recorded as the one open lever with its ceiling stated, not as work to do.
