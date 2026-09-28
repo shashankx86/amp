@@ -59,43 +59,72 @@ const char * argv_value(const std::vector<std::string> & argv, const std::string
 // ---------------------------------------------------------------------------
 // Sampler keys: the config-file spelling, the flags that set them, and where the value lands.
 //
-// A table rather than five UserFlags bits, because the planner treats the samplers as one axis
-// (a whole profile, chosen by name) while the command line treats them as five independent flags.
-// A table is also the only way to keep the "an explicit flag beats the preset" rule from drifting:
-// one row per key, so adding a key cannot forget its flag spelling.
+// A table rather than a UserFlags bit per key, because the planner treats the samplers as one
+// axis (a whole profile, chosen by name) while the command line treats them as independent flags.
+// A table is also the only way to keep "an explicit flag beats the preset" and "these are the
+// defaults" from drifting apart: one row per key carries its flag spelling, its field, its bit and
+// its default, so adding a key cannot forget any of the four.
 //
-// Two details in the rows are not optional:
+// Four things in the rows are not optional:
 //
 //   alt_flag  Every flag here is a real llama-server flag, and the alternates are the other
 //             spellings its own parser accepts. A flag amp lists but llama.cpp lacks would be a
 //             setting that never takes effect, which is the exact failure this mechanism exists
 //             to prevent.
 //
-//   bit       llama.cpp gates each sampler behind a user_sampling_config bit, and a sampler with
+//   bit       llama.cpp gates most samplers behind a user_sampling_config bit, and a sampler with
 //             its bit clear is overwritten by the GGUF's own sampling metadata
 //             (common/common.cpp:1217, 1235-1242). Setting the field without the bit would let
 //             the model file quietly undo the preset, so the bit is set with the value. This is
 //             the same pair of statements llama.cpp's own flag handlers make (common/arg.cpp:
-//             2015-2017).
+//             2015-2017). A bit of 0 means llama.cpp has no bit for that sampler - true of
+//             presence_penalty, whose own flag handler (common/arg.cpp:2101-2108) sets no bit
+//             either, so amp matching that is matching upstream rather than losing a guard.
+//
+//   dflt      The value the planner uses when neither a flag nor a preset said anything. These
+//             are the deterministic-coding profile and are the reason this table exists rather
+//             than a dozen lines in the rule that sets them: a profile is a set of values chosen
+//             together, and a rule that names them one at a time is how a profile ends up half
+//             applied. An empty dflt means "amp has no opinion", which is different from a
+//             default of 0 and is why the column is a string.
+//
+//   kind      Only presence_penalty and enable_thinking are not plain floats. enable_thinking is
+//             not a sampler at all: it is a chat-template variable, and llama.cpp exposes it as
+//             -rea/--reasoning, which sets two fields at once (common/arg.cpp:3688-3700).
+enum SamplerKind { kSampFloat, kSampTopK, kSampThinking };
+
 struct SamplerKey {
     const char * key;         // key as written in a model config
     const char * long_flag;   // canonical flag
     const char * alt_flag;    // llama.cpp's other accepted spelling, or nullptr
-    float common_params_sampling::* dst;
-    uint64_t bit;
+    SamplerKind  kind;
+    float common_params_sampling::* dst;   // kSampFloat only
+    uint64_t     bit;                        // 0 when llama.cpp defines no bit
+    const char * dflt;                       // amp's default, or nullptr for no opinion
 };
 
 static const SamplerKey kSamplerKeys[] = {
-    { "temperature",        "--temp",          "--temperature",     &common_params_sampling::temp,
-      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP           },
-    { "top_p",              "--top-p",         nullptr,             &common_params_sampling::top_p,
-      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P           },
-    { "top_k",              "--top-k",         nullptr,             nullptr,
-      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K           },
-    { "min_p",              "--min-p",         nullptr,             &common_params_sampling::min_p,
-      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P           },
-    { "repetition_penalty", "--repeat-penalty", nullptr,             &common_params_sampling::penalty_repeat,
-      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT  },
+    { "temperature",        "--temp",           "--temperature", kSampFloat,
+      &common_params_sampling::temp, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP,
+      "0.20" },
+    { "top_p",              "--top-p",          nullptr,          kSampFloat,
+      &common_params_sampling::top_p, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P,
+      "0.95" },
+    { "top_k",              "--top-k",          nullptr,          kSampTopK,
+      nullptr,             common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K,
+      "20" },
+    { "min_p",              "--min-p",          nullptr,          kSampFloat,
+      &common_params_sampling::min_p, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P,
+      "0.05" },
+    { "repetition_penalty", "--repeat-penalty", nullptr,          kSampFloat,
+      &common_params_sampling::penalty_repeat, common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT,
+      "1.05" },
+    { "presence_penalty",   "--presence-penalty", nullptr,        kSampFloat,
+      &common_params_sampling::penalty_present, 0,
+      nullptr },
+    { "enable_thinking",    "--reasoning",      "-rea",           kSampThinking,
+      nullptr, 0,
+      nullptr },
 };
 
 static const SamplerKey * find_sampler_key(const std::string & k) {
@@ -117,24 +146,86 @@ static bool sampler_flag_given(const std::vector<std::string> & argv, const std:
     return argv_has(argv, s->long_flag) || (s->alt_flag && argv_has(argv, s->alt_flag));
 }
 
-// Parses one sampler value, or returns false with a reason. The accepted ranges are llama.cpp's
-// own, not new ones: top_p and min_p are probabilities whose documented "disabled" values are
-// 1.0 and 0.0 (common/arg.cpp:2030, 2038), and repeat-penalty must be finite and above 0 or
-// llama.cpp refuses to start (common/arg.cpp:2091-2094). top_k is an int32, 0 meaning disabled.
-static bool parse_sampler_value(const std::string & key, const std::string & v, float & out) {
-    char * end = nullptr;
+// Parses one value, or returns false. The accepted ranges are llama.cpp's own, not new ones:
+// top_p and min_p are probabilities whose documented disabled values are 1.0 and 0.0
+// (common/arg.cpp:2030, 2038), repeat-penalty must be finite and above 0 or llama.cpp refuses to
+// start (common/arg.cpp:2091-2094), and presence-penalty need only be finite (2105-2106).
+// top_k is an int32, 0 meaning disabled.
+//
+// One range is deliberately stricter than upstream. llama.cpp clamps temperature at 0 and imposes
+// no ceiling, so `--temp 9.5` starts and samples from a near-uniform distribution. That is fine for
+// a flag someone typed deliberately and not fine for a line in a config file read months later by
+// someone who meant 0.95, which is the same failure an unknown key already is. So the ceiling is
+// amp's, and 2.0 is far above any temperature that still means something.
+static bool parse_sampler_float(const SamplerKey & sk, const std::string & v, float & out) {
+    char *   end = nullptr;
     const double d = strtod(v.c_str(), &end);
     if (end == v.c_str() || (end && *end != '\0') || !std::isfinite(d)) {
         return false;
     }
-    if (key == "repetition_penalty" && d <= 0.0) {
+    if (sk.key == std::string("repetition_penalty") && d <= 0.0) {
         return false;
     }
-    if ((key == "top_p" || key == "min_p") && (d < 0.0 || d > 1.0)) {
+    if ((sk.key == std::string("top_p") || sk.key == std::string("min_p")) &&
+        (d < 0.0 || d > 1.0)) {
+        return false;
+    }
+    if (sk.key == std::string("temperature") && (d < 0.0 || d > 2.0)) {
         return false;
     }
     out = (float) d;
     return true;
+}
+
+// enable_thinking is on/off/auto, and the spellings are llama.cpp's own is_truthy/is_falsey
+// (common/arg.cpp:3691-3696), so "auto" is accepted and means: leave the template to decide.
+static bool parse_thinking(const std::string & v, int & out) {
+    if (common_arg_utils::is_truthy(v)) {
+        out = 1;
+    } else if (common_arg_utils::is_falsey(v)) {
+        out = 0;
+    } else if (common_arg_utils::is_autoy(v)) {
+        out = -1;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// Applies one key's value, plus its bit when llama.cpp has one. Shared by the preset path and the
+// default path so the two cannot set the same field differently. The value must already have been
+// validated by parse_sampler_float or parse_thinking.
+static void apply_sampler(const SamplerKey & sk, const std::string & v, common_params & params) {
+    switch (sk.kind) {
+        case kSampThinking: {
+            int on = -1;
+            parse_thinking(v, on);
+            params.enable_reasoning = on;
+            // Both fields, because llama.cpp's -rea handler sets both (common/arg.cpp:3691-3696)
+            // and setting only one leaves the template and the response parser disagreeing about
+            // whether a reply should have been a thinking reply at all.
+            if (on >= 0) {
+                params.default_template_kwargs["enable_thinking"] = on ? "true" : "false";
+            }
+            return;
+        }
+        case kSampTopK: {
+            float parsed = 0.0f;
+            parse_sampler_float(sk, v, parsed);
+            params.sampling.top_k = (int32_t) parsed;
+            break;
+        }
+        case kSampFloat:
+        default: {
+            float parsed = 0.0f;
+            parse_sampler_float(sk, v, parsed);
+            params.sampling.*(sk.dst) = parsed;
+            break;
+        }
+    }
+    if (sk.bit) {
+        params.sampling.user_sampling_config |= sk.bit;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -542,20 +633,17 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
                 // The samplers are llama-server request defaults, so they apply to every request
                 // that does not carry its own value. A client that sends temperature still wins,
                 // which is why the docs say to set them here rather than in the client.
-                float parsed = 0.0f;
-                if (!parse_sampler_value(k, v, parsed)) {
-                    note("model-config: bad value \"" + v + "\" for " + k +
-                         " in " + want);
+                const bool ok = sk->kind == kSampThinking
+                                    ? [&] { int t; return parse_thinking(v, t); }()
+                                    : [&] { float f; return parse_sampler_float(*sk, v, f); }();
+                if (!ok) {
+                    note("model-config: bad value \"" + v + "\" for " + k + " in " + want +
+                         (sk->kind == kSampThinking
+                              ? " (expected on, off or auto)"
+                              : " (expected a number in that sampler's own range)"));
                     return Status::Error("bad model config");
                 }
-                if (sk->dst) {
-                    params.sampling.*(sk->dst) = parsed;
-                } else {
-                    // top_k is int32 in common_params but shares this table so that the flag
-                    // check and the range rules live in one place.
-                    params.sampling.top_k = (int32_t) parsed;
-                }
-                params.sampling.user_sampling_config |= sk->bit;
+                apply_sampler(*sk, v, params);
             } else {
                 // Never silently ignore a key. A config file that quietly does nothing is the
                 // worst failure mode a quality dial can have.
@@ -686,31 +774,24 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
     //    this pinned must not send the field. The model config file is the place to pin it.
     bool touched = false;
     for (const SamplerKey & sk : kSamplerKeys) {
-        if (params.sampling.user_sampling_config & sk.bit) {
+        // No dflt means amp has no opinion on that key, which is not the same as a default of 0:
+        // presence_penalty and enable_thinking stay at llama.cpp's own values unless a preset or a
+        // flag names them.
+        if (!sk.dflt) {
             continue;
         }
-        const char * dflt = nullptr;
-        if (sk.bit == common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP) {
-            dflt = "0.20";
-        } else if (sk.bit == common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P) {
-            dflt = "0.95";
-        } else if (sk.bit == common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K) {
-            dflt = "20";
-        } else if (sk.bit == common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P) {
-            dflt = "0.05";
-        } else {
-            dflt = "1.05";
+        if (sk.bit && (params.sampling.user_sampling_config & sk.bit)) {
+            continue;
         }
-        float parsed = 0.0f;
-        if (!parse_sampler_value(sk.key, dflt, parsed)) {
-            continue;   // unreachable for the constants above; never silently skip a real key
+        // Also skip on the flag, not only on the bit. In production the bit is enough, because
+        // llama.cpp's own parser sets it for any sampler passed on the command line
+        // (common/arg.cpp:2015-2017). Checking the flag as well means the default cannot overwrite
+        // a value that reached params by some other route, which is the failure this loop would
+        // otherwise cause silently and only under a caller's own construction of params.
+        if (sampler_flag_given(argv, sk.key)) {
+            continue;
         }
-        if (sk.dst) {
-            params.sampling.*(sk.dst) = parsed;
-        } else {
-            params.sampling.top_k = (int32_t) parsed;
-        }
-        params.sampling.user_sampling_config |= sk.bit;
+        apply_sampler(sk, sk.dflt, params);
         touched = true;
     }
     if (touched) {

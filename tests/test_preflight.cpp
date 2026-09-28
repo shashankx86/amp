@@ -393,6 +393,121 @@ AMP_TEST(model_config_yields_to_an_explicit_flag) {
                   "an explicit -c must beat the preset, got " + std::to_string(p.n_ctx));
 }
 
+AMP_TEST(model_config_sampler_profiles) {
+    // The four published sampler profiles, checked against the values in the table rather than
+    // against themselves. :s1 is the one that catches the most: it is the only profile using
+    // presence_penalty and enable_thinking, and those are the two keys that are not plain floats.
+    //
+    // Note what the expected values say about a key the profile omits. :s1 does not name
+    // repetition_penalty, and the expected value is amp's default 1.05, not llama.cpp's 1.00. A
+    // profile is a partial description of a sampler, and the rest of the sampler is amp's, not the
+    // upstream default's - otherwise :s1 would silently be a different sampler depending on what
+    // llama.cpp happened to ship, and the four profiles would not be comparable to each other.
+    const char * m = model_path();
+    if (!m) {
+        return;
+    }
+    PreflightOptions o;
+    o.n_ctx = 4096;
+
+    struct Row { const char * spec; float temp; float top_p; int top_k; float min_p;
+                 float rep; float presence; int thinking; };
+    const Row rows[] = {
+        { "occamy-1.0-apex-i-miniplus:s1", 1.00f, 0.95f, 20, 0.05f, 1.05f, 1.5f, 1 },
+        { "occamy-1.0-apex-i-miniplus:s2", 0.20f, 0.95f, 20, 0.05f, 1.05f, 0.0f, -1 },
+        { "occamy-1.0-apex-i-miniplus:s3", 0.35f, 0.95f, 20, 0.00f, 1.00f, 0.0f, -1 },
+        { "occamy-1.0-apex-i-miniplus:s4", 0.60f, 0.95f, 20, 0.05f, 1.08f, 0.0f, -1 },
+    };
+    for (const Row & row : rows) {
+        common_params p = parsed_like_llama_cpp();
+        p.model.path   = m;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{
+            "amp-server", "-m", m, "--model-config", row.spec });
+        AMP_CHECK_MSG(r.ok(), std::string(row.spec) + " must apply: " + r.message());
+        const std::string at = std::string(" in ") + row.spec;
+        AMP_CHECK_MSG(p.sampling.temp == row.temp,
+                      "temperature" + at + ", got " + std::to_string(p.sampling.temp));
+        AMP_CHECK_MSG(p.sampling.top_p == row.top_p,
+                      "top_p" + at + ", got " + std::to_string(p.sampling.top_p));
+        AMP_CHECK_MSG(p.sampling.top_k == row.top_k,
+                      "top_k" + at + ", got " + std::to_string(p.sampling.top_k));
+        AMP_CHECK_MSG(p.sampling.min_p == row.min_p,
+                      "min_p" + at + ", got " + std::to_string(p.sampling.min_p));
+        AMP_CHECK_MSG(p.sampling.penalty_repeat == row.rep,
+                      "repetition_penalty" + at + ", got " + std::to_string(p.sampling.penalty_repeat));
+        AMP_CHECK_MSG(p.sampling.penalty_present == row.presence,
+                      "presence_penalty" + at + ", got " + std::to_string(p.sampling.penalty_present));
+        AMP_CHECK_MSG(p.enable_reasoning == row.thinking,
+                      "enable_thinking" + at + ", got " + std::to_string(p.enable_reasoning));
+    }
+}
+
+AMP_TEST(model_config_sampler_flags_win_per_key) {
+    // Per key, not per group: one --temp must not stop the preset from supplying the rest, and one
+    // --presence-penalty must not stop it from supplying enable_thinking.
+    const char * m = model_path();
+    if (!m) {
+        return;
+    }
+    PreflightOptions o;
+    o.n_ctx = 4096;
+
+    common_params p = parsed_like_llama_cpp();
+    p.model.path   = m;
+    p.sampling.temp = 0.35f;                       // as "--temp 0.35" would have left it
+    const auto r = apply_preflight(o, p, std::vector<std::string>{
+        "amp-server", "-m", m, "--model-config", "occamy-1.0-apex-i-miniplus:s1", "--temp", "0.35" });
+    AMP_CHECK_MSG(r.ok(), "should not fail: " + r.message());
+    AMP_CHECK_MSG(p.sampling.temp == 0.35f,
+                  "the flag must win, got " + std::to_string(p.sampling.temp));
+    AMP_CHECK_MSG(p.sampling.penalty_present == 1.5f,
+                  "the preset must still supply presence_penalty, got " +
+                      std::to_string(p.sampling.penalty_present));
+    AMP_CHECK_MSG(p.enable_reasoning == 1,
+                  "the preset must still enable thinking, got " + std::to_string(p.enable_reasoning));
+}
+
+AMP_TEST(model_config_rejects_a_bad_sampler_value) {
+    // A typo in a config file is the failure this whole mechanism exists to rule out, so an
+    // out-of-range number is a hard error just like an unknown key. temperature is the case worth
+    // having: llama.cpp's own flag accepts 9.5, so nothing upstream would catch it.
+    const char * m = model_path();
+    if (!m) {
+        return;
+    }
+    PreflightOptions o;
+    o.n_ctx = 4096;
+    setenv("AMP_MODEL_CONFIGS", "/nonexistent-model-configs.conf", 1);
+
+    struct Case { const char * body; };
+    const Case cases[] = {
+        { "[t:b]\ntemperature = 9.5\n" },
+        { "[t:b]\ntop_p = 3.0\n" },
+        { "[t:b]\nmin_p = -1\n" },
+        { "[t:b]\nrepetition_penalty = 0\n" },
+        { "[t:b]\nenable_thinking = maybe\n" },
+        { "[t:b]\ntemperaturre = 0.3\n" },
+    };
+    for (const Case & c : cases) {
+        const std::string path = "/tmp/amp-bad-sampler.conf";
+        FILE * fp = fopen(path.c_str(), "w");
+        AMP_CHECK_MSG(fp != nullptr, "could not write " + path);
+        if (!fp) {
+            return;
+        }
+        fputs(c.body, fp);
+        fclose(fp);
+        setenv("AMP_MODEL_CONFIGS", path.c_str(), 1);
+
+        common_params p = parsed_like_llama_cpp();
+        p.model.path   = m;
+        const auto r = apply_preflight(o, p, std::vector<std::string>{
+            "amp-server", "-m", m, "--model-config", "t:b" });
+        AMP_CHECK_MSG(!r.ok(), std::string("must be rejected: ") + c.body);
+    }
+    unsetenv("AMP_MODEL_CONFIGS");
+}
+
 AMP_TEST(model_config_rejects_a_bad_spec_instead_of_guessing) {
     // A quality dial that quietly does nothing is the worst failure mode it can have, so an
     // unknown variant is a hard error. Bare numbers are accepted as well as the vN spelling.
