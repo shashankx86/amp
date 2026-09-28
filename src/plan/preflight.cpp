@@ -10,6 +10,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <unistd.h>
 #include <list>
@@ -53,6 +54,87 @@ const char * argv_value(const std::vector<std::string> & argv, const std::string
         }
     }
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Sampler keys: the config-file spelling, the flags that set them, and where the value lands.
+//
+// A table rather than five UserFlags bits, because the planner treats the samplers as one axis
+// (a whole profile, chosen by name) while the command line treats them as five independent flags.
+// A table is also the only way to keep the "an explicit flag beats the preset" rule from drifting:
+// one row per key, so adding a key cannot forget its flag spelling.
+//
+// Two details in the rows are not optional:
+//
+//   alt_flag  Every flag here is a real llama-server flag, and the alternates are the other
+//             spellings its own parser accepts. A flag amp lists but llama.cpp lacks would be a
+//             setting that never takes effect, which is the exact failure this mechanism exists
+//             to prevent.
+//
+//   bit       llama.cpp gates each sampler behind a user_sampling_config bit, and a sampler with
+//             its bit clear is overwritten by the GGUF's own sampling metadata
+//             (common/common.cpp:1217, 1235-1242). Setting the field without the bit would let
+//             the model file quietly undo the preset, so the bit is set with the value. This is
+//             the same pair of statements llama.cpp's own flag handlers make (common/arg.cpp:
+//             2015-2017).
+struct SamplerKey {
+    const char * key;         // key as written in a model config
+    const char * long_flag;   // canonical flag
+    const char * alt_flag;    // llama.cpp's other accepted spelling, or nullptr
+    float common_params_sampling::* dst;
+    uint64_t bit;
+};
+
+static const SamplerKey kSamplerKeys[] = {
+    { "temperature",        "--temp",          "--temperature",     &common_params_sampling::temp,
+      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP           },
+    { "top_p",              "--top-p",         nullptr,             &common_params_sampling::top_p,
+      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P           },
+    { "top_k",              "--top-k",         nullptr,             nullptr,
+      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K           },
+    { "min_p",              "--min-p",         nullptr,             &common_params_sampling::min_p,
+      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P           },
+    { "repetition_penalty", "--repeat-penalty", nullptr,             &common_params_sampling::penalty_repeat,
+      common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT  },
+};
+
+static const SamplerKey * find_sampler_key(const std::string & k) {
+    for (const SamplerKey & s : kSamplerKeys) {
+        if (k == s.key) {
+            return &s;
+        }
+    }
+    return nullptr;
+}
+
+// Did the command line already fix this sampler? Checked per key rather than once for the whole
+// group, so that passing only --temp still lets a preset supply top_k, min_p and the rest.
+static bool sampler_flag_given(const std::vector<std::string> & argv, const std::string & key) {
+    const SamplerKey * s = find_sampler_key(key);
+    if (!s) {
+        return false;
+    }
+    return argv_has(argv, s->long_flag) || (s->alt_flag && argv_has(argv, s->alt_flag));
+}
+
+// Parses one sampler value, or returns false with a reason. The accepted ranges are llama.cpp's
+// own, not new ones: top_p and min_p are probabilities whose documented "disabled" values are
+// 1.0 and 0.0 (common/arg.cpp:2030, 2038), and repeat-penalty must be finite and above 0 or
+// llama.cpp refuses to start (common/arg.cpp:2091-2094). top_k is an int32, 0 meaning disabled.
+static bool parse_sampler_value(const std::string & key, const std::string & v, float & out) {
+    char * end = nullptr;
+    const double d = strtod(v.c_str(), &end);
+    if (end == v.c_str() || (end && *end != '\0') || !std::isfinite(d)) {
+        return false;
+    }
+    if (key == "repetition_penalty" && d <= 0.0) {
+        return false;
+    }
+    if ((key == "top_p" || key == "min_p") && (d < 0.0 || d > 1.0)) {
+        return false;
+    }
+    out = (float) d;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +246,9 @@ static bool list_variants(const std::string & path, const std::string & name, st
     if (!fp) {
         return false;
     }
-    const std::string prefix = name + ":v";
+    // Every "[name:...]" header, whatever the suffix letter. Listing one axis and not the other
+    // would leave the user unable to discover half the dial.
+    const std::string prefix = name + ":";
     char raw[1024];
     out  = "variants of \"" + name + "\" in " + path + ":\n";
     bool any = false;
@@ -367,14 +451,14 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
         const size_t colon = arg.find(':');
         if (colon != std::string::npos) {
             name = arg.substr(0, colon);
-            // Accept both "name:2" and "name:v2". The listing prints the "v" form, so it is the
-            // canonical one, but a bare number is the obvious thing to type and there is no
-            // reason to make it an error.
-            std::string num = arg.substr(colon + 1);
-            if (num.size() > 1 && (num[0] == 'v' || num[0] == 'V')) {
-                num = num.substr(1);
-            }
-            want = name + ":v" + num;
+            // The suffix is whatever the config file's headers use, so a second axis can be added
+            // without touching the parser: ":v2" is the KV quality dial, ":s2" a sampler profile.
+            // A bare number still means the v axis, because "name:2" is the obvious thing to type
+            // and there is no reason to make it an error.
+            const std::string suffix = arg.substr(colon + 1);
+            const bool bare_number = !suffix.empty() &&
+                                     suffix.find_first_not_of("0123456789") == std::string::npos;
+            want = name + (bare_number ? ":v" : ":") + suffix;
         }
 
         if (want.empty()) {
@@ -410,7 +494,8 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
                                  (k == "cache_ram_mib"  && f.cram)  ||
                                  (k == "n_parallel"     && f.np)    ||
                                  (k == "n_ubatch"       && f.ub)    ||
-                                 (k == "n_threads"      && f.t);
+                                 (k == "n_threads"      && f.t)     ||
+                                 (find_sampler_key(k) && sampler_flag_given(argv, k));
             if (already) {
                 // Skip before the dispatch chain, not by compounding its conditions: a compound
                 // condition would fall through to the unknown-key branch and reject a perfectly
@@ -453,6 +538,24 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
                 params.cpuparams.n_threads      = (int32_t) atoi(v.c_str());
                 params.cpuparams_batch.n_threads = (int32_t) atoi(v.c_str());
                 f.t = true;
+            } else if (const SamplerKey * sk = find_sampler_key(k)) {
+                // The samplers are llama-server request defaults, so they apply to every request
+                // that does not carry its own value. A client that sends temperature still wins,
+                // which is why the docs say to set them here rather than in the client.
+                float parsed = 0.0f;
+                if (!parse_sampler_value(k, v, parsed)) {
+                    note("model-config: bad value \"" + v + "\" for " + k +
+                         " in " + want);
+                    return Status::Error("bad model config");
+                }
+                if (sk->dst) {
+                    params.sampling.*(sk->dst) = parsed;
+                } else {
+                    // top_k is int32 in common_params but shares this table so that the flag
+                    // check and the range rules live in one place.
+                    params.sampling.top_k = (int32_t) parsed;
+                }
+                params.sampling.user_sampling_config |= sk->bit;
             } else {
                 // Never silently ignore a key. A config file that quietly does nothing is the
                 // worst failure mode a quality dial can have.
@@ -565,6 +668,60 @@ Result<std::vector<std::string>> apply_preflight(const PreflightOptions & opts,
              "13.66 GiB model needs; 512 is enough to evict it and costs 2.6x on sustained prefill. "
              "Prefix reuse comes from the slot KV, not this cache. Use -cram N to override)");
         params.cache_ram_mib = 0;
+    }
+
+    // -- Sampler defaults: the deterministic-coding profile, applied only where neither the command
+    //    line nor a model config said anything. The test is the user_sampling_config bit rather
+    //    than a separate "did a preset set this" flag, because the bit is already the record of
+    //    that fact and duplicating it would be a second thing to keep in step.
+    //
+    //    Why these values rather than llama.cpp's: the defaults are a general chat sampler, tuned
+    //    for prose. This model's job here is tool-calling code generation, where a sampled token
+    //    is a malformed edit at best and a hallucinated file write at worst. The bit set is the
+    //    whole reason this is a default and not a recommendation: with the bit clear the GGUF's
+    //    own sampling metadata overrides it, so a "default" that can be silently replaced by the
+    //    model file is not a default.
+    //
+    //    A client that sends its own temperature still wins per request, so anything that needs
+    //    this pinned must not send the field. The model config file is the place to pin it.
+    bool touched = false;
+    for (const SamplerKey & sk : kSamplerKeys) {
+        if (params.sampling.user_sampling_config & sk.bit) {
+            continue;
+        }
+        const char * dflt = nullptr;
+        if (sk.bit == common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP) {
+            dflt = "0.20";
+        } else if (sk.bit == common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P) {
+            dflt = "0.95";
+        } else if (sk.bit == common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K) {
+            dflt = "20";
+        } else if (sk.bit == common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P) {
+            dflt = "0.05";
+        } else {
+            dflt = "1.05";
+        }
+        float parsed = 0.0f;
+        if (!parse_sampler_value(sk.key, dflt, parsed)) {
+            continue;   // unreachable for the constants above; never silently skip a real key
+        }
+        if (sk.dst) {
+            params.sampling.*(sk.dst) = parsed;
+        } else {
+            params.sampling.top_k = (int32_t) parsed;
+        }
+        params.sampling.user_sampling_config |= sk.bit;
+        touched = true;
+    }
+    if (touched) {
+        const auto num = [](float v) { return std::to_string((double) v); };
+        note(std::string("samplers: ") + num(params.sampling.temp) + " / top_p " +
+             num(params.sampling.top_p) + " / top_k " + std::to_string(params.sampling.top_k) +
+             " / min_p " + num(params.sampling.min_p) + " / repeat " +
+             num(params.sampling.penalty_repeat) +
+             " (deterministic-coding defaults for tool-calling work; a flag, or a model config "
+             "variant such as :s2, overrides any of them, and a request that carries its own "
+             "value overrides them all)");
     }
 
     // -- Open the model and plan. Without a local GGUF there is nothing to plan; the
