@@ -4,32 +4,34 @@ How amp is put together, and why each piece exists. Module boundaries are enforc
 (one CMake target per module); interfaces exist wherever a second implementation is plausible.
 
 ```
-  tools/            amp-plan, amp-warm, amp-server, amp-infer
+  tools/       amp-plan  amp-warm  amp-server  amp-infer  kernel-bound
       |
-  amp_plan          cost model + memory/device planner        [pure, testable]
+  plan/        cost model, memory/device planner, preflight   [pure, testable]
       |
-  amp_model         GGUF header reader + derived geometry     [pure, testable]
+  model/       GGUF header reader + derived geometry          [pure, testable]
       |
-  amp_io            mmap, page-cache warmer, streaming reads  [the memory system]
+  io/          mmap, page-cache warmer, streaming reads       [the memory system]
       |
-  amp_util          format, bytes, log, timing, meminfo
+  runtime/     the forward path used by amp-infer
+
+  src/         format, bytes, log, timing                    [shared utilities]
 ```
 
-Dependencies point downward only. `amp_model` and `amp_plan` are pure functions of the model file,
-so they are fully testable without touching hardware; `amp_io` is the only module that does I/O.
+Dependencies point downward only. `model/` and `plan/` are pure functions of the model file, so they
+are fully testable without touching hardware; `io/` is the only module that does I/O.
 
-Four modules hold the parts that still exist. `amp_preflight` and `amp_runtime` are described at
-the end, since they were added after the first four were settled.
+`runtime/` and the preflight in `plan/` are the two pieces added after the first four settled, and
+both are described at the end.
 
 ## Modules
 
-### amp_util
+### shared utilities (src/*.cpp)
 `Status`/`Result<T>`, the only error channel across module boundaries. No exceptions cross an
 interface. Also a tiny `format()`, byte parsing/printing, a leveled logger, `Stopwatch`, and
 `read_meminfo()`. The meminfo reader exists because page-cache residency is the single most
 important signal in this project; it is a first-class utility rather than something buried in a tool.
 
-### amp_io
+### io/
 The memory system. Three pieces behind interfaces:
 
 - `MappedFile`: read-only mmap. Never `MAP_POPULATE`, never an anonymous copy. A 14.65 GB
@@ -44,7 +46,7 @@ The memory system. Three pieces behind interfaces:
 - `IReadScheduler`: composite that dispatches per `ReadPolicy` (`kCacheWarm` vs `kStream`). The
   runtime states an intent; the backends stay swappable.
 
-### amp_model
+### model/
 `GGUFFile` parses the header only: 41 KV pairs and 733 tensor infos, a few hundred KB, with
 sizes taken from ggml itself so amp's view of the file is byte-for-byte llama.cpp's view. That is
 what makes "zero quality loss" structural instead of aspirational: the arithmetic is the same code.
@@ -52,18 +54,25 @@ what makes "zero quality loss" structural instead of aspirational: the arithmeti
 `ModelGeometry` derives the facts the rest of the engine needs: per-layer expert bytes, per-expert
 bytes, the attention/recurrent split, KV bytes per token, SSM state size.
 
-### amp_plan
+### plan/
 `CostModel` holds the measured constants of this box and turns a configuration into predicted
 tokens/second. `MemoryPlanner` searches (expert layers on GPU) x (ubatch), scores with
 `0.65 * log(prefill) + 0.35 * log(decode)`, and emits an `ExecutionPlan`: device assignment,
 resident ranges to warm, streamed ranges, VRAM totals, and the top-N candidate ranking.
 
-The `IoMode` distinction is deliberate and load-bearing:
+The cost model scores each candidate twice, once per I/O mode, and `predicted_prefill_tps_faults`
+is the one that matches what actually ships:
 
-| mode | bandwidth | overlap | who |
+| mode | bandwidth | overlap | corresponds to |
 |---|---|---|---|
-| `kPageFault` | 1.85 GB/s | none (synchronous) | llama.cpp today |
-| `kPrefetch` | 2.0 GB/s | 0.75 | amp |
+| `kPageFault` | 1.85 GB/s | none (synchronous) | what the server really does |
+| `kPrefetch` | 2.0 GB/s | 0.75 | an overlap amp does not implement |
+
+**The planner's headline `predicted prefill` figure uses `kPrefetch` and is therefore optimistic.**
+`predicted_prefill_tps_faults` is the honest one. This is left as-is rather than corrected because
+the fitter's job is to *rank* candidates, and the offset is the same for all of them, so the
+ranking is unaffected. TBD: report the faults number in `amp-plan` output alongside the other, or
+switch the headline to it.
 
 ## Design rules
 
@@ -76,12 +85,11 @@ The `IoMode` distinction is deliberate and load-bearing:
    capped by what is realistically achievable; it reports both that and the momentary free cache, so
    an open browser cannot make the model look permanently un-cacheable.
 4. **Measure before claiming.** `docs/BENCH.md` carries the numbers, and a perf claim without a
-   measurement in the same commit is not acceptable. Two "measured" constants were already wrong
-   when first written (KV byte math, fault bandwidth) and the tests caught both.
+   measurement in the same commit is not acceptable.
 5. **Bounded everything.** Queues, in-flight bytes, and thread pools all have explicit limits;
    unbounded prefetch on a 6 GB box is how you get an OOM instead of a speedup.
 
-### amp_runtime
+### runtime/
 
 The forward path for `amp-infer` (the benchmark tool), on llama.cpp's kernels.
 
@@ -91,7 +99,7 @@ The forward path for `amp-infer` (the benchmark tool), on llama.cpp's kernels.
   `ffn_*_exps.weight` to the CPU for the layers the plan left there (the `-ncmoe` equivalent).
   One helper, because a missing sentinel is a segfault and two call sites had it.
 
-### amp_preflight, the whole of amp's server contribution
+### plan/preflight, the whole of amp's server contribution
 
 `src/plan/preflight.{h,cpp}`, plus `tools/amp_server.cpp` which is ~90 lines. There is no amp HTTP
 layer, no amp OpenAI translation, no amp slot management, and no amp prompt cache. All of it is
@@ -123,19 +131,17 @@ What the preflight actually does, and why each part exists:
 It never initialises a backend, loads the model, or creates a context. `llama_server()` owns all
 of that, and doing any of it twice would read 12 GB of weights twice.
 
-## What was deleted, and why
+## One design decision worth recording
 
-The hand-rolled server (`src/server/`, ~2,200 lines) plus the code that only existed to serve it
-(`prefix_cache`, `util/json`, `util/text`, ~1,600 more) is gone. It implemented 7 endpoints;
-llama.cpp's server implements 40+ and is maintained against the commit we pin.
+The hand-rolled server was deleted, about 3,800 lines including its prefix cache. The prefix cache
+was real work and it is still the interesting part of the decision: 30 of 40 layers here are
+recurrent, so the KV cannot be rewound, and the cache snapshotted the sequence at the prompt
+boundary to work around that. llama.cpp solves it better, by asking the model what it supports
+(`common_context_seq_rm_type`, `common.h:989-992`) and falling back to a full re-process with a log
+line pointing at the upstream PR (`server-context.cpp:3379`).
 
-The prefix cache is the deletion worth arguing for, because it was real work: 30 of 40 layers here
-are recurrent, so the KV cannot be rewound, and it snapshotted the sequence at the prompt boundary
-to work around that. llama.cpp solves it better, asking the model what it supports via
-`common_context_seq_rm_type` (`common.h:989-992`), keeps context checkpoints with `pos_min`/`pos_max`
-ranges, and falls back to a full re-process with a log line pointing at the upstream PR that added
-it for hybrid/recurrent memory (`server-context.cpp:3379`). Maintaining our own version of a solved
-problem was the mistake, not writing it.
+Maintaining a version of a solved problem was the mistake, not writing it. Git has the deleted
+code if anyone needs to know what it did.
 
 ## Known duplication
 

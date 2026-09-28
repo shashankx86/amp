@@ -27,12 +27,11 @@ the old amp server used.
 | 5 | the CLI flag surface, with the flags that matter on this model |
 | 6 | the reasoning and thinking surface |
 | 7 | what is testable on this box, what is not, and what is a silent no-op |
-| 8 | differences from the deleted hand-rolled amp server |
 
 Section 7 is the one to read first if you are deciding whether a feature can be verified here. It
 is the honest answer, including the 8 features that cannot.
 
----
+`scripts/parity_test.py` implements this document. A change to the contract belongs in both.
 
 ## 1. route table
 
@@ -881,34 +880,7 @@ Per AGENT.md, this template does **not** support `reasoning_effort` /
 
 ---
 
-## 8. key differences from the old amp server
-
-1. **Route count:** 7 endpoints -> 40+ (including legacy aliases).
-2. **Error taxonomy:** OpenAI `type` strings -> llama.cpp's own (`not_found_error`,
-   `not_supported_error`, `unavailable_error`, `exceed_context_size_error`,
-   `permission_error`, `authentication_error`). Status codes 401/403/404/501/503 are
-   emitted intentionally.
-3. **Reasoning:** `reasoning_content` is now split out by default (`deepseek` format);
-   the old amp server required manual splitting.
-4. **Streaming:** Resumable streaming via `X-Conversation-Id` + `/v1/stream`.
-5. **Token counting:** `/v1/chat/completions/input_tokens`, `/v1/responses/input_tokens`,
-   `/v1/messages/count_tokens`.
-6. **Slot management:** `/slots`, `/slots/:id_slot` with save/restore/erase.
-7. **Metrics:** Prometheus `/metrics`.
-8. **Models:** `/v1/models` with full metadata.
-9. **Props:** `/props` with template, caps, endpoints.
-10. **Control:** `/v1/chat/completions/control` for runtime reasoning-end.
-11. **Anthropic:** `/v1/messages` with full Anthropic Messages API.
-12. **Responses:** `/v1/responses` with OpenAI Responses API.
-13. **Embeddings/Rerank:** `/v1/embeddings`, `/v1/rerank` (with `--embeddings`/`--reranking`).
-14. **Infill:** `/infill` (if FIM tokens present).
-15. **Tools:** `/tools` (if `--tools` or MCP).
-16. **CORS proxy:** `/cors-proxy` (if `--ui-mcp-proxy`).
-17. **CLI surface:** ~140 server-relevant flags vs. the old amp server's ~10.
-
----
-
-## Verification status (added 2026-09-27)
+## Verification status
 
 This document is a description of llama.cpp's server. This section records what is actually
 *verified*, so the two cannot drift apart silently.

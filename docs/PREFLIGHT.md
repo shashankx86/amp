@@ -116,7 +116,7 @@ Most fields have no surviving unset sentinel: `postprocess_cpu_params` resolves
 | `cache_type_v` | `-ctv` (`arg.cpp:2446-2458`) | **argv** | `opts.cache_v` (q4_0) |
 
 **And the same intent test decides what the planner is *given*, and not only what is set.** See
-"the plan must use the configuration that will be applied" below - this is not a detail, it
+"A planner must be given the configuration it is planning for" below - this is not a detail, it
 was worth 4 GPU expert layers and a 2.7x smaller ubatch at `-c 200000`.
 | `flash_attn_type` | `-fa` (`arg.cpp:1751-1765`) | **argv** (default AUTO, `common.h:499`) | `LLAMA_FLASH_ATTN_TYPE_ENABLED` |
 | `cpuparams.n_threads` | `-t` (`arg.cpp:1513-1522`) | **argv** (field resolved during parse) | `opts.n_threads` / `budget.n_cpu_threads` (8) |
@@ -317,10 +317,9 @@ layout (section 5) and its 1 GiB-free target fights the planner.
 - **Future llama.cpp changes**: the padding (arg.cpp:940-944), the fit's throw checks, and
   the `MAP_POPULATE` load are all version-pinned (`third_party/DEPS.lock`); if the pin moves,
   re-verify sections 2, 4 and 5.
-- **The preflight is ~430 lines** (vs the ~300 guideline). The design is 9 small rules plus
-  a warm; the length is the `file:line` citations and per-field notes this task requires, not
-  complexity. The one genuinely chunky helper (`to_ggml`, 16 cases) is a mechanical enum
-  mapping copied from `src/server/service.cpp:26-43`.
+- **`to_ggml` is 16 cases of mechanical enum mapping** and is the one chunky helper here. It is a
+  copy of `src/server/service.cpp:26-43` and a safe place to cut lines if this file ever needs to
+  shrink further.
 
 ---
 
@@ -339,49 +338,33 @@ Assumed but not yet measured: that the planner's `vram_bytes` matches reality wi
 (section 8); and that `opts.warm`'s one-time ~5 s tail upload is acceptable. All three are
 empirical and should be measured when the module is first compiled and run.
 
-## The plan must use the configuration that will be applied
+## A planner must be given the configuration it is planning for
 
-Two bugs, both found by running the plan at 200k and comparing it against `amp-plan -c 200000`,
-which disagreed. Both were *pessimistic*, so they cost performance and never produced a wrong
-answer - the dangerous class, because nothing fails loudly.
+Two bugs here were both *pessimistic*: they cost performance and never produced a wrong answer,
+which is the dangerous class because nothing fails loudly. Reading a `common_params` field after
+`common_params_parse` but before your own rules have run is the same mistake in both cases.
 
-### 1. the plan ignored the user's `-c`
+**Planning ignored the user's `-c`.** `PlannerOptions::n_ctx` came from `opts.n_ctx` (200000)
+rather than from what the server would create, so `-c 32768` still reserved 200k worth of KV.
 
-`PlannerOptions::n_ctx` was set from `opts.n_ctx` (200000) rather than from what the server would
-actually create. Asking for `-c 32768` still reserved 200k worth of KV: 1.55 GiB of VRAM budget for
-a cache that would be 260 MiB.
-
-Fix: plan against `params.n_ctx`, which `common_params_parse` has already resolved from `-c` /
-`--ctx-size` / `LLAMA_ARG_CTX_SIZE`. It is 0 when neither was given, which means "use the model's
-native context", not "a context of zero" - hence the fallback to `opts.n_ctx`.
-
-Measured at `-c 32768`:
-
-| | expert layers on GPU | CPU expert set | KV budgeted |
+| at `-c 32768` | expert layers on GPU | CPU expert set | KV budgeted |
 |---|---|---|---|
 | before | 4 | 10.90 GiB | 1.55 GiB (should be 260 MiB) |
 | after | **8** | **9.61 GiB** | 260 MiB |
 
-### 2. the plan computed KV at f16 while the server ran q8_0/q4_0
+**Planning computed KV at f16 while the server ran q8_0.** llama.cpp's field default is F16
+(`common/common.h:587-588`), and the preflight read `params.cache_type_*` for planning before
+overwriting them. f16 KV is 2.46x the bytes.
 
-llama.cpp's field default is F16 (`common/common.h:587-588`). The preflight read
-`params.cache_type_*` for planning and only *afterwards* overwrote them with the measured
-q8_0/q4_0 baseline (Rule 5). f16 KV is **2.46x** the bytes, so at 200k the plan reserved 3.81 GiB
-for a cache that is really 1.55 GiB - which crushed the VRAM budget for everything else.
-
-Measured at `-c 200000`:
-
-| | expert layers on GPU | ubatch | KV | predicted decode |
+| at `-c 200000` | expert layers on GPU | ubatch | KV | predicted decode |
 |---|---|---|---|---|
 | before | 0 | 384 | 3.81 GiB (planned) | 1.9 t/s |
 | after | **4** | **1024** | 1.55 GiB (actual) | 15.5 t/s |
 
-Fix: `po.cache_k = f.ctk ? from_ggml(params.cache_type_k) : opts.cache_k`, and the same for v. The
-`f.ctk` / `f.ctv` flags are the *same* user-intent test Rule 5 uses to decide whether to override,
-so the plan and the applied configuration cannot drift apart.
-
-**The general rule: a planner must be given the configuration it is planning for.** Reading a
-"resolved" field before your own rules have run is the same bug wearing a different hat.
+Both are fixed by planning from `params.n_ctx` and `params.cache_type_*`, using the same
+user-intent test (`f.ctk`, `f.ctv`) that decides whether to override. The plan and the applied
+configuration then cannot drift apart. `params.n_ctx` is 0 when neither `-c` nor the env var was
+given, which means "use the model's native context", so it falls back to `opts.n_ctx`.
 
 ## Model configs: `--model-config <name>:<variant>`
 
