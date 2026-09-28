@@ -10,15 +10,31 @@ exported `int llama_server(common_params & params, int argc, char * argv)`
 (`tools/server/server.cpp:43`, defined at `server.cpp:119`). The CLI entry point
 `llama_server(int argc, char ** argv)` (`server.cpp:88`) parses argv via
 `common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)` (`server.cpp:107`).
-Therefore **the entire llama.cpp server flag surface is accepted**, not just the flags
+Therefore **the entire llama.cpp server flag surface is accepted**, not only the flags
 the old amp server used.
 
 **Model under test.** `/home/e0u/localhost/models/Occamy-1.0-APEX-I-MiniPlus-V2.1-Abliterated.gguf`
 (arch `qwen35moe`, text-only, no mmproj, no LoRA adapters, no draft model).
 
+## What is in here
+
+| section | what it covers |
+|---|---|
+| 1 | every route, and whether amp serves it |
+| 2 | request fields, per endpoint, plus the full sampler field list |
+| 3 | response shapes, one subsection per endpoint |
+| 4 | error body shape and the `error_type` to HTTP status mapping |
+| 5 | the CLI flag surface, with the flags that matter on this model |
+| 6 | the reasoning and thinking surface |
+| 7 | what is testable on this box, what is not, and what is a silent no-op |
+| 8 | differences from the deleted hand-rolled amp server |
+
+Section 7 is the one to read first if you are deciding whether a feature can be verified here. It
+is the honest answer, including the 8 features that cannot.
+
 ---
 
-## 1. Route table
+## 1. route table
 
 All routes are registered in `tools/server/server.cpp:244-373`. Unless noted, a
 route requires the API key (if `--api-key` is set) and is gated by the
@@ -74,7 +90,7 @@ Unknown routes return 404 with `{"error":{"message":"File Not Found","type":"not
 
 ---
 
-## 2. Request field matrix
+## 2. request field matrix
 
 ### 2.1 `/v1/chat/completions` (and `/chat/completions`, `/v1/responses`, `/v1/messages`, `/apply-template`, `*/input_tokens`)
 
@@ -148,7 +164,7 @@ Parsed by `oaicompat_completion_params_parse` (`server-common.cpp:1036-1072`) th
 
 All other fields pass through to `eval_llama_cmpl_schema` (same as §2.1 passthrough).
 
-### 2.3 Full sampler field list (`eval_llama_cmpl_schema`, `server-schema.cpp:11-517`)
+### 2.3 full sampler field list (`eval_llama_cmpl_schema`, `server-schema.cpp:11-517`)
 
 | Field | Type | Default | Struct field | Limits / notes |
 |---|---|---|---|---|
@@ -225,12 +241,12 @@ They are accepted by the schema builder but never registered.
 
 ---
 
-## 3. Response shape contract
+## 3. response shape contract
 
 All shapes below are the exact JSON keys emitted by the cited `to_json_*` functions.
 `system_fingerprint` is `llama_build_info()` on every response and every stream chunk.
 
-### 3.1 Non-streaming chat response (`to_json_oaicompat_chat`, `server-task.cpp:414-460`)
+### 3.1 non-streaming chat response (`to_json_oaicompat_chat`, `server-task.cpp:414-460`)
 
 ```json
 {
@@ -255,7 +271,7 @@ All shapes below are the exact JSON keys emitted by the cited `to_json_*` functi
 
 Optional: `logprobs` (if `n_probs>0`), `timings` (if stats set), `__verbose` (if `verbose`).
 
-### 3.2 Streaming chat response (`to_json_oaicompat_chat_stream`, `server-task.cpp:462-526`)
+### 3.2 streaming chat response (`to_json_oaicompat_chat_stream`, `server-task.cpp:462-526`)
 
 Returns a JSON **array** of chunk objects (sent as multiple SSE `data:` lines,
 `server-common.cpp:1620-1637`). Each chunk:
@@ -276,7 +292,7 @@ Returns a JSON **array** of chunk objects (sent as multiple SSE `data:` lines,
 `{"choices":[],"created":N,"id":"chatcmpl-...","model":"...","system_fingerprint":"...","object":"chat.completion.chunk","usage":{...}}`
 (`server-task.cpp:505-513`). Empty `choices` array, usage only.
 
-### 3.4 Non-streaming completion (`to_json_oaicompat`, `server-task.cpp:374-412`)
+### 3.4 non-streaming completion (`to_json_oaicompat`, `server-task.cpp:374-412`)
 
 ```json
 {"choices":[{"text":str,"index":0,"logprobs":null|{...},"finish_reason":"stop|length"}],
@@ -288,7 +304,7 @@ Returns a JSON **array** of chunk objects (sent as multiple SSE `data:` lines,
 `finish_reason`: `"stop"` if EOS/stop-word, else `"length"` (`server-task.cpp:382-385`).
 Note: completions never emit `"tool_calls"` as a finish_reason.
 
-### 3.5 Streaming completion (`to_json_oaicompat` partial, `server-task.cpp:1073-1109`)
+### 3.5 streaming completion (`to_json_oaicompat` partial, `server-task.cpp:1073-1109`)
 
 Same shape as §3.4 but `finish_reason` is `null` on every chunk, no `usage`, ends with `[DONE]`.
 
@@ -370,9 +386,9 @@ Gauges: `prompt_tokens_seconds`, `predicted_tokens_seconds`, `requests_processin
 
 ---
 
-## 4. Error contract
+## 4. error contract
 
-### 4.1 Error body shape
+### 4.1 error body shape
 
 All errors are `{"error":{"code":int,"message":str,"type":str}}`
 (`format_error_response`, `server-common.cpp:36-78`).
@@ -394,20 +410,20 @@ All errors are `{"error":{"code":int,"message":str,"type":str}}`
 400-with-`exceed_context_size_error` body. These are llama.cpp's own taxonomy, not
 OpenAI's. A smoke test must accept them as correct.
 
-### 4.3 Exception -> status mapping (`ex_wrapper`, `server.cpp:54-86`)
+### 4.3 exception to status mapping (`ex_wrapper`, `server.cpp:54-86`)
 
 - `std::invalid_argument` -> 400 `invalid_request_error`.
 - Other `std::exception` -> 500 `server_error`.
 - Unknown -> 500 `server_error`.
 
-### 4.4 Middleware errors (bypass `ex_wrapper`)
+### 4.4 middleware errors (bypass `ex_wrapper`)
 
 - 401 `authentication_error`: invalid/missing API key (`server-http.cpp:290-304`).
 - 503 `unavailable_error`: server not ready (model loading) (`server-http.cpp:307-328`).
 - 404 `not_found_error`: unknown route (`server-http.cpp:199-213`).
 - 403 `feature_disabled`: `/tools` or `/cors-proxy` when not enabled (`server.cpp:315-325`).
 
-### 4.5 Context-size errors (`server-context.cpp:3196-3215`)
+### 4.5 context-size errors (`server-context.cpp:3196-3215`)
 
 - Prompt > `n_ctx` (no split): 400 `exceed_context_size_error`, body includes
   `n_prompt_tokens` and `n_ctx` (`server-task.h:481-483`, `server-task.cpp:1501-1508`).
@@ -424,7 +440,7 @@ extracted from `common_params_parser_init` (`arg.cpp:1391+`). Flags tagged
 `LLAMA_EXAMPLE_COMMON` are inherited by all examples except `LLAMA_EXAMPLE_DOWNLOAD`
 (`arg.cpp:1432-1438`).
 
-### 5.1 Model / context
+### 5.1 model / context
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
@@ -453,7 +469,7 @@ extracted from `common_params_parser_init` (`arg.cpp:1391+`). Flags tagged
 | `--chunk-size` | — | — | Prompt chunk size. |
 | `--chunk-separator` | — | — | Chunk separator. |
 
-### 5.2 Batching / parallelism
+### 5.2 batching / parallelism
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
@@ -482,7 +498,7 @@ extracted from `common_params_parser_init` (`arg.cpp:1391+`). Flags tagged
 | `-ncffn`, `--n-cpu-ffn` | `LLAMA_ARG_N_CPU_FFN` | 0 | CPU FFN layers. |
 | `--rpc` | `LLAMA_ARG_RPC` | — | RPC backend. |
 
-### 5.4 Sampling
+### 5.4 sampling
 
 | Flag | Env | Default |
 |---|---|---|
@@ -522,7 +538,7 @@ extracted from `common_params_parser_init` (`arg.cpp:1391+`). Flags tagged
 | `-bs`, `--backend-sampling` | `LLAMA_ARG_BACKEND_SAMPLING` | false |
 | `--pooling` | `LLAMA_ARG_POOLING` | none |
 
-### 5.5 Cache / prompt-cache
+### 5.5 cache / prompt-cache
 
 | Flag | Env | Default |
 |---|---|---|
@@ -537,7 +553,7 @@ extracted from `common_params_parser_init` (`arg.cpp:1391+`). Flags tagged
 | `-cms`, `--checkpoint-min-step` | `LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT` | 0 |
 | `--context-shift` | `LLAMA_ARG_CONTEXT_SHIFT` | enabled |
 
-### 5.6 Reasoning
+### 5.6 reasoning
 
 | Flag | Env | Default | Notes |
 |---|---|---|---|
@@ -554,7 +570,7 @@ extracted from `common_params_parser_init` (`arg.cpp:1391+`). Flags tagged
 | `--skip-chat-parsing` / `--no-skip-chat-parsing` | `LLAMA_ARG_SKIP_CHAT_PARSING` | disabled | Force pure content. |
 | `--prefill-assistant` / `--no-prefill-assistant` | `LLAMA_ARG_PREFILL_ASSISTANT` | enabled | Prefill assistant response. |
 
-### 5.7 Speculative decoding
+### 5.7 speculative decoding
 
 All `--spec-draft-*` and `--spec-*` flags (`arg.cpp:3750+`). Requires a draft model or
 ngram config. **Not usable with this model** (no draft model available).
@@ -580,7 +596,7 @@ ngram config. **Not usable with this model** (no draft model available).
 | `--threads-http` | `LLAMA_ARG_THREADS_HTTP` | auto |
 | `--sse-ping-interval` | `LLAMA_ARG_SSE_PING_INTERVAL` | 30 |
 
-### 5.9 Logging
+### 5.9 logging
 
 | Flag | Env |
 |---|---|
@@ -594,7 +610,7 @@ ngram config. **Not usable with this model** (no draft model available).
 | `--log-prefix` / `--no-log-prefix` | `LLAMA_ARG_LOG_PREFIX` |
 | `--log-timestamps` / `--no-log-timestamps` | `LLAMA_ARG_LOG_TIMESTAMPS` |
 
-### 5.10 Other server flags
+### 5.10 other server flags
 
 | Flag | Env | Notes |
 |---|---|---|
@@ -638,7 +654,7 @@ ngram config. **Not usable with this model** (no draft model available).
 | `--warmup` / `--no-warmup` | — | Warmup run. |
 | `--perf` / `--no-perf` | `LLAMA_ARG_PERF` | Performance timings. |
 
-### 5.11 Load-bearing for THIS model on THIS machine
+### 5.11 load-bearing for this model on this machine
 
 **Critical (must be set correctly):**
 - `-m`: model path.
@@ -665,7 +681,7 @@ ngram config. **Not usable with this model** (no draft model available).
 
 ---
 
-## 6. Reasoning surface
+## 6. reasoning surface
 
 ### 6.1 `reasoning_format` values (`common_reasoning_format`, `common.h:419-427`)
 
@@ -684,7 +700,7 @@ Set per-request via the `reasoning_format` field (`server-common.cpp:1320-1322`)
 via `--reasoning-format` CLI (`arg.cpp:3674-3684`). Unknown value -> runtime error
 `Unknown reasoning format: <value>` (`chat.cpp:902`).
 
-### 6.2 Thinking budget mechanism
+### 6.2 thinking budget mechanism
 
 The reasoning budget is a **sampler** (`common_reasoning_budget_init`,
 `reasoning-budget.cpp:261-269`), not a template feature. State machine
@@ -716,7 +732,7 @@ Request fields (`server-common.cpp:1388-1403`):
 CLI: `--reasoning-budget N` (`arg.cpp:3715-3722`), `--reasoning-budget-message`
 (`arg.cpp:3723-3729`).
 
-### 6.3 How `enable_thinking` reaches the template
+### 6.3 how `enable_thinking` reaches the template
 
 1. CLI `--reasoning on|off|auto` sets `params.enable_reasoning` (1/0/-1) and
    `default_template_kwargs["enable_thinking"]` (`arg.cpp:3685-3702`).
@@ -776,9 +792,9 @@ Per AGENT.md, this template does **not** support `reasoning_effort` /
 
 ---
 
-## 7. Testability notes
+## 7. testability notes
 
-### 7.1 Testable with this GGUF, no network, black-box HTTP
+### 7.1 testable with this GGUF, no network, black-box HTTP
 
 | Feature | Testable | How |
 |---|---|---|
@@ -850,7 +866,7 @@ Per AGENT.md, this template does **not** support `reasoning_effort` /
 | `--tools` (server tools) | Requires `--tools` flag and tool definitions; otherwise 403. |
 | GCP/Vertex compat | Requires `AIP_MODE=PREDICTION` env var. |
 
-### 7.3 Features that are accepted but no-ops or ignored
+### 7.3 features that are accepted but no-ops or ignored
 
 | Feature | Behavior |
 |---|---|
@@ -865,7 +881,7 @@ Per AGENT.md, this template does **not** support `reasoning_effort` /
 
 ---
 
-## 8. Key differences from the old amp server
+## 8. key differences from the old amp server
 
 1. **Route count:** 7 endpoints -> 40+ (including legacy aliases).
 2. **Error taxonomy:** OpenAI `type` strings -> llama.cpp's own (`not_found_error`,

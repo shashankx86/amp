@@ -4,7 +4,7 @@ How amp is put together, and why each piece exists. Module boundaries are enforc
 (one CMake target per module); interfaces exist wherever a second implementation is plausible.
 
 ```
-  tools/            amp-plan, amp-warm, (later) amp-server, amp-bench
+  tools/            amp-plan, amp-warm, amp-server, amp-infer
       |
   amp_plan          cost model + memory/device planner        [pure, testable]
       |
@@ -18,11 +18,14 @@ How amp is put together, and why each piece exists. Module boundaries are enforc
 Dependencies point downward only. `amp_model` and `amp_plan` are pure functions of the model file,
 so they are fully testable without touching hardware; `amp_io` is the only module that does I/O.
 
+Four modules hold the parts that still exist. `amp_preflight` and `amp_runtime` are described at
+the end, since they were added after the first four were settled.
+
 ## Modules
 
 ### amp_util
 `Status`/`Result<T>`, the only error channel across module boundaries. No exceptions cross an
-interface), a tiny `format()`, byte parsing/printing, a leveled logger, `Stopwatch`, and
+interface. Also a tiny `format()`, byte parsing/printing, a leveled logger, `Stopwatch`, and
 `read_meminfo()`. The meminfo reader exists because page-cache residency is the single most
 important signal in this project; it is a first-class utility rather than something buried in a tool.
 

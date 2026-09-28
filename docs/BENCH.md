@@ -1,21 +1,46 @@
 # BENCH.md, measurements taken by amp on this machine
 
-All numbers measured on the target box (CachyOS 7.2.6, RTX 4050 Laptop 6 GB, Ryzen 7 7735HS,
-14 GiB RAM, Kingston QLC NVMe under LUKS+btrfs). Raw context in `../NOTES.md`.
+Every number amp has ever claimed, with the date it was taken and the caveats that make it mean
+something. Including the ones that were wrong and got retracted. A measurement that is only
+recorded when it agreed with the plan is not a record.
 
-Reproduce with:
+Measured on: CachyOS 7.2.6, RTX 4050 Laptop 6 GB, Ryzen 7 7735HS, 14 GiB RAM, Kingston QLC NVMe
+under LUKS+btrfs. Raw context in `../NOTES.md`.
+
+## How to read this file
+
+Sections 1 to 8 are the foundation and rarely change. Everything after them is dated, newest last,
+and each entry is self-contained. The retracted claims are the most useful part, so they are left
+in rather than deleted:
+
+| what you want | where |
+|---|---|
+| where decode time actually goes | 2026-09-27 "every quality-neutral decode lever, exhausted" |
+| why placement stopped helping | 2026-09-28 "a g-sweep for the 60%" |
+| prefill tuning and the RAM cache claim | 2026-09-27 "prefill-first retune", 2026-09-28 "the `cram` claim was overstated" |
+| quality parity and the instrument that measures it | 2026-09-26 "the server swap is bit-identical" |
+| the 7.4x claim and its retraction | 2026-09-26 "the 7.4x decode claim does not reproduce" |
+| speculative decoding, closed out | 2026-09-28 "n-gram speculation, measured, and it is a loss" |
+| tool-call stalls and concurrency | 2026-09-27 "the tool-call stall, reproduced and fixed" |
+| still unexplained | 2026-09-27 "an unexplained truncation, left open" |
+
+Two rules apply to everything below. A speed claim needs a measurement in this file in the same
+commit. And prefill must be measured as a sequence of requests: the same config restarted three
+times measured 132.5, 178.4 and 311.3 t/s on one identical prompt, so single-request prefill
+numbers are noise. `scripts/bench_prefill.py` exists for that reason.
+
+Reproduce the foundation with:
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DAMP_LLAMA_ROOT=../llama.cpp
-cmake --build build -j$(nproc)
-./build/bin/amp-plan --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-./build/bin/amp-warm  --model ../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf \
-                  --what experts --drop-cache --verify
+./scripts/fetch_deps.sh && ./scripts/build.sh
+M=/home/e0u/localhost/models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
+./build/bin/amp-plan --model $M
+./build/bin/amp-warm --model $M --what experts --drop-cache --verify
 ```
 
 ---
 
-## 1. Demand paging vs direct I/O: the number that matters most
+## 1. demand paging vs direct I/O: the number that matters most
 
 `mincore()` over a read-only mmap of the model, touching one byte per 4 KiB page. This is the
 exact access pattern both llama.cpp and amp produce.
@@ -38,7 +63,7 @@ ubatch re-reads the whole set, and *synchronous* faults on the compute thread ca
 depth. Latency, not throughput, is what collapses prefill. The fixes are residency control
 and I/O/compute overlap, not faster disks.
 
-## 2. Warming the whole expert working set
+## 2. warming the whole expert working set
 
 `amp-warm --what experts --drop-cache --verify` (12.19 GiB, the CPU-resident expert set for all 40
 layers):
@@ -55,7 +80,7 @@ processes at the time was 5.2 GiB, so the practical cache ceiling is about 9.6 G
 set. That is the structural reason `amp` plans a resident hot set *plus* an explicitly streamed
 tail instead of assuming everything fits.
 
-## 3. Storage characteristics (fio 3.42, O_DIRECT)
+## 3. storage characteristics (fio 3.42, O_DIRECT)
 
 | test | Kingston (LUKS+btrfs) | Kioxia KBG40ZNV256G (ext4) |
 |---|---|---|
@@ -68,7 +93,7 @@ tail instead of assuming everything fits.
 The Kioxia collapses to a degraded state after ~10 s and stays there. It is not thermal (a cliff,
 not a ramp). Do not put the model there.
 
-## 4. Model byte budget (from the GGUF header)
+## 4. model byte budget (from the GGUF header)
 
 | item | bytes |
 |---|---|
@@ -84,7 +109,7 @@ Cross-check: 1489 MiB weights + 1587 MiB KV + ~450 MiB compute = 3526 MiB, and t
 measured on this box is 3473 MiB. The accounting is consistent, which is why the planner's VRAM
 predictions can be trusted.
 
-## 5. Planner output on this box
+## 5. planner output on this box
 
 `amp-plan` (default: 200k context, q8_0/q4_0, detected budgets):
 
@@ -145,7 +170,7 @@ gracefully, it collapses it ~10x. The cost model now models this as a cliff
 (`cache_overflow_tolerance`, `decode_fault_latency_us = 28 us`) instead of a linear penalty, and
 `amp-plan` prints the "tg now" column next to "tg t/s" so the effect of other RAM users is visible.
 
-## 7. Quality parity (`scripts/parity.py`)
+## 7. quality parity (`scripts/parity.py`)
 
 amp runs llama.cpp's own ggml kernels on the same weights with the same KV dtypes (q8_0/q4_0), the same
 flash-attention setting and the same sampler. There is no algorithmic difference to find. The harness
@@ -177,7 +202,7 @@ Protocol traps found while building this, all of which first looked like numeric
   first sample, shifting every generation by one. Text diffing alone did not make that obvious;
   comparing logprobs position by position did.
 
-## 8. Open questions this bench raised
+## 8. open questions this bench raised
 
 1. **How much of the working set can actually be pinned?** The 12.19 GiB set does not fit under the
    ~9.6 GiB practical cache ceiling while other processes hold ~5 GiB. amp needs to decide which
@@ -637,7 +662,7 @@ fixable by scheduling: it is 14 GiB of RAM against a 12.19 GiB cyclically-scanne
 
 ### Decode across context lengths: 200k costs 2.6 %, and two measurements agree
 
-The goal asked for decode at multiple context lengths, not just 200k. This matters here because
+The goal asked for decode at multiple context lengths, rather than only 200k. This matters here because
 context size changes the *plan*: the KV cache grows into the same 6 GB of VRAM the expert layers
 want, so the planner gives layers away as context grows. 4 requests each, steady state = median of
 requests 2-4, same machine, same session:
@@ -1018,7 +1043,7 @@ held at q8_0/q8_0 so this is the lever in isolation:
 | 512 | 85.0 t/s | 77.0 t/s |
 | 512 | 77.9 t/s | 54.3 t/s |
 
-> **SUPERSEDED IN MAGNITUDE 2026-09-28 — the direction holds, the 3x does not. Re-measured
+> **SUPERSEDED IN MAGNITUDE 2026-09-28. The direction holds, the 3x does not. Re-measured
 > at the same 200k context with ten distinct 18k prompts: `-cram 0` median 559.8 t/s against
 > `-cram 512` median 509.5 t/s, so ~1.10x, not ~3x.** The original 85.0 t/s for `-cram 512` does
 > not reproduce and never did under this protocol; the collapse shape below was one session.
@@ -1035,7 +1060,7 @@ The shape that was read as the mechanism, re-run ten prompts deep:
 Both climb out of the cold first request and then hold. Neither collapses. The original
 "180 -> 93 -> 82 -> 98 -> 110 -> 110" was the signature of a session that happened to be unlucky,
 read as a mechanism. A 512 MiB cache holding 143 MiB entries fills after 3.6 prompts, so ten
-prompts is where the effect *should* appear if it exists — and it does not.
+prompts is where the effect *should* appear if it exists, and it does not.
 
 **A caution about the original protocol:** `bench_prefill.py --tokens N` builds prompts that land
 larger than N (8192 asked for, ~11.2k delivered). At 11.2k a 512 MiB cache needs 5.7 prompts to
@@ -1070,12 +1095,12 @@ Measured on the same prompt, and the early single-request numbers for this were 
 | `-tb 16` | 221.0 t/s |
 | `-tb 8` explicit | 173.0 t/s |
 
-> **SUPERSEDED 2026-09-28 — the "above 1024 loses" half of this is now measured to be
+> **SUPERSEDED 2026-09-28. The "above 1024 loses" half of this is now measured to be
 > wrong, and the correction is in the 2026-09-28 section below.** The 2048 point is not a
 > wash: it is 38% *faster* than 1024 under the same harness, and the displacement argument does
 > not survive. The "below 1024 falls off a cliff" half still holds. The failure was measuring a
 > `n_ubatch` sweep with single requests, which is the exact mistake that had already
-> invalidated an earlier sweep in this project — and `n_ubatch 1024` is still the planner's
+> invalidated an earlier sweep in this project, and `n_ubatch 1024` is still the planner's
 > choice, for a reason given in the 2026-09-28 section.
 
 The compute buffer is not tradeable: below 1024 prefill falls off a cliff, and above it the GPU
@@ -1423,8 +1448,8 @@ Strata processes prompts in **2,048-token chunks** with the experts streamed to 
 PCIe. amp's measured optimum was 1,024, and its `n_ubatch` sweep claimed 2,048 was 24% *worse*
 (243 vs 320 t/s). That was measured with single requests, which this project has already
 recorded as the mistake that invalidated an earlier sweep. Re-measured with
-`scripts/bench_prefill.py` — five distinct ~8,192-token prompts, one server process, first
-request reported separately by the script — the sign flips:
+`scripts/bench_prefill.py`, five distinct ~8,192-token prompts, one server process, first
+request reported separately by the script, the sign flips:
 
 | `n_ubatch` | GPU expert layers | total VRAM | prefill median | spread |
 |---:|---:|---|---:|---:|
@@ -1439,7 +1464,7 @@ placement fixed and separate the two effects:
 | `-ub 2048 -ncmoe 33` (placement held) | 836.8 t/s | 3.16x |
 | `-ub 2048` (placement free, g=6) | 836.5 t/s | 1.31x |
 
-Identical. **The displacement is not the mechanism** — losing a GPU expert layer costs nothing
+Identical. **The displacement is not the mechanism.** Losing a GPU expert layer costs nothing
 measurable here, because during prefill a 2048-token batch activates so many experts that the
 extra resident layer is a rounding error. The win is the batch size itself, and it is the same
 +38% whether or not the placement is pinned.
@@ -1461,12 +1486,12 @@ Three things differ from the 2026-09-27 run, and none of them is the hardware:
 ### What was given up, and what this does not claim
 
 2048 needs a 1.91 GiB compute buffer against 1 GiB at 1024, and total VRAM rises to 5.84 of
-5.89 GiB — **50 MiB free**, which is below Strata's 256 MiB "requests may stall" threshold and
+5.89 GiB, **50 MiB free**, which is below Strata's 256 MiB "requests may stall" threshold and
 below the 119 MiB at which amp's own preflight already warns. At 200,000 context the buffer
 scales with the batch and this does not fit at all.
 
 **So 2048 is right at short context and wrong at 200k, and the planner's 1024 is not a
-mistake — it is the only value that fits the target configuration.** The honest conclusion is
+mistake: it is the only value that fits the target configuration.** The honest conclusion is
 that `n_ubatch` should be a function of context, not a constant, and that the constant was
 chosen for the case that matters:
 
@@ -1499,14 +1524,14 @@ At `-c 200000` nothing changes: the planner still lands on 1024, because 2048's 
 The planner is now context-sensitive on this knob, and the VRAM check is what makes it so.
 
 The test that pinned the wrong constant, `cost_model_ubatch_efficiency_is_monotonic`, asserted
-`ubatch_efficiency(1024) == 1.0` — so it was *enforcing* the error. It now asserts saturation at
+`ubatch_efficiency(1024) == 1.0`, so it was *enforcing* the error. It now asserts saturation at
 2048, that 1024 is strictly below it, and that the 2048/1024 ratio brackets the measured 1.38x,
 so if the measurement stops being represented in the model the test fails rather than the
 constant quietly staying wrong.
 
 ## 2026-09-28: the `cram` claim was overstated at 3x; it is about 1.1x
 
-Not a Strata item — this is a claim this project made in its own earlier work, re-measured while
+Not a Strata item. This is a claim this project made in its own earlier work, re-measured while
 looking for the next thing and found to be wrong in magnitude. It matters because the same
 number appears in `AGENT.md` as an established invariant, and a 3x figure in a durable rule is
 the kind of thing that stops anyone from re-checking the next one.
@@ -1522,7 +1547,7 @@ Re-measured at the target 200k context, ten distinct ~18k prompts, one server pr
 protocol at any prompt count tried. Both arms climb out of the cold first request and then hold;
 neither collapses. The "180 -> 93 -> 82 -> 98 -> 110 -> 110" sequence that was read as the
 eviction mechanism was one unlucky session, and a shape read off a single session is not a
-mechanism — the same mistake this project has already made twice and recorded.
+mechanism, the same mistake this project has already made twice and recorded.
 
 **The direction survives, so the default is unchanged**: `-cram 0` is not slower and is slightly
 faster, and at 4096 MiB (a plausible user value) the difference disappears entirely into the
@@ -1531,7 +1556,7 @@ rather than deleted, because "this was measured and was wrong" is more useful to
 reader than a quietly corrected number.
 
 **A protocol trap worth recording.** `bench_prefill.py --tokens N` builds prompts that land
-*larger* than N — 8192 requested, ~11.2k delivered. At 11.2k a 512 MiB cache needs 5.7 prompts
+*larger* than N: 8192 requested, ~11.2k delivered. At 11.2k a 512 MiB cache needs 5.7 prompts
 to fill, so a 5-prompt run cannot expose an eviction effect even if it is real. This project's
 own earlier test used 18k prompts, which is why the effect, if it exists, needs at least 4
 prompts to appear. Any future test of a cache-vs-page-cache lever has to run past the point
@@ -1553,7 +1578,7 @@ placement pinned: **444 of 512 positions "disagreed"**, median KL 1.7e-05, and t
 breakdown showed the distribution wandering with no relationship to the dtype. That number
 measures the divergence cascade, not the KV dtype.
 
-The fix is teacher forcing — score a *fixed* token sequence so every position is comparable.
+The fix is teacher forcing, scoring a *fixed* token sequence so every position is comparable.
 Three changes made that possible, and each was a latent trap:
 
 - **`ModelRuntime::score()`** (`src/runtime/model_runtime.cpp`) generates the same way but reads
@@ -1575,7 +1600,7 @@ Three changes made that possible, and each was a latent trap:
 | `q8_0/q8_0` at g=3 vs g=6 | median KL **1.217e-04**, 8/512 top-1 flips |
 
 The engine is bit-deterministic on the scored path, and **placement alone moves the median KL
-by 1.2e-04** — the same quantized matmul accumulated on CPU and GPU sums in a different order.
+by 1.2e-04**, because the same quantized matmul accumulated on CPU and GPU sums in a different order.
 That is the floor any dtype number has to be read against.
 
 ### The result
@@ -1590,13 +1615,13 @@ That is the floor any dtype number has to be read against.
 
 ### What this does and does not say
 
-**The dtype effect is real and an order of magnitude above the placement floor** — 26-29x it,
+**The dtype effect is real and an order of magnitude above the placement floor**, 26-29x it,
 not 1.2x, so this is not float reordering in disguise.
 
 **But v1 and v2 are within 12% of each other at 131k** (3.551e-03 against 3.179e-03), where at
 32k v2 was 8.8x closer to f16. **The gap between q8_0 and q4_0 in V largely closes at long
-context.** That is the opposite of Strata's shape — their q4_0 penalty *grew* with context
-(+8% at 1K, +12% at 8K) — and it is consistent with what this model is: only 2 KV heads at
+context.** That is the opposite of Strata's shape, whose q4_0 penalty *grew* with context
+(+8% at 1K, +12% at 8K). It is consistent with what this model is: only 2 KV heads at
 key/value length 256, so the V cache is small and the long-context cost lands in attention
 rounding rather than in V's own error.
 
@@ -1619,7 +1644,7 @@ needed `amp-infer --repeat` to average out run-to-run noise, and `--repeat` was 
 ### Bug 1: a NULL context
 
 `--repeat` reset its KV with `llama_memory_clear(llama_get_memory((llama_context *) nullptr), true)`
-— a **null context**, which is undefined behaviour. `ModelRuntime::reset()` now uses the real
+, a **null context**, which is undefined behaviour. `ModelRuntime::reset()` now uses the real
 context, and `prefill()` calls it so every pass starts from an empty cache rather than appending
 to the previous one's.
 
@@ -1628,7 +1653,7 @@ to the previous one's.
 `pp_toks`/`tg_toks` were **assigned** from the last pass while `pp_sum`/`tg_sum` **accumulated**
 across passes, so `--repeat 3` reported 512 tokens over three passes' worth of time. Every
 repeated measurement read 1/3 of the true rate. That is why `--repeat 3` looked like a 3x
-slowdown (9.5 t/s) while a single pass in the same session read 31.7 t/s — and it is a strong
+slowdown (9.5 t/s) while a single pass in the same session read 31.7 t/s, and it is a strong
 reason this instrument was never used to average noise, because it reported a number that was
 wrong by construction.
 
@@ -1640,7 +1665,7 @@ what makes the next section possible.
 ### Strata's logits-scan finding does NOT transfer, and now it is measured rather than assumed
 
 Their per-token host phase is 993 KB of D2H plus a 248,320-float NaN scan, 16% of a 53 ms token.
-**amp's vocabulary is 3,115,143 tokens** — 12.5x theirs — so the same shape would be 11.9 MiB of
+**amp's vocabulary is 3,115,143 tokens**, 12.5x theirs, so the same shape would be 11.9 MiB of
 f32 logits per token, a 3.1M-element `partial_sort`, and a 3.1M-term `exp()` loop, every token.
 
 Measured with the fixed instrument, 1536 tokens per arm:
@@ -1653,7 +1678,7 @@ Measured with the fixed instrument, 1536 tokens per arm:
 **Indistinguishable.** The whole vocab scan is inside the noise of a ~28 ms token, so it is
 under ~3 ms and therefore not a lever. The reason Strata's version cost 16% and this does not is
 scale in the wrong direction for them: 248k floats is a small fraction of a 53 ms token's
-attention and expert work, while 3.1M pairs of `partial_sort` work is a different thing — but
+attention and expert work, while 3.1M pairs of `partial_sort` work is a different thing, but
 measured, it still does not matter, because decode here is 40% expert bandwidth and the
 remaining time is GPU-side layer work, not host-side scanning.
 
@@ -1682,7 +1707,7 @@ event so the output looks valid). So: measure the marginal cost of a CPU expert 
 
 g=0 puts 12.19 GiB of experts on the CPU against a measured ~11.2 GiB usable page cache, and
 this model has a documented decode cliff: 10.25 GiB gives 25.6-29.9 t/s, 11.54 GiB gives
-2.8-4.8 t/s. So **g=0..2 is caching-bound and g>=4 is bandwidth-bound** — one line through all
+2.8-4.8 t/s. So **g=0..2 is caching-bound and g>=4 is bandwidth-bound**, one line through all
 seven points describes a cliff with a ramp. Fitting all seven gives `ms = -19.70 + 1.601*cpu`,
 i.e. a **negative** intercept and experts at 175% of the token, which is physically impossible.
 R² was 0.78, a perfectly respectable-looking fit on data that cannot be right. That is the
@@ -1696,7 +1721,7 @@ clearest argument in this project for refusing to read an intercept off a regres
 ### An arithmetic error, caught by the sweep disagreeing with itself
 
 My first pass divided **total** expert bytes by 40 layers, giving "312 MiB per layer" and 10.3 ms
-per layer — 432 ms for a token measured at 28-50 ms, which is nonsense. **A token routes 8 of 256
+per layer, 432 ms for a token measured at 28-50 ms, which is nonsense. **A token routes 8 of 256
 experts per layer, so it reads 1/32 of each layer's bytes.** Corrected: 9.75 MiB per layer,
 0.339 ms of bandwidth per CPU expert layer, 13.54 ms for a fully-CPU token against the
 documented 349 MiB/token.
@@ -1710,7 +1735,7 @@ The correction matters because it is what makes the two estimates agree:
 
 **Two independent routes bracket the 40/60 split the earlier measurement reported, so that
 conclusion stands.** What is new is (b): the marginal cost of a CPU expert layer is **0.461 ms
-against 0.339 ms of pure bandwidth, so 1.36x**. That 0.12 ms per layer — about 4 ms per token —
+against 0.339 ms of pure bandwidth, so 1.36x**. That 0.12 ms per layer, about 4 ms per token,
 is not memory. It is the per-expert work around the memory: gather, dequant, the group-scatter
 back into the residual, and the launch per expert.
 
@@ -1719,14 +1744,14 @@ Strata's `moe_grouped_s2` motivation ("this cannot be a per-layer grouped kernel
 split is not an optimisation", h_layer = 0.0456 ruling out the cheap shapes). Their answer was to
 group experts into one kernel and get 10.2 ms off a 19.0 ms pool drain. amp's per-expert overhead
 is smaller in absolute terms but is the same phenomenon, and it is a kernel question rather than
-a bandwidth question — the only kind left on this box.
+a bandwidth question, the only kind left on this box.
 
 ### The finding with immediate operational value: g=10 is the turning point
 
 **g=12 is slower than g=10** (29.04 vs 28.06 ms). Adding GPU expert layers stops paying at about
 10 of 40 and then reverses, because the compute buffer grows ~80 MiB per GPU expert layer and the
 GPU begins competing with the CPU for the same memory path. So `max_expert_layers_gpu` above ~10
-is not a free safety margin — it is a region where the planner can choose a slower plan. The
+is not a free safety margin. It is a region where the planner can choose a slower plan. The
 planner's VRAM-driven choice lands at g=3..6 at 200k, well inside the paying region.
 
 `--gpu-layers 14` is **refused** by the planner (fails model load) but prints the refusal to
@@ -1782,7 +1807,7 @@ kernel**, so the TLB fix cannot be had by advising the existing mapping.
 The only route to huge pages here is Strata's: copy the experts into an **anonymous** arena and
 advise that (`ArenaExpertSource`, 33.97 GB anonymous + `lock_resident`, measured 1.79x better
 than a warm mmap). AnonHugePages does work on this box. **That is exactly the
-`--load-mode none` path this project has already recorded as freezing the box** — a 14.75 GB
+`--load-mode none` path this project has already recorded as freezing the box**, a 14.75 GB
 anonymous load, once. So the one remaining version of this idea is the one version already known
 to be unsafe here.
 
@@ -1790,6 +1815,6 @@ to be unsafe here.
 not reachable on this box by threads, by huge pages, or by any memory layout short of the
 anonymous load that has already crashed it.** Writing a grouped expert kernel against
 `ggml_compute_forward_mul_mat_id` would be the remaining move, and it is a genuine upstream-scale
-change — a new `ggml` op plus a kernel — for a ceiling of ~13% of decode, on a path whose
+change, a new `ggml` op plus a kernel, for a ceiling of ~13% of decode, on a path whose
 measured penalty is 1.36x bandwidth rather than the 4-5x that would make it worth the build.
 Recorded as the one open lever with its ceiling stated, not as work to do.

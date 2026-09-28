@@ -19,9 +19,27 @@ an argument the user explicitly passed.
 All citations are to the vendored llama.cpp at `third_party/llama.cpp` (git `1ab7e5a`,
 `third_party/DEPS.lock`).
 
+## What is in here
+
+| section | what it answers |
+|---|---|
+| 1 | the call order from `main()` to the first served request |
+| 2 | does start-up already read the whole model file, and is the warm redundant |
+| 3 | field table: who sets each `common_params` field, how user intent is detected, default when unset |
+| 4 | the `tensor_buft_overrides` padding, and why a missing sentinel segfaults |
+| 5 | llama.cpp's `--fit` versus amp's planner, and why the fit is off |
+| 6 | picking the ubatch without a real allocation attempt |
+| 7 | landmines that would silently undo the plan or double the memory |
+| 8 | what could still go wrong |
+| 9 | verification status |
+| Model configs | `--model-config` presets, the sampler axis, and `extra_args` |
+
+Sections 3 and 7 are the ones to read before changing the preflight. Everything else is there so
+a later reader does not have to re-derive it.
+
 ---
 
-## 1. The ordered sequence: `main()` to the first HTTP request
+## 1. the ordered sequence: `main()` to the first HTTP request
 
 | # | Step | Where | Notes |
 |---|------|-------|-------|
@@ -49,7 +67,7 @@ pre-load warm, the warm either (a) is skipped by default, or (b) opts in with
 
 ---
 
-## 2. Does the startup already read the whole file? (warm redundancy)
+## 2. does the startup already read the whole file? (warm redundancy)
 
 **Yes.** With the default `load_mode = AUTO` and `lazy_mode = AUTO`:
 
@@ -76,7 +94,7 @@ the old amp-warm behavior with `lazy_mode = ON` to protect it.
 
 ---
 
-## 3. Field table: who sets it, how we detect user intent, default when unset
+## 3. field table: who sets it, how we detect user intent, default when unset
 
 The core problem is that llama.cpp's parser keeps **no** record of which args were supplied.
 `seen_args` (`common/arg.cpp:814`) is local to `parse_cli_args` and discarded on return.
@@ -97,7 +115,7 @@ Most fields have no surviving unset sentinel: `postprocess_cpu_params` resolves
 | `cache_type_k` | `-ctk` (`arg.cpp:2433-2445`) | **argv** (field default F16 is indistinguishable from explicit) | `opts.cache_k` (q8_0) |
 | `cache_type_v` | `-ctv` (`arg.cpp:2446-2458`) | **argv** | `opts.cache_v` (q4_0) |
 
-**And the same intent test decides what the planner is *given*, not just what is set.** See
+**And the same intent test decides what the planner is *given*, and not only what is set.** See
 "the plan must use the configuration that will be applied" below - this is not a detail, it
 was worth 4 GPU expert layers and a 2.7x smaller ubatch at `-c 200000`.
 | `flash_attn_type` | `-fa` (`arg.cpp:1751-1765`) | **argv** (default AUTO, `common.h:499`) | `LLAMA_FLASH_ATTN_TYPE_ENABLED` |
@@ -140,7 +158,7 @@ first time. `-ctk`/`-ctv` are the reachable mappings for `type_k`/`type_v`
 
 ---
 
-## 4. The `tensor_buft_overrides` padding and segfault question, definitive answer
+## 4. the `tensor_buft_overrides` padding and segfault question, definitive answer
 
 The claim being defended here is that the preflight can safely write overrides into `params.tensor_buft_overrides`
 because llama.cpp has *already padded the buffer* by the time the preflight runs.
@@ -211,12 +229,12 @@ padding.
 The resolution is that the preflight sets `fit_params = false` (Rule 2) unless the user explicitly
 passed `-fit on` (full no-op, section 3). This is not overriding an explicit choice,
 `fit_params` defaults to `true` (`common.h:476`) and the user did not ask for it. Setting
-`n_ctx` explicitly (Rule 3) additionally protects the context from reduction
+`n_ctx` explicitly (Rule 3) also protects the context from reduction
 (`fit.cpp:454-456`).
 
 ---
 
-## 6. The VRAM-adaptive ubatch, recommendation
+## 6. the VRAM-adaptive ubatch, recommendation
 
 **Old behaviour** (`src/server/service.cpp:354-403`): create the context, measure free VRAM
 via `ggml_backend_dev_get_props`, and if under budget free the context and retry with
@@ -249,7 +267,7 @@ layout (section 5) and its 1 GiB-free target fights the planner.
 
 ---
 
-## 7. Landmines that would silently undo amp's plan (or double the memory)
+## 7. landmines that would silently undo amp's plan (or double the memory)
 
 1. **The model load's full-file fault-in** (`src/llama-mmap.cpp:480`, `:500-504`), which reads
    the whole GGUF front-to-back and evicts the file front. This is why the default warm is
@@ -279,7 +297,7 @@ layout (section 5) and its 1 GiB-free target fights the planner.
 
 ---
 
-## 8. What could still go wrong
+## 8. what could still go wrong
 
 - **The analytic ubatch is wrong** (section 6), giving a clean startup failure rather than a freeze.
   Calibrate `vram_context_bytes` / `vram_safety` against the post-init free VRAM on first run.
@@ -306,7 +324,7 @@ layout (section 5) and its 1 GiB-free target fights the planner.
 
 ---
 
-## 9. Verification status
+## 9. verification status
 
 **Verified by reading the source (this document):** every `file:line` claim above, the parse
 order and padding (`arg.cpp`), the conversion asserts (`common.cpp:1706`,
@@ -327,7 +345,7 @@ Two bugs, both found by running the plan at 200k and comparing it against `amp-p
 which disagreed. Both were *pessimistic*, so they cost performance and never produced a wrong
 answer - the dangerous class, because nothing fails loudly.
 
-### 1. The plan ignored the user's `-c`
+### 1. the plan ignored the user's `-c`
 
 `PlannerOptions::n_ctx` was set from `opts.n_ctx` (200000) rather than from what the server would
 actually create. Asking for `-c 32768` still reserved 200k worth of KV: 1.55 GiB of VRAM budget for
@@ -344,7 +362,7 @@ Measured at `-c 32768`:
 | before | 4 | 10.90 GiB | 1.55 GiB (should be 260 MiB) |
 | after | **8** | **9.61 GiB** | 260 MiB |
 
-### 2. The plan computed KV at f16 while the server ran q8_0/q4_0
+### 2. the plan computed KV at f16 while the server ran q8_0/q4_0
 
 llama.cpp's field default is F16 (`common/common.h:587-588`). The preflight read
 `params.cache_type_*` for planning and only *afterwards* overwrote them with the measured
@@ -365,10 +383,12 @@ so the plan and the applied configuration cannot drift apart.
 **The general rule: a planner must be given the configuration it is planning for.** Reading a
 "resolved" field before your own rules have run is the same bug wearing a different hat.
 
-## Model configs: `--model-config <name>:v<N>`
+## Model configs: `--model-config <name>:<variant>`
 
-Named presets with a quality dial, in `configs/model-configs.conf`. Three variants for
-`occamy-1.0-apex-i-miniplus`, ordered by KV quality:
+Named presets in `configs/model-configs.conf`. Two independent axes for
+`occamy-1.0-apex-i-miniplus`, and a variant may set keys from both.
+
+The `v` axis is KV cache quality:
 
 | variant | KV | median KL vs f16/f16 | notes |
 |---|---|---|---|
@@ -376,7 +396,54 @@ Named presets with a quality dial, in `configs/model-configs.conf`. Three varian
 | `:v2` | q8_0 / q8_0 | 2.065e-07 | the default now, 8.8x closer to f16 |
 | `:v3` | f16 / f16 | 0 | f16 KV; `n_ctx` cut to 131072 because f16 does not fit at 200k |
 
-Three design decisions, each of which cost something to get right:
+The `s` axis is samplers, transcribed from the model's published table:
+
+| variant | workload | keys |
+|---|---|---|
+| `:s1` | co-work, agentic, tool use | `temperature` 1.00, `top_p` 0.95, `top_k` 20, `presence_penalty` 1.5, `enable_thinking` true |
+| `:s2` | deterministic coding | `temperature` 0.20, `top_p` 0.95, `top_k` 20, `min_p` 0.05, `repetition_penalty` 1.05 |
+| `:s3` | independent SWE-bench baseline | `temperature` 0.35, `top_p` 0.95, `top_k` 20, `min_p` 0.0, `repetition_penalty` 1.0 |
+| `:s4` | general multilingual | `temperature` 0.60, `top_p` 0.95, `top_k` 20, `repetition_penalty` 1.08 |
+
+The suffix letter is not interpreted. `--model-config` looks for whatever header the file uses, so
+a third axis needs no parser change. A bare number still means the `v` axis.
+
+Four sampler details are load-bearing, and each one is a place where the obvious implementation is
+wrong:
+
+- **`user_sampling_config` has to be set with the value.** A sampler whose bit is clear is
+  overwritten by the GGUF's own sampling metadata (`common/common.cpp:1217`, `1235-1242`), so
+  setting the field alone would let the model file quietly undo the preset. llama.cpp's own flag
+  handlers make the same pair of statements (`common/arg.cpp:2015-2017`). `presence_penalty` has no
+  bit at all, upstream or here, which is matching llama.cpp rather than losing a guard.
+- **One table drives everything.** Flag spelling, destination field, bit and default all live in
+  one row per key. Five separate places to remember a spelling is five ways to ship a setting that
+  silently does nothing, which is the one failure this file exists to rule out.
+- **A key the profile omits gets amp's default, not llama.cpp's.** `:s1` names no
+  `repetition_penalty` and gets 1.05. Otherwise `:s1` would be a different sampler depending on
+  what upstream happened to ship, and the four profiles would not be comparable.
+- **Ranges are upstream's, with one exception.** `temperature` is capped at 2.0, which llama.cpp
+  does not do. It clamps at 0 and imposes no ceiling, so `--temp 9.5` starts happily and samples
+  from a near-uniform distribution. Fine for a flag someone typed deliberately, not fine for a line
+  read months later by someone who meant 0.95.
+
+### `extra_args`: any flag, not only the ones we know
+
+`extra_args` splices a whitespace-separated list into `argv` before `common_params_parse`, so every
+llama-server flag is reachable from a config file including ones that did not exist when the
+preflight was written. llama.cpp parses them exactly as it parses the user's own; there is no
+second argument parser to drift from upstream.
+
+Ordering is the subtlety. llama.cpp assigns each occurrence of a flag in turn as it walks `argv`,
+so the last one parsed wins. They go in immediately after `argv[0]`, which makes the command line
+win on a conflict and matches every other key in the file. Splicing them last would invert that
+silently.
+
+The preflight skips the key rather than re-applying it, since `amp-server` already put it on the
+command line. It appears in the "kept from the command line" list, so the startup note is not lying
+about where the value came from.
+
+Design decisions behind the whole mechanism:
 
 **A preset is exactly equivalent to typing its flags.** It sets the same `common_params` fields and
 raises the same `UserFlags` bits a typed flag raises, so every downstream rule treats it as a user
