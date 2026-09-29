@@ -1,86 +1,90 @@
-# Where the work is, 2026-09-29
+# Where the work is, 2026-09-29 (end of session)
 
-Read `docs/STRATA-PORT.md` first: it has the measurements. This file is the state of the
-tree and the next concrete step.
+`docs/STRATA-PORT.md` has the measurements and the reasoning. This is the state of the
+tree and the one thing left to do.
 
-## Done and committed
+## State
 
-- `4b1395e` — `tools/page_walk.cpp`, `tools/fa_bench.cpp`, `scripts/decompose_decode.sh`,
-  wired into `CMakeLists.txt`.
-- `c9e5b79` — `docs/STRATA-PORT.md`, the bottleneck analysis and the transfer assessment.
+`third_party/llama.cpp` is **stock**, apart from a pre-existing `ggml-cpu.c` patch that
+predates this work. Four changes were built and measured in that tree and all four were
+reverted; they are described in STRATA-PORT.md so none is re-attempted:
 
-`third_party/llama.cpp` is **stock**. Two changes were tried there and reverted: a
-`fattn-vec` -> `MMA` kernel-selection change, and temporary tracing. Both are described in
-STRATA-PORT.md so they are not re-attempted. Only the pre-existing `ggml-cpu.c` vendored
-patch remains modified.
+| change | result |
+|---|---|
+| `fattn-vec` -> MMA kernel selection | appeared to be 1.5x; the forced path crashes on the first context, so the number was a short-context timing compared against a full sweep. MMA also dequantizes the whole q8_0 KV to f16 every step, 5.06x the traffic. |
+| buffer `get_tensor`/`set_tensor` on the compute stream | correct and cut individual read-backs from 44-162 us to 13-23 us; changed the token by 0.0%, because the wait is for the GPU finishing the layer. |
+| `__launch_bounds__(128, 4)` on `fattn-vec` | a real 1.22x on the attention, and it changes the arithmetic: 12/128 teacher-forced top-1 disagreements, median KL 2.8e-3 against a placement floor of 1.2e-4. |
+| `gridDim.y` pinned to 1 | bit-exact, and 2.0x slower. Proves split-K is both the speed and the quality loss. |
 
-## The finding
+New tools, all committed and building: `amp-page-walk`, `amp-fa-bench`, `amp-gdn-bench`,
+`amp-budget`, `scripts/decompose_decode.sh`, `scripts/compare_logprobs.py`.
 
-96% of a decode token is GPU-CPU barrier latency, not arithmetic: ~50.8 ms of a 52.7 ms
-token, 0.634 ms per layer, 80 barriers per token. The CPU has 14 of 16 cores idle and the
-GPU's DRAM is ~30% utilised, because they take turns rather than overlapping.
+`amp_tests` passes. The one bug found in amp's own code is fixed: `--emit-score`,
+`--score-file`, `--dump-output`, `--dump-logprobs` and `--logprobs-n` all worked and all
+were missing from `amp-infer --help`.
 
-## Next step: the overlap, in Strata's shape
+## What is left, and why it is a single item
 
-Strata's `hit_hook` (`include/strata/core/hit_hook.hpp`) is the thing to port. Its shape:
+`amp-budget` bounds every candidate. Against a 45 ms warm decode token:
 
-```
-pre[N]   graph up to and including the router   -> rings a doorbell
-         CPU pool for layer N                   -> runs WHILE the GPU does pre[N+1]
-post[N]  combine and the rest of layer N
-```
+| candidate | bound | verdict |
+|---|---|---|
+| scheduler copy phase | 10.6 ms | measured to be GPU latency, not overhead |
+| attention kernel | 8.5 ms | **the only live item** |
+| experts | 12.9 ms | already at 27.96 GB/s on the CPU |
+| GDN fused state | 0.8 ms | under 2%, not worth writing |
+| overlap seam, KV streaming, grouped expert GEMV | - | need VRAM this card does not have, or have no host stall to reclaim |
 
-Constraints to respect, all of them learned by Strata at cost:
+The attention kernel runs at 67 GB/s of ~170 GB/s achievable, flat from 32k to 200k
+context, so the shortfall is per-position work. It is **not** reachable by changing the
+thread mapping: split-K is worth 2.0x and is the same thing that makes the result differ
+from stock, and the project requires bit-exactness.
 
-1. **The split decision must be made before the CPU pool starts**, on the ids for *this*
-   layer. Strata's first version decided inside the pool callback, read the previous layer's
-   ids, and produced a plausible-looking token with KL 9.69e-02 -> 1.03e+00 and top-1
-   0.867 -> 0.333 (`hit_hook.hpp:30-37`). If amp does this, the failure is silent.
-2. **Ordering is the whole point.** Calling the GPU half once, after the pool, cut the drain
-   18.2 -> 10.2 ms and moved the token not at all, because the GPU's work had been moved
-   *behind* the CPU rather than *beside* it. A second buffer plus one `add` bought it back
-   (`hit_hook.hpp:23-27`).
-3. **Measure on the token, never on the drain.** Point 2 is a 1.8x win on the drain and
-   0% on the token.
+## The next piece of work
 
-Where the seam goes in amp: `ggml_backend_sched_compute_splits`
-(`ggml/src/ggml-backend.cpp:1646-1830`) currently does compute-split / sync / copy-inputs
-in a strictly serial loop. The `GGML_TENSOR_FLAG_INPUT` branch at lines 1677-1684 is the
-`cudaStreamSynchronize` that costs 39.3% of all cycles.
+Write a decode attention that adds parallelism *within* a chunk rather than splitting the
+chunk, so the speed does not come from repartitioning K. Strata's `qsa_decode_attn` is the
+shape to adapt: one block per 64-cell chunk per KV head, all `n_head / n_head_kv` = 8 query
+heads that share a KV head served from a single read of the chunk, per-lane `float4` loads,
+and a split-K merge that is either disabled or kept in the same order as stock.
 
-Expected shape of the change, smallest first:
+Files that matter:
 
-- **Do nothing clever, just do it in one process**: let the CPU expert split for layer N run
-  while the CUDA backend is still executing layer N's GPU queue, and use the existing
-  `ggml_backend_event_t` to order the result rather than a host-side wait. This alone should
-  recover most of the 50.8 ms, because the work already exists and is only serialized.
-- Only if that is not enough, split the layer graph at the router, as Strata does.
+- `ggml/src/ggml-cuda/fattn-vec.cuh` - the kernel to beat, and the exact summation order
+  to reproduce. `vec_dot_KQ` and the `KQ_max`/`KQ_sum` update at `:268-303` are the order.
+- `ggml/src/ggml-cuda/fattn-common.cuh:1131-1204` - where `parallel_blocks` is chosen.
+- `ggml/src/ggml-cuda/fattn.cu:541` - the dispatch that picks VEC, and the reason it
+  picks VEC for this geometry (quantized K/V, Ada, batch 1).
+- Strata's `include/strata/kernels/qsa_decode_attn.hpp` and
+  `src/kernels/cuda/qsa_decode_attn.cu` - the design, and the split-K merge to port.
 
 ## The gate
 
-`scripts/kl_parity.py`, teacher-forced, per the note in `AGENT.md` about per-position KL
-being meaningless without it. Placement already shifts logprobs by ~1.2e-04 (the documented
-floor), so the comparison must hold placement fixed and compare decode output token-for-token
-at greedy, reporting the top-1/top-2 gap. Any KL above the placement floor is a bug, not
-noise.
+```bash
+M=../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
+./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/para.txt --ctx 200000 \
+    --n-predict 128 --temp 0 --logprobs-n 32 --emit-score /tmp/fix.txt
+# ... change something ...
+./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/para.txt --ctx 200000 \
+    --n-predict 128 --temp 0 --logprobs-n 32 --score-file /tmp/fix.txt \
+    --dump-logprobs /tmp/after.tsv
+python3 scripts/compare_logprobs.py /tmp/before.tsv /tmp/after.tsv
+```
 
-## Also worth doing, lower value
+Zero top-1 disagreements, or it does not ship. Generating text with both builds and
+diffing it is not a substitute: after the first argmax flip the two arms are on different
+prefixes, which on this model reported 444 of 512 positions disagreeing at median KL
+1.7e-05 for a change that did almost nothing.
 
-- Attention runs at ~67 GB/s of ~170 GB/s achievable, flat in context length
-  (`tools/fa-bench`). The per-position cost is the block-wide reduction in `fattn-vec`'s
-  inner loop. Worth ~15 ms/token. Kernel work, not a flag.
-- The 30 recurrent GDN layers each cost a separate state round trip; Strata's `fused_gdn`
-  keeps 32 state rows per thread in registers and folds the norm and gate into the same
-  kernel. Worth roughly 120 MiB/token of avoidable traffic.
+## Traps, each of which cost time this session
 
-## Traps, all of which cost time this session
-
-- End-to-end decode varies **5.5 to 22 t/s on a fixed config** in the same session. Nothing
-  measured that way is usable.
-- `nvidia-smi` `utilization.memory` on this card idles at 11% and reads ~30% under load. It
-  is not a bandwidth measurement. Do not divide anything by it.
-- The GPU cannot be clock-locked (no root) and idles at 315 MHz, so any single timing is a
-  guess until the card is warm. `tools/fa_bench` re-measures its baseline per row for this.
-- `/tmp` is tmpfs. `bench_prefill.py` exists because prefill measured on a single request
-  means nothing.
-- `pkill -f` matches its own command line. Use `pkill -x`.
+- End-to-end decode varies **5.5 to 22 t/s on a fixed config**. Nothing measured that way
+  is usable. `amp-fa-bench` and the duty-cycle tools exist because of this.
+- `nvidia-smi` `utilization.memory` is not a bandwidth measurement on this card.
+- The GPU cannot be clock-locked (no root) and idles at 315 MHz; a single timing is a guess
+  until the card is warm, so measure the baseline alongside the thing.
+- `n_kv` must be a multiple of 256 or the raw `flash_attn_ext` silently times the generic
+  fallback and looks like a 5x win. The serving path pads it; the benchmark asserts it.
+- Timing a code path that aborts early is not a measurement. That is how the MMA result
+  first looked like a 1.5x win.
+- `/tmp` is tmpfs. `pkill -f` matches its own command line.
