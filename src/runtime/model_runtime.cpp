@@ -440,7 +440,7 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
     // the sample and the prefetch are host work that has nothing to do with the model, so
     // without this the only way to attribute a token is to infer it from a sweep.
     const bool  trace    = getenv("AMP_TRACE_DECODE") != nullptr;
-    double      t_pref = 0.0, t_dec = 0.0, t_smpl = 0.0, t_logp = 0.0;
+    double      t_pref = 0.0, t_dec = 0.0, t_smpl = 0.0, t_logp = 0.0, t_acc_ms = 0.0, t_gap_ms = 0.0, t_call_ms = 0.0;
     int64_t     t0 = 0;
     // The KV cache already holds the whole prompt, so the logits for the *next* token are ready.
     // Sample first, then feed the sampled token: decoding before sampling would append a spurious
@@ -484,11 +484,18 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
             }
         }
 
-        if (trace) { t_logp += (double) (ggml_time_us() - t0); t0 = ggml_time_us(); }
-
+        const int64_t t_a = trace ? ggml_time_us() : 0;
         const llama_token id = llama_sampler_sample(smpl_, ctx_, -1);
+        const int64_t t_b = trace ? ggml_time_us() : 0;
         llama_sampler_accept(smpl_, id);
-        if (trace) { t_smpl += (double) (ggml_time_us() - t0); t0 = ggml_time_us(); }
+        if (trace) {
+            const int64_t t_now = ggml_time_us();
+            t_gap_ms += (double) (t_a - t0);
+            t_call_ms += (double) (t_b - t_a);
+            t_acc_ms += (double) (t_now - t_b);
+            t_smpl += (double) (t_now - t0);
+            t0 = t_now;
+        }
         if (llama_vocab_is_eog(vocab_, id)) {
             break;
         }
@@ -523,7 +530,10 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
                  "  prefetch ",      format("%.3f", t_pref / 1e3 / n), " ms",
                  "  llama_decode ",  format("%.3f", t_dec  / 1e3 / n), " ms",
                  "  sampler ",       format("%.3f", t_smpl  / 1e3 / n), " ms",
-                 "  logprobs ",      format("%.3f", t_logp  / 1e3 / n), " ms",
+                 "    gap ", format("%.3f", t_gap_ms / 1e3 / n),
+                 "    call ", format("%.3f", t_call_ms / 1e3 / n),
+                 "    accept ", format("%.3f", t_acc_ms / 1e3 / n), " ms",
+                 "  logits_fetch ", format("%.3f", t_logp  / 1e3 / n), " ms",
                  "  unaccounted ",   format("%.3f", (stats_.decode_ms * 1e3 - tot) / 1e3 / n), " ms");
     }
 

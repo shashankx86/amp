@@ -357,7 +357,124 @@ position in the accumulator that assigns it today. Strata's `qsa_decode_attn` is
 shape - one block per 64-cell chunk per KV head, all `n_head / n_head_kv` query heads that
 share a KV head served from one read of the chunk - and it has to clear this same gate
 before it ships.
-## 6. Attention efficiency, in isolation
+## 6. Where a decode token actually goes, at the context it is used at
+
+The bounds above all came from isolated measurements, and section 5 showed that one of them
+was wrong by an order of magnitude. So this measures the token directly. Three instruments,
+none of which touches the vendored tree except the two that are described as reverted.
+
+### `AMP_TRACE_DECODE`: the phases of amp's own decode loop
+
+Four phases per token, timed in `ModelRuntime::generate`:
+
+| phase | 3.4k ctx | 33k ctx | 135k ctx |
+|---|---|---|---|
+| prefetch | 0.000 | 0.000 | 0.000 |
+| `llama_decode` | 32.48 | 34.17 | 49.58 |
+| sampler | 3.89 | 4.20 | 5.90 |
+| logprob tracking | 0.000 | 0.000 | 0.000 |
+| **total** | **36.37** | **38.36** | **55.48** |
+
+The prefetcher is free at the call site, and the logprob tracking is now off. The sampler is
+10.6% of a token at 135k, which is the one number here that did not exist before.
+
+### The context sweep: the KV slope is the attention, exactly
+
+No instrumentation, just decode time against prompt length, 1024 generated tokens each:
+
+| prompt | tokens | ms/token |
+|---|---|---|
+| p32k | 8365 | 39.18 |
+| p64k | 16661 | 37.15 |
+| p128k | 33359 | 40.23 |
+| prompt200k | 134572 | 56.33 |
+
+The two end points carry the fit, the middle two carry the noise:
+
+```
+slope 0.1359 us per KV position per token      (10 layers, q8_0 K+V, 2 KV heads, D=256)
+fixed 38.04 ms per token, independent of context
+```
+
+0.1359 us per position is 10,880 B / 0.1359 us = **80 GB/s in situ**, against the 155 GB/s
+the card streams and the 67 GB/s `fa_bench` reports for the kernel in isolation. So the
+in-situ attention is running *faster* than the isolated benchmark of the same kernel, which
+is the other half of why the 1.22x kernel win was worth only 1% of a token: the kernel is
+not the constraint in situ, the memory layout around it is.
+
+At 200k that is 27.2 ms of attention in a 65 ms token, 42%.
+
+### The fixed 38 ms
+
+`perf` over a 2048-token decode at 8k context, grouped by symbol:
+
+| share of host cycles | where |
+|---|---|
+| 47.2% | `libgomp` - the OpenMP runtime: barriers and spin |
+| 22.7% | `ggml_vec_dot_iq3_xxs_q8_K` - expert matvec, layers 10-29 |
+| 20.0% | `ggml_vec_dot_q3_K_q8_K` - expert matvec, layers 0-9 and 30-39 |
+| 2.5% | graph dispatch and `clock_gettime` |
+
+The expert matvec at 42.7% of cycles matches the 14.6 ms it is independently known to take
+(413 MiB per token at 27.96 GB/s), so the OpenMP time is the other 47% and it is *spin*:
+scaling is memory-bound, and a thread sweep confirms it. Four configurations, 2048 tokens,
+two runs each:
+
+| threads | decode | |
+|---|---|---|
+| 2 | 128.4 / 135.3 s | 1.84x slower than 8 |
+| 4 | 86.3 / 83.8 s | 1.19x slower |
+| 8 | 70.3 / 73.1 s | the optimum, and the default |
+| 16 | 109.9 / 112.7 s | 1.55x slower; 8 is 8 physical cores, 16 is SMT |
+
+So the thread count is already right and the expert path is at bandwidth. Neither is a
+target.
+
+### The sampler's 5.9 ms, and the 4.4 ms of it that is not accounted for
+
+The sampler's own arithmetic is negligible, measured two ways:
+
+| | cost |
+|---|---|
+| build the 248,320-entry candidate array | 0.05 ms in situ, 0.11 ms isolated |
+| `std::partial_sort`, k=20 | 0.03 ms in situ, 0.06 ms isolated |
+| `llama_sampler_accept` | 0.000 ms |
+
+And it is not the top-k logprob tracking, which is off by default now and cost 0.16 ms when
+it was on, and it is not `output_reorder()`, measured at 0.000 ms with zero swaps. All four
+`llama_get_sampled_*_ith` entry points call `ctx->synchronize()`, so the phase is where the
+host first waits for the device, and it does grow with context: 3.89 ms at 3.4k, 4.20 ms at
+33k, 5.90 ms at 135k.
+
+**But 4.4 ms of it is unexplained and is recorded as an open lead.** A bracket around the
+`llama_sampler_sample` call from the caller says 5.90 ms. A bracket inside that same
+function, from its first statement to its last, says 1.19 ms. Both are wall clock and they
+cannot both be right. The likely explanation is that the sampler's 3 MB of writes and reads
+land in a memory system that the OpenMP spin pool and the expert pages have just thrashed,
+so the same work that costs 0.17 ms on an idle machine costs several times that here - but
+that is a hypothesis, and it was not confirmed. It needs an instrument that can sample the
+host while it is in there, which this session did not build.
+
+The one thing that is safe to say: 10.6% of a decode token is spent in a function whose
+entire purpose is to pick a token from 248,320 logits, and almost none of it is the
+selection.
+
+### What this changes about the plan
+
+The map is now, for a 135k token of 55.5 ms:
+
+| | ms | |
+|---|---|---|
+| attention, from the sweep slope | 18.3 | 33%, at 80 GB/s in situ |
+| expert matvec, from perf | 14.6 | 26%, at 27.96 GB/s, already at bandwidth |
+| sampler's unexplained portion | ~4.4 | 8% |
+| the rest of `llama_decode` | ~18 | 32%, GDN, projections, norms, copies, launches, graph |
+
+The two byte-movers are both at or near their hardware limits. The only item that is not
+accounted for and is not obviously a hardware limit is the sampler's 4.4 ms, which is the
+next thing to chase, and the "rest of llama_decode" at 18 ms, which nobody has decomposed.
+
+## 7. Attention efficiency, in isolation
 
 `amp-fa-bench` measures one decode attention alone: ~67 GB/s, about 40% of this card's
 achievable read bandwidth, flat from 32k to 200k context. The flatness says the shortfall
@@ -409,13 +526,20 @@ so it can be re-run rather than believed. Against a 45 ms warm decode token:
 
 | candidate | bound | of token | verdict |
 |---|---|---|---|
-| attention: reach streaming rate | 8.5 ms | 19% | partly taken: 1.22x, bit-exact, shipped |
+| attention: reach streaming rate | 8.5 ms | 19% | partly taken: 1.22x on the kernel, 1% on the token |
 | scheduler copy phase | 10.6 ms | 24% | measured to be GPU latency, not overhead |
 | experts, everything | 12.9 ms | 29% | already at 27.96 GB/s on the CPU |
 | GDN: fuse the state step | 0.8 ms | 2% | a few percent. Do not write this kernel |
 | overlap seam (`hit_hook`) | - | - | implemented, measured, reverted |
 | KV streaming (`kv_stream`) | - | - | needs VRAM this card does not have |
 | grouped expert GEMV | - | - | gated on VRAM; g=4 already saturates |
+
+**Rewritten by section 6, which measured the token instead of bounding it.** The table above
+is the old set of bounds, kept so the correction is visible. What the token actually looks
+like at 135k, of 55.5 ms: attention 18.3 ms at 80 GB/s, experts 14.6 ms at 27.96 GB/s, an
+unexplained 4.4 ms inside the sampler, and 18 ms of `llama_decode` that nobody has
+decomposed. Both byte-movers are at their hardware limits, so the two things worth attacking
+are the sampler's unexplained portion and the 18 ms.
 
 **Shipped this session:** raising the vec kernel's resident-blocks-per-SM from 1 to 4
 (`fattn-vec.cuh:29`). One decode attention at 200k goes from 3.23 ms to 2.64 ms, 1.22x, and
