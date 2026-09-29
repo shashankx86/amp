@@ -14,13 +14,31 @@ approval, and that instruction was not given for this tree.
 
 Everything else in `amp/` is committed. `amp_tests` passes.
 
-## Three bugs found and fixed
+## Bugs found and fixed
 
+0. **`--seed` did not exist.** `RuntimeConfig` has had a `seed` field since the file was
+   created and nothing set it, so it stayed at `LLAMA_DEFAULT_SEED`, which
+   `llama_sampler_init_dist` resolves from the system clock. With the shipped default config
+   - temp 0.6, top_p 0.95, top_k 20 - every run of the same build on the same input
+   produced different text. Nothing was reproducible and nothing about the sampling path
+   could be compared; the quality gate only works because it pins `--temp 0`, which is not
+   what ships. Two runs with `--seed 1234` are now byte-identical.
+0b. **Every token was accepted twice.** `llama_sampler_sample` calls
+   `llama_sampler_accept` before returning and `generate()` called it again. `score()` needs
+   its own, because it never calls `llama_sampler_sample`, so the two are now asymmetric on
+   purpose. Harmless today - every accept in this chain is a no-op - and verified
+   bit-identical under the shipped sampling config with a fixed seed.
 1. **`--score-file` did not read back what `--emit-score` wrote.** The fixture is a list of
    token ids; the reader tokenised it as text, so newlines became tokens and byte-level
    tokens did not survive. Two runs of the *same binary* disagreed on 127 of 128 positions.
    The whole quality gate depended on this and nothing in it would have said so.
-2. **The engine ran `q8_0`/`q4_0` KV, not the `q8_0`/`q8_0` it documents.**
+2. **The top-k logprob tracking ran on the hot path by default.** It builds and
+   partial-sorts the whole 248,320-entry vocab every token to produce a report nobody
+   asked for. Measured at 0.16 ms, so 0.3% of a token, but it is pure overhead and
+   `--logprobs-n` turns it on when comparing engines. `--logprobs-n 0` now actually
+   disables it: the old guard was `if (cfg.top_k_track > 0) assign`, so a 0 fell through and
+   left the runtime at its own default.
+3. **The engine ran `q8_0`/`q4_0` KV, not the `q8_0`/`q8_0` it documents.**
    `RuntimeConfig::cache_v` was the only declaration in the tree that said `kQ4_0`;
    `PlannerOptions`, `PreflightOptions`, a test and `AGENT.md` all said `kQ8_0`. The
    requirement is q8_0/q8_0, and it was being violated silently. Cost of the fix, as
@@ -59,24 +77,63 @@ Also note: at 200k, **f16 KV is faster than q8_0 KV** (17.9 vs 16.1 t/s) despite
 bytes, so the q8_0 path is dequantisation-bound rather than bandwidth-bound. That is a
 finding about the constraint, not an argument against it.
 
+## Where a token goes, measured 2026-09-30
+
+This was the open question at the end of the last session, and it is now answered.
+`docs/STRATA-PORT.md` section 6 has the numbers. For a 135k token of 55.5 ms:
+
+| | ms | share | at hardware limit? |
+|---|---|---|---|
+| attention | 18.3 | 33% | 80 GB/s in situ, yes |
+| expert matvec | 14.6 | 26% | 27.96 GB/s, yes |
+| sampler, unexplained portion | ~4.4 | 8% | unknown, this is the lead |
+| the rest of `llama_decode` | ~18 | 32% | not decomposed |
+
+Tools: `AMP_TRACE_DECODE=1` times the four phases of amp's own decode loop. A context sweep
+(no instrumentation, 1024 generated tokens per point) gives the KV slope and therefore the
+attention share exactly. `perf record` over a 2048-token decode gives the cycle split.
+
+Both byte-movers are at their hardware limits, so neither is a target. 8 threads is
+optimal and scaling is memory-bound, confirmed by a four-point thread sweep. The OpenMP
+spin is worth 12% end to end (`OMP_WAIT_POLICY=passive` costs 56.6 s -> 63.6 s), so the
+default is right.
+
 ## The next piece of work
 
-Not the attention kernel. The remaining ideas are bounded, and `tools/budget.cpp` prints the
-bounds from the model's own geometry:
+**The sampler's unexplained 4.4 ms.** The sampler's own arithmetic is 0.08 ms: building the
+248,320-entry candidate array is 0.05 ms and the k=20 `partial_sort` is 0.03 ms, measured
+both in situ and in isolation. It is not the logprob tracking (now off by default, 0.16 ms
+when on) and not `output_reorder` (0.000 ms, zero swaps). All four
+`llama_get_sampled_*_ith` entry points call `ctx->synchronize()`, so the phase is where the
+host first waits for the device, and it does grow with context: 3.89 ms at 3.4k, 4.20 at
+33k, 5.90 at 135k.
 
-| candidate | bound | verdict |
-|---|---|---|
-| attention kernel | 19% | 1% actually realised; the rest needs a kernel that adds parallelism within a chunk |
-| scheduler copy phase | 10.6 ms | measured to be GPU latency, not overhead |
-| experts | 12.9 ms | already at 27.96 GB/s on the CPU |
-| GDN fused state | 0.8 ms | under 2%, do not write it |
-| overlap seam, KV streaming, grouped expert GEMV | - | no host stall to reclaim, or need VRAM this card lacks |
+A bracket around the `llama_sampler_sample` call from the caller reads 5.90 ms. A bracket
+inside the same function, first statement to last, reads 1.19 ms. Both are wall clock and
+they disagree, and that is the whole lead.
 
-The one substantive thing left is understanding **where a 55 ms decode token actually goes
-at 200k**, because the isolated measurements have now twice been shown not to predict it.
-`scripts/decompose_decode.sh` samples the duty cycle; the scheduler instrumentation from
-earlier in this series (three phases per split) is the more direct instrument and is worth
-reinstating, extended to separate the attention layers from the recurrent ones.
+Two candidate explanations, one already tested:
+
+- *OpenMP spin thrashing memory under the sampler.* **Refuted.** `OMP_WAIT_POLICY=passive`
+  and `GOMP_SPINCOUNT=0` leave the phase at 5.74 ms.
+- *The sampler is blocked, not computing.* Supported by the profile and not settled by the
+  timing. `perf` shows 47.2% `libgomp`, 42.7% the two matvecs, 2.5% everything else, and no
+  sampler symbol at all. A function burning 4.4 ms of CPU per 35 ms token would be ~13% of
+  the cycles and impossible to miss. So the time is most likely blocked in
+  `ctx->synchronize()`, which `perf`'s cycle event does not sample.
+
+Settling it needs an instrument that samples the host while it is inside that call. The
+vendored-tree timers that were used to bisect it (`llama-sampler.cpp`,
+`llama-context.cpp`) have been reverted; `perf` without frame pointers gave no usable call
+graph, so the next attempt should either build the binary with `-fno-omit-frame-pointer` and
+run `perf record -g`, or add a ring-buffer sampler that records the instruction pointer on a
+timer thread.
+
+**Second:** the 18 ms of `llama_decode` that is neither attention nor the expert matvec.
+Nobody has decomposed it. The scheduler split instrumentation from earlier in this series -
+three phases per split in `ggml_backend_sched_compute_splits` - is the direct instrument and
+is worth reinstating, extended to separate the ten attention layers from the thirty
+recurrent ones.
 
 ## Strata
 
