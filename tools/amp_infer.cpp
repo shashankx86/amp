@@ -208,10 +208,37 @@ int main(int argc, char ** argv) {
             if (!in) { fprintf(stderr, "amp-infer: cannot read --score-file %s\n", score_file.c_str()); return 2; }
             std::ostringstream ss; ss << in.rdbuf(); txt = ss.str();
         }
-        auto fr = rt->tokenize(txt, /*add_special=*/ false);
-        if (!fr.ok()) { fprintf(stderr, "amp-infer: %s\n", fr.message().c_str()); return 1; }
-        forced = *fr;
-        if (forced.empty()) { fprintf(stderr, "amp-infer: --score-file tokenised to nothing\n"); return 2; }
+        // A file of bare token ids is read as ids. --emit-score writes that form, and
+        // tokenising it as text does not give the ids back: the newlines become tokens of
+        // their own and a byte-level token does not survive a round trip. The two arms then
+        // score different continuations and the comparison is meaningless - measured on this
+        // model as 127 of 128 positions "disagreeing" between two runs of the SAME binary.
+        // Anything that is not a bare list of ids is still tokenised, so a hand-written text
+        // fixture keeps working.
+        bool all_ids = !txt.empty();
+        {
+            std::istringstream ls(txt);
+            std::string tok;
+            while (ls >> tok) {
+                if (tok.find_first_not_of("0123456789") != std::string::npos) { all_ids = false; break; }
+            }
+        }
+        if (all_ids) {
+            std::istringstream ls(txt);
+            long long id = 0;
+            while (ls >> id) {
+                if (id < 0 || id > INT32_MAX) {
+                    fprintf(stderr, "amp-infer: --score-file token id %lld is not a token id\n", id);
+                    return 2;
+                }
+                forced.push_back((llama_token) id);
+            }
+        } else {
+            auto fr = rt->tokenize(txt, /*add_special=*/ false);
+            if (!fr.ok()) { fprintf(stderr, "amp-infer: %s\n", fr.message().c_str()); return 1; }
+            forced = *fr;
+        }
+        if (forced.empty()) { fprintf(stderr, "amp-infer: --score-file produced no tokens\n"); return 2; }
         if ((int32_t) forced.size() > n_predict) forced.resize((size_t) n_predict);
     }
 
