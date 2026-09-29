@@ -47,6 +47,10 @@ options:
   --temp F            sampler temperature (default 0.6)
   --top-p F           sampler top-p (default 0.95)
   --top-k N           sampler top-k (default 20)
+  --seed N            sampler RNG seed. Required for a reproducible run: without it
+                      llama.cpp draws the seed from the system clock, so two runs of the
+                      same build on the same input produce different text and nothing can be
+                      compared
   --logprobs-n N      track this many logprobs per position for --emit-score and
                       --dump-logprobs (default 0, off: it sorts the whole vocab every token)
   --dump-output PATH  write the generated text
@@ -116,6 +120,7 @@ int main(int argc, char ** argv) {
         else if (a == "--top-p") cfg.top_p = (float) atof(next("--top-p").c_str());
         else if (a == "--top-k") cfg.top_k = atoi(next("--top-k").c_str());
         else if (a == "--logprobs-n") cfg.top_k_track = atoi(next("--logprobs-n").c_str());
+        else if (a == "--seed") cfg.seed = (uint32_t) strtoul(next("--seed").c_str(), nullptr, 10);
         else if (a == "--dump-output") dump_output = next("--dump-output");
         else if (a == "--dump-logprobs") dump_logprobs = next("--dump-logprobs");
         else if (a == "--score-file") score_file = next("--score-file");
