@@ -47,6 +47,15 @@ options:
   --temp F            sampler temperature (default 0.6)
   --top-p F           sampler top-p (default 0.95)
   --top-k N           sampler top-k (default 20)
+  --logprobs-n N      how many logprobs to track per position (default 5)
+  --dump-output PATH  write the generated text
+  --dump-logprobs PATH  write per-token logprobs as JSON
+  --emit-score PATH   write a teacher-forcing fixture for a fixed token sequence
+  --score-file PATH   replay a fixture from --emit-score, so every position is compared
+                      against the identical prefix. This is the only quality comparison
+                      that means anything here: a per-position KL where each engine
+                      samples its own tokens puts the two arms on different prefixes from
+                      the first argmax difference onward
   --json              machine-readable output
   -v, --verbose       debug logging
 )");

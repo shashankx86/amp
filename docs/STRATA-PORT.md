@@ -180,7 +180,72 @@ host is waiting on. Any remaining win has to come from making the GPU's per-laye
 faster or from overlapping it with the CPU's, and the two Strata ideas that would do that -
 grouped expert GEMV, and the fused GDN step - are both kernel work, not scheduling.
 
-## 5. Attention efficiency, second
+## 5. Attention: a real 22% speedup that costs quality, and cannot be had
+
+This is the one candidate with a large prize, and it was built and measured. It does not
+qualify, and the reason is structural rather than a matter of tuning.
+
+**The change.** `flash_attn_ext_vec` is declared
+
+```cuda
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)   // fattn-vec.cuh:20
+```
+
+with 128 threads per block. The trailing `1` is a *minimum blocks per SM* hint to the
+compiler, which is 4 warps resident per SM - a very low occupancy for a kernel whose inner
+loop is a chain of dependent memory loads. Raising it to 4 was a one-token change, wrapped
+in `AMP_FATTN_VEC_MIN_BLOCKS` so the value could be swept.
+
+**The speed.** `tools/fa_bench`, one decode attention, this model's geometry, best of 9
+passes, three repeats, reproducible to under 0.5%:
+
+| `min_blocks` | 32k | 131k | 200k |
+|---|---|---|---|
+| 1 (stock) | 0.541 ms | 2.112 ms | 3.229 ms |
+| 4 | 0.439 ms | 1.727 ms | 2.638 ms |
+| 8 | 0.481 ms | 1.878 ms | 2.856 ms |
+
+`min_blocks=4` is a **1.22x** win on the attention, and 8 is worse than 4, so the optimum
+is a real interior point rather than "more is better".
+
+**Why it fails the quality gate.** Teacher-forced, both arms scoring byte-identical token
+ids from one fixture, 32 tracked logprobs per position over 128 positions:
+
+| | |
+|---|---|
+| first divergence | position 1, 0.21 nats |
+| logprobs differing | 3771 of 4096 |
+| max delta logprob | 2.74 nats |
+| **top-1 disagreements** | **12 of 128** |
+
+The cause is in the kernel. When `gridDim.y == 1` the block normalises its own output
+(`fattn-vec.cuh:498`), one block sees all of K and V, and the float summation order is
+fixed. When `gridDim.y > 1` the block instead writes an **unnormalised** partial plus
+`(KQ_max, KQ_sum)` into `dst_meta` (`:501`, `:512`), and a separate reduction merges the
+partials with a log-sum-exp rescale. `parallel_blocks` is chosen from
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` in `launch_fattn`
+(`fattn-common.cuh:1131-1204`), so changing the launch bounds changes how K is partitioned,
+which changes the summation order of the softmax and of the P.V product.
+
+**So any change to this kernel's occupancy, block count, or partitioning changes the
+arithmetic.** That is not a defect in the change; it is inherent to a split-K attention with
+a numerically-sensitive combine, and it means the 40%-of-bandwidth gap in this kernel is
+not reachable at zero quality loss by moving threads around.
+
+This is the concrete meaning of the project's quality constraint. The gap is real and worth
+22% of the attention, and it is exactly the size of thing that a "numerically equivalent"
+implementation silently is not. A kernel that reaches that rate has to reproduce the
+stock summation order, which means keeping the same partitioning - which is the thing that
+has to change to get the rate.
+
+**What would still qualify:** a kernel that does more work per block without changing the
+partition of K across blocks, for example serving all `n_head / n_head_kv` query heads
+that share a KV head from one read of the chunk, which is what Strata's `qsa_decode_attn`
+does (one block per 64-cell chunk per KV head, per-lane `float4` loads, split-K merged with
+a log-sum-exp pass). That is a larger change than a launch bound and would have to be
+validated the same way, against the same gate, before it could ship.
+
+## 6. Attention efficiency, in isolation
 
 `amp-fa-bench` measures one decode attention alone: ~67 GB/s, about 40% of this card's
 achievable read bandwidth, flat from 32k to 200k context. The flatness says the shortfall
@@ -250,8 +315,16 @@ is the block-wide reduction `fattn-vec` performs once per KV position
 (`ggml/src/ggml-cuda/fattn-vec.cuh:254-290`). Strata's answer to a slow decode attention is
 `qsa_decode_attn`: one block per (64-cell chunk, KV head) so all the query heads sharing a
 KV head are served from a single read of the chunk, per-lane `float4` loads, and split-K
-partials merged with a log-sum-exp pass. That is the port, and it is worth doing against
-the 8.5 ms bound.
+partials merged with a log-sum-exp pass.
+
+**It was built, and it is not free.** Raising the kernel's occupancy to 4 blocks per SM is
+a 1.22x win on the attention, and it changes the arithmetic: 12 of 128 teacher-forced top-1
+tokens disagree and the largest logprob moves by 2.74 nats, because `parallel_blocks`
+selects how K is partitioned across blocks and the split-K combine is order-sensitive. See
+section 5. The honest statement is that the attention gap is worth 22% of the attention and
+is **not reachable by changing the thread mapping**; the only version that would qualify is a
+kernel that reproduces the stock summation order while doing more work per block. That is
+real work and it is the only thing left.
 
 **Retired:** the CPU/GPU overlap seam. It was the largest item two drafts ago and it is not a
 win on this box, because there is no host-side stall for it to reclaim: `wait-prev` is
