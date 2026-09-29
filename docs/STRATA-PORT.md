@@ -141,6 +141,31 @@ pipe". The GPU is 79% resident but its DRAM is only ~30% utilised, and the CPU i
 of 16 cores. Neither device is doing useful work most of the time, because they are taking
 turns.
 
+### How big the barrier cost is, from two measurements that do not depend on the profiler
+
+The barrier count is per-layer and per-token, and it does not depend on batch size. So
+prefill, which pays 80 barriers once per 2048 tokens, and decode, which pays 80 barriers for
+one token, do identical arithmetic work per token. Two equations, two unknowns:
+
+| measured | value |
+|---|---|
+| prefill | 1.97 ms/token at batch 2048, so 4034 ms per ubatch |
+| decode | 52.7 ms/token at batch 1 |
+
+Writing `w` for the per-token bandwidth-bound work and `B` for the per-layer barrier cost:
+
+```
+2048w + 80B = 4034
+   w + 80B =   52.7
+```
+
+which gives **w = 1.95 ms/token** and **B = 0.634 ms per layer**, so `80B = 50.8 ms`.
+
+**96% of a decode token is barrier latency.** The model's arithmetic is ~2 ms. This is also
+why prefill and decode differ by 26.8x on identical bytes, which is the clearest single
+statement of the problem: nothing about the work changed, only how often the pipeline was
+stopped.
+
 **This is exactly the problem Strata's `hit_hook` seam exists to solve.** Strata splits each
 layer's graph into a pre-graph ending at the router and a post-graph beginning at the
 combine, rings a doorbell, and runs the CPU expert pool for layer N *while the GPU is
@@ -150,10 +175,20 @@ the GPU's half had been moved *behind* the CPU instead of *beside* it, and a sec
 plus one `add_inplace` bought the overlap back (`include/strata/core/hit_hook.hpp:23-27`).
 
 That is the port with the largest expected value, and it is a scheduling change rather than
-an arithmetic one, so it preserves bit-exactness. The obstacle specific to amp is that
-llama.cpp's scheduler is built around "compute this split, then synchronise", and the CPU
-expert split genuinely cannot start until the router result exists, so the overlap has to be
-built as a producer/consumer seam rather than by relaxing a barrier.
+an arithmetic one, so it preserves bit-exactness. Two things make it non-trivial here:
+
+1. llama.cpp's scheduler is built around "compute this split, then synchronise", and the CPU
+   expert split genuinely cannot start until the router result exists. The overlap therefore
+   has to be a producer/consumer seam, not a relaxed barrier.
+2. Strata overlaps the GPU computing *some* experts of a layer against the CPU computing the
+   *others*. amp pins whole layers to the CPU, so there is no within-layer split to overlap;
+   the seam has to run the CPU pool for layer N against GPU work for layer N+1, which is the
+   cross-layer variant Strata also implements.
+
+Strata's own record is the warning that matters here: the naive version of this change
+looked like a large win and was worth nothing, because it moved the GPU's work *behind* the
+CPU instead of *beside* it. Any attempt at this must be measured on the token, not on the
+drain.
 
 ## 5. Attention efficiency, second
 
@@ -177,4 +212,51 @@ be rediscovered as a phantom 5x.
 Any change here must be bit-exact or provably equivalent, because the project's whole
 quality argument is "same ggml kernels, same order of operations". That rules out
 approximate attention, FP8/INT8 KV, and a different reduction order in the softmax. It does
-not rule out a different *thread mapping*, which is what is actually broken here.
+not rule out a different *thread mapping*, nor a different *schedule* over the same
+operations, which is what is actually broken here. The gate stays `scripts/kl_parity.py`
+with teacher forcing, per the note in `AGENT.md` about per-position KL without it being
+meaningless.
+
+## What the user asked for, and what is answerable from Strata
+
+Strata is a from-scratch CUDA engine for a 125 B model on a 12 GB card; amp is llama.cpp
+plus a memory plan on a 6 GB card. Most of Strata's kernel tree does not transfer, and
+pretending otherwise would waste the session. Assessed against this box:
+
+| Strata idea | Transfers? | Why |
+|---|---|---|
+| `hit_hook` two-phase CPU/GPU seam | **yes, and it is the whole prize** | the 96%-of-decode barrier cost is exactly what it removes |
+| Grouped expert GEMV, constant launches per layer | yes, later | only pays off once experts actually live on the GPU; g=4 already saturates here |
+| Per-layer expert-cache quotas, adaptive residency | partly | 6 GB cannot hold enough of a 12.19 GiB set to matter; VRAM is the binding constraint |
+| `kv_stream` KV-in-RAM paging | no | its point is freeing VRAM for experts, and expert residency is already saturated at +3.4% |
+| `fused_gdn` state-in-registers | yes, second | 30 recurrent layers x 2 MiB state, currently a separate round trip per layer |
+| MTP / n-gram speculation | no | no MTP in this model, and n-gram was already measured at +0.2% |
+| Warp-per-row mapping, hi/lo FP16 MMA, cp.async | yes, for attention | see section 5; the 40% of bandwidth |
+| `__constant__` codebook is slow, use shared memory | no | applies to Strata's own codebook formats, not to GGUF's |
+| Hugepages for weights | no, and now disproven | `tools/page_walk.cpp`: this kernel gives zero huge pages and no gain |
+
+## Order of work, by measured value
+
+1. **Overlap the CPU expert pool with GPU work** (96% of decode). Largest single item.
+2. **Attention kernel efficiency** (40% of achievable bandwidth, ~15 ms/token). Kernel work.
+3. **Fuse the GDN step** so the 30 recurrent layers stop costing a round trip each.
+4. Everything else in Strata's tree is either already in llama.cpp or needs more VRAM than
+   this card has.
+
+## The measurement trap on this box, restated because it cost real time
+
+Identical configuration, same session, minutes apart:
+
+| run | decode |
+|---|---|
+| p8k, rep 1 | 11.12 t/s |
+| p8k, rep 2 | 24.28 t/s |
+| p8k, rep 3 | 21.78 t/s |
+| g=0 (all experts CPU) | 5.54 t/s |
+| g=0, same command again | 22.14 t/s |
+
+A 4x spread on a fixed config. Any claim of the form "X is N% faster" measured this way is
+meaningless, and one such claim in an earlier draft of this file was exactly that. The two
+measurements that survived scrutiny are the ones that do not depend on page-cache state: a
+duty-cycle ratio from a single process, and the prefill/decode contrast in section 4, which
+compares two phases *of the same run*.
