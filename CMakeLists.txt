@@ -171,6 +171,13 @@ if(AMP_BUILD_TOOLS)
   target_include_directories(amp-fa-bench PRIVATE "${AMP_VENDOR_DIR}/include" "${AMP_VENDOR_DIR}/ggml/include")
   target_link_libraries(amp-fa-bench PRIVATE llama ggml ggml-cuda)
   target_compile_options(amp-fa-bench PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+  # gdn-bench: a measurement tool, not part of the serving path. Sizes the 30 recurrent
+  # layers' per-token state traffic against what the card can deliver, so it is visible
+  # whether a fused GDN kernel has anything to win.
+  add_executable(amp-gdn-bench tools/gdn_bench.cpp)
+  target_link_libraries(amp-gdn-bench PRIVATE amp_model amp_io amp_util llama ggml ggml-cuda)
+  target_compile_options(amp-gdn-bench PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(AMP_BUILD_TESTS)
