@@ -274,10 +274,44 @@ teacher-forced positions, 32 logprobs each, all three arms on one fixture:
 | **stock vs `min_blocks = 4`** | **bit-identical** |
 
 Speed, `tools/fa_bench`, one decode attention, q8_0/q8_0, best of 9, three repeats on the
-shipped build: **3.23 ms -> 2.64 ms** at 200k. End to end at 200k, interleaved A/B so cache
-and temperature drift hit both arms equally, 512 generated tokens: 15.8 -> 17.2 t/s and
-17.1 -> 17.4 t/s. The end-to-end signal is inside the noise band this box produces; the
-isolated number is the trustworthy one and it is repeatable to 0.5%.
+shipped build: **3.23 ms -> 2.64 ms** at 200k. The kernel is confirmed to be the one that
+runs: instrumenting the dispatch prints, during decode at 200k,
+
+```
+[FATTN] VEC nq=1 nkv=2 D=256 n_kv=200192 K=q8_0 V=q8_0
+```
+
+which is exactly the geometry the benchmark models, at the full context and the shipped
+dtypes.
+
+### What it is worth end to end: 1%, not 10%
+
+End to end at 200k, interleaved A/B so cache and temperature drift hit both arms equally,
+2048 generated tokens so the decode window is 113 s rather than a few seconds:
+
+| | decode | |
+|---|---|---|
+| stock | 113.44 s / 113.51 s | 18.05, 18.04 t/s |
+| min_blocks = 4 | 112.49 s / 112.11 s | 18.21, 18.27 t/s |
+
+**1.0% faster, repeatable, and the method is precise: the within-arm spread is 0.06%.**
+
+The arithmetic says it should be about ten times that. `fa_bench` puts one attention at
+2.64 ms, ten attention layers makes 26.4 ms, and a token is 55.5 ms, so attention would be
+48% of the token and a 22% cut on it should be worth ~10%. It is worth 1.0%.
+
+So the isolated benchmark overstates the in-situ cost of this kernel by roughly an order of
+magnitude. The most likely reason is the memory the kernel actually walks: `fa_bench` gives
+K and V two separate contiguous 218 MB buffers, while in situ the KV cache is one 2.03 GiB
+buffer holding all ten layers' K and V together, so the per-layer access pattern, the TLB
+behaviour and the L2 residency are all different. `fa_bench` is still the right tool for
+comparing *kernels*, and the wrong tool for predicting *tokens*.
+
+The honest summary of this item: a real, free, bit-exact 1.22x on the attention kernel that
+is worth 1% of a decode token, and a demonstration that on this box an attention kernel
+measured in isolation says almost nothing about what the token costs. Every bandwidth claim
+in this document that was derived from a single isolated kernel should be read with that in
+mind, including the 30 ms of attention per token that the byte counts suggest.
 
 ### The bug this found in the gate itself
 
@@ -385,8 +419,14 @@ so it can be re-run rather than believed. Against a 45 ms warm decode token:
 
 **Shipped this session:** raising the vec kernel's resident-blocks-per-SM from 1 to 4
 (`fattn-vec.cuh:29`). One decode attention at 200k goes from 3.23 ms to 2.64 ms, 1.22x, and
-it is bit-identical at the shipped dtype and context - see section 5. That took 22% off the
-single largest item on this list.
+it is bit-identical at the shipped dtype and context. End to end it is worth **1%**, not the
+10% the isolated number predicts, because the attention is not the share of the token its
+byte count suggests. See section 5.
+
+That is the most important methodological result in this document: every bound on this list
+that came from a single isolated kernel is suspect by the same order of magnitude, and the
+largest one - attention, 19% of a token - is the one that turned out to be wrong. The two
+entries below it were checked end to end and held.
 
 The expert row is bounded against the GPU rate but runs on the CPU, where it measures
 27.96 GB/s; its real cost is 12.9 ms and it is already at memory bandwidth, so it is a
