@@ -238,12 +238,45 @@ implementation silently is not. A kernel that reaches that rate has to reproduce
 stock summation order, which means keeping the same partitioning - which is the thing that
 has to change to get the rate.
 
-**What would still qualify:** a kernel that does more work per block without changing the
-partition of K across blocks, for example serving all `n_head / n_head_kv` query heads
-that share a KV head from one read of the chunk, which is what Strata's `qsa_decode_attn`
-does (one block per 64-cell chunk per KV head, per-lane `float4` loads, split-K merged with
-a log-sum-exp pass). That is a larger change than a launch bound and would have to be
-validated the same way, against the same gate, before it could ship.
+### Speed and bit-exactness are the same knob in this kernel
+
+The 1.22x is worth chasing only if the 2.7 nats are avoidable, so the two were separated
+directly. `launch_fattn` chooses `parallel_blocks` from
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` and then a wave-efficiency heuristic
+(`fattn-common.cuh:1131-1204`). Instrumenting it on this card:
+
+```
+nthreads=128  max_blocks_per_sm=2  nsm=20  ntiles_dst=16  ntiles_KV=8   -> parallel_blocks=5
+```
+
+So the split is live: `gridDim.y = 5`, five blocks each covering a fifth of K, five
+unnormalised partials merged by a log-sum-exp reduce. Forcing `gridDim.y = 1` disables it
+and every block sees all of K, which is the same order the kernel uses when the context is
+short enough to avoid splitting.
+
+| configuration | 200k attention | quality |
+|---|---|---|
+| stock, `gridDim.y = 5` | 3.23 ms | baseline |
+| `gridDim.y = 1`, no split | 6.46 ms | bit-exact, by construction |
+| `min_blocks = 4` | 2.64 ms | 12/128 top-1 differ, median KL 2.8e-3 |
+
+**The two rows on the ends are the whole story.** Split-K is worth 2.0x on this kernel, and
+it is the same thing that makes the result not bit-identical. There is no occupancy setting
+that gets the speed without moving the partition, because the partition *is* the speed. The
+1.22x from the launch bound is simply 2.0x of split-K scaled down by whatever the new
+occupancy costs elsewhere.
+
+So on this engine, at this context length, the attention kernel's throughput and its
+bit-exactness cannot be had together. The project asks for both, and bit-exactness is the
+hard constraint, so the answer here is no.
+
+**What would change that answer** is a kernel whose speed does not come from repartitioning
+K. Concretely: one that does more work per block while keeping each K position in the same
+accumulator that assigns it today. Strata's `qsa_decode_attn` is the shape - one block per
+64-cell chunk per KV head, all `n_head / n_head_kv` query heads that share a KV head served
+from a single read of the chunk, per-lane `float4` loads - because it adds parallelism
+*within* a chunk instead of splitting the chunk. That is the port, it is a real piece of
+work, and it has to clear the same gate before it ships.
 
 ## 6. Attention efficiency, in isolation
 
@@ -317,14 +350,18 @@ is the block-wide reduction `fattn-vec` performs once per KV position
 KV head are served from a single read of the chunk, per-lane `float4` loads, and split-K
 partials merged with a log-sum-exp pass.
 
-**It was built, and it is not free.** Raising the kernel's occupancy to 4 blocks per SM is
-a 1.22x win on the attention, and it changes the arithmetic: 12 of 128 teacher-forced top-1
-tokens disagree and the largest logprob moves by 2.74 nats, because `parallel_blocks`
-selects how K is partitioned across blocks and the split-K combine is order-sensitive. See
-section 5. The honest statement is that the attention gap is worth 22% of the attention and
-is **not reachable by changing the thread mapping**; the only version that would qualify is a
-kernel that reproduces the stock summation order while doing more work per block. That is
-real work and it is the only thing left.
+**It was built, measured, and rejected.** Raising the kernel's occupancy to 4 blocks per SM
+is a 1.22x win on the attention, and it changes the arithmetic: 12 of 128 teacher-forced
+top-1 tokens disagree and the largest logprob moves by 2.74 nats. The cause is not the
+occupancy itself but the split-K it selects: `parallel_blocks` decides how K is partitioned
+across blocks, and the merge of the resulting partials is order-sensitive. Forcing
+`gridDim.y = 1` disables the split, is bit-exact by construction, and costs 2.0x. Speed and
+bit-exactness are the same knob in this kernel. See section 5 for the full separation.
+
+So the attention gap is real and worth 22% of the attention, and it is **not reachable
+without giving up bit-exactness**. The only version that would qualify is a kernel that
+adds parallelism *within* a chunk rather than splitting the chunk, which is what Strata's
+`qsa_decode_attn` does and what would have to be written and gated here.
 
 **Retired:** the CPU/GPU overlap seam. It was the largest item two drafts ago and it is not a
 win on this box, because there is no host-side stall for it to reclaim: `wait-prev` is
