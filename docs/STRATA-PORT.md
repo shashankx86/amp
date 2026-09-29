@@ -93,102 +93,92 @@ f16 scratch buffer the benchmark did not allocate), so the "MMA" column was one 
 number compared against a full sweep. The fix was reverted. Timing a path that aborts early
 is not a measurement.
 
-## 4. The actual bottleneck: 80 GPU-CPU barriers per token
+## 4. Where a decode token actually goes, measured inside the scheduler
 
-This is the finding that matters, and it was not visible until the process was sampled
-rather than timed end to end.
+`perf` says 71% of host cycles are in the CUDA driver, mostly `cuMemcpyHtoDAsync` and
+`cudaStreamSynchronize`. That is real but it does not say *why*. The scheduler was
+instrumented to time three phases of every split - waiting for the previous split, copying
+split inputs, and launching - and the result overturns the obvious reading.
 
-`perf record` over a 200k-context prefill plus 200 decode tokens, grouped by shared object:
+Per split, on a warm 33k-context decode, 38 CPU splits and 38 CUDA splits per token:
 
-| share of all CPU cycles | where |
-|---|---|
-| **71.4%** | `libcuda.so` (the driver) |
-| 11.1% | `vdso` (`clock_gettime`) |
-| 8.1% | `libgomp` (OpenMP barriers) |
-| **5.9%** | `amp-infer`, i.e. actual model arithmetic |
+| phase | CPU split | CUDA split |
+|---|---|---|
+| wait for previous split | **0.0001 ms** | 0.0000 ms |
+| copy split inputs | **0.244 ms** | 0.027 ms |
+| launch / compute | 0.387 ms | 0.014 ms |
+| **total, per split** | **0.625 ms** | 0.041 ms |
 
-Broken down by symbol, the driver time is two calls:
+**The synchronisation hypothesis is wrong.** `wait-prev` is 0.1 us, not 634 us. There is no
+host-side barrier stalling, so there is nothing for an overlap schedule to reclaim. The
+earlier "96% of the token is barrier latency" figure came from solving two equations whose
+prefill and decode arms do not move the same bytes - prefill touches far more distinct
+experts, so `w` and `B` were never separable that way. It is withdrawn.
 
-| share of all CPU cycles | call |
-|---|---|
-| **43.7%** | `ggml_backend_cuda_set_tensor_async` -> `cuMemcpyHtoDAsync_v2` |
-| **39.3%** | `cudaStreamSynchronize` |
+What the 0.387 ms of CPU "launch" is: it is `ggml_graph_compute` on the CPU backend, which
+is synchronous, so the expert matvec runs inline. 8 experts x 1.29 MiB = 10.32 MiB in
+0.387 ms is **27.96 GB/s**, which is the 28-30 GB/s the existing notes already measured for
+this path. `AGENT.md` was right: the expert matvec is at memory bandwidth, and a better
+kernel or a deeper prefetcher cannot help it.
 
-So the model spends most of its time not computing, and the two things it is doing are
-host-to-device copies and waiting for the device.
+That still leaves a real and *stable* cost, and it is the one thing in this table that is
+addressable:
 
-**Why.** The MoE experts are pinned to the CPU (`-ncmoe`), so the router's chosen expert
-ids have to travel GPU -> CPU before the CPU can compute anything, and the expert output
-has to travel back. Tracing the scheduler's copies (`ggml_backend_tensor_copy`, called from
-`ggml_backend_sched_compute_splits`) shows the per-layer pattern, repeated for all 40 layers
-on every token:
+**0.244 ms per layer of input copying, 9.5 ms per token, about 18% of a decode token.** The
+bytes involved are trivial - 8 KiB down, 32 B down, 64 KiB up, 73,760 B per layer, 2.8 MiB
+per token. At 0.244 ms for three copies that is 79 us per copy, where an 8 KiB
+`cudaMemcpyAsync` should cost 5-10 us. The cost is the **number of driver round trips**, not
+the bytes: 3 copies x 40 layers = 120 per token, each one a separate call into the driver,
+and each `GGML_TENSOR_FLAG_INPUT` copy preceded by a stream synchronise
+(`ggml/src/ggml-backend.cpp:1677-1684`).
 
-```
-D2H  attn_post_norm-N (reshaped)   8192 B
-D2H  ffn_moe_topk-N                   32 B     <- the router's choice
-H2D  ffn_moe_down-N               65536 B
-```
+Crucially this number is reproducible to within 1% across runs, unlike the launch time,
+which swings 8 to 16 ms per layer with page-cache state. That makes it the one cost here
+that can be improved and then *verified*.
 
-That is 2.8 MiB per token in total, which is nothing. The cost is not bandwidth. Each
-`GGML_TENSOR_FLAG_INPUT` copy forces a full `cudaStreamSynchronize` first
-(`ggml/src/ggml-backend.cpp:1677-1684`), so every layer boundary is a hard
-**GPU-drain -> CPU-compute -> re-upload** barrier. 40 layers means 80 such barriers per
-token, and each one stops the pipeline dead until both sides finish.
+### What the 121 copies actually are, and why two fixes for them did not work
 
-Arithmetic that fits: 52.7 ms per token over 40 layers is 1318 us per layer, which is the
-right order for "drain the device, compute 8 experts from RAM, copy 64 KiB back, refill the
-pipe". The GPU is 79% resident but its DRAM is only ~30% utilised, and the CPU is using 1.36
-of 16 cores. Neither device is doing useful work most of the time, because they are taking
-turns.
+The 121 inputs per token, from the scheduler's own copy loop:
 
-### How big the barrier cost is, from two measurements that do not depend on the profiler
+| tensor | bytes | direction | per copy |
+|---|---|---|---|
+| `model.input_embed` | 8192 | CPU -> CUDA | 229 us (once) |
+| `attn_post_norm-N (reshaped)` | 8192 | CUDA -> CPU | 34-162 us |
+| `ffn_moe_topk-N` | 32 | CUDA -> CPU | 7-11 us |
+| `ffn_moe_down-N` | 65536 | CPU -> CUDA | 64-77 us |
 
-The barrier count is per-layer and per-token, and it does not depend on batch size. So
-prefill, which pays 80 barriers once per 2048 tokens, and decode, which pays 80 barriers for
-one token, do identical arithmetic work per token. Two equations, two unknowns:
+Two hypotheses were tested against this and both were wrong, which is worth recording
+because the measurements look like a fix until you check where the time is inside them.
 
-| measured | value |
-|---|---|
-| prefill | 1.97 ms/token at batch 2048, so 4034 ms per ubatch |
-| decode | 52.7 ms/token at batch 1 |
+**Fix 1, wrong: the copies are on the wrong stream.** `ggml_backend_tensor_get/set` go
+through the *buffer* interface, which has no handle on the backend's compute stream, so they
+used `cudaStreamPerThread` and then synchronised *that* stream
+(`ggml-cuda.cu`, `buffer_get_tensor` / `buffer_set_tensor`). Those two streams are not
+ordered against each other, so the synchronise did not mean "the data is ready". Giving the
+buffer context the backend's stream and copying on it is more correct and did cut the
+individual read-backs from 44-162 us to 13-23 us. **The token did not get faster**: total
+per-input time was 87.7 us before and 87.7 us after. The per-copy improvement was real and
+was entirely hidden by waiting for the GPU further down.
 
-Writing `w` for the per-token bandwidth-bound work and `B` for the per-layer barrier cost:
+**Fix 2, wrong: the time is a wait, not a copy.** Instrumenting the body of the copy loop
+separated the wait issued at the top of the branch from the copy itself, and the wait is
+**0.0 us**. Events are in use (`ggml_backend_event_wait`, not a stream sync), so nothing
+stalls there. The 87 us is inside `ggml_backend_tensor_copy`, and for the D2H cases that is
+`cudaStreamSynchronize` on the compute stream, which returns when the GPU has actually
+produced the tensor. Those 8 KiB of `attn_post_norm` exist at the *end* of a layer's GPU
+work, so reading them means waiting for that layer's kernels, and the wait is the GPU doing
+its job, not overhead.
 
-```
-2048w + 80B = 4034
-   w + 80B =   52.7
-```
+So the 0.244 ms per layer is mostly **the GPU's own latency being attributed to the copy
+phase**, because the copy is the first place the host has to wait for it. It is not
+reclaimable by making the copies cheaper, and it is not a barrier that an overlap schedule
+can hide, because the CPU cannot start its expert matvec before the router has run.
 
-which gives **w = 1.95 ms/token** and **B = 0.634 ms per layer**, so `80B = 50.8 ms`.
-
-**96% of a decode token is barrier latency.** The model's arithmetic is ~2 ms. This is also
-why prefill and decode differ by 26.8x on identical bytes, which is the clearest single
-statement of the problem: nothing about the work changed, only how often the pipeline was
-stopped.
-
-**This is exactly the problem Strata's `hit_hook` seam exists to solve.** Strata splits each
-layer's graph into a pre-graph ending at the router and a post-graph beginning at the
-combine, rings a doorbell, and runs the CPU expert pool for layer N *while the GPU is
-already working on layer N+1's mixer*. Its own measurements record the same effect: a single
-change moved the drain from 18.2 ms to 10.2 ms while the token did not move at all, because
-the GPU's half had been moved *behind* the CPU instead of *beside* it, and a second buffer
-plus one `add_inplace` bought the overlap back (`include/strata/core/hit_hook.hpp:23-27`).
-
-That is the port with the largest expected value, and it is a scheduling change rather than
-an arithmetic one, so it preserves bit-exactness. Two things make it non-trivial here:
-
-1. llama.cpp's scheduler is built around "compute this split, then synchronise", and the CPU
-   expert split genuinely cannot start until the router result exists. The overlap therefore
-   has to be a producer/consumer seam, not a relaxed barrier.
-2. Strata overlaps the GPU computing *some* experts of a layer against the CPU computing the
-   *others*. amp pins whole layers to the CPU, so there is no within-layer split to overlap;
-   the seam has to run the CPU pool for layer N against GPU work for layer N+1, which is the
-   cross-layer variant Strata also implements.
-
-Strata's own record is the warning that matters here: the naive version of this change
-looked like a large win and was worth nothing, because it moved the GPU's work *behind* the
-CPU instead of *beside* it. Any attempt at this must be measured on the token, not on the
-drain.
+**What remains true and useful:** the expert matvec is at 27.96 GB/s and is not the
+problem; the copies are not the problem; and the per-layer cost is dominated by GPU work the
+host is waiting on. Any remaining win has to come from making the GPU's per-layer work
+faster or from overlapping it with the CPU's, and the two Strata ideas that would do that -
+grouped expert GEMV, and the fused GDN step - are both kernel work, not scheduling.
 
 ## 5. Attention efficiency, second
 
@@ -237,11 +227,25 @@ pretending otherwise would waste the session. Assessed against this box:
 
 ## Order of work, by measured value
 
-1. **Overlap the CPU expert pool with GPU work** (96% of decode). Largest single item.
-2. **Attention kernel efficiency** (40% of achievable bandwidth, ~15 ms/token). Kernel work.
-3. **Fuse the GDN step** so the 30 recurrent layers stop costing a round trip each.
-4. Everything else in Strata's tree is either already in llama.cpp or needs more VRAM than
-   this card has.
+Revised after instrumenting the scheduler, which retired item 1 of the previous list.
+
+1. **Fused GDN step** (`fused_gdn` in Strata). 30 of the 40 layers are recurrent, each
+   carrying a 4096x128 f32 state that is read and written per token, 120 MiB/token of
+   traffic plus a kernel boundary per layer. Strata keeps 32 state rows per thread in
+   registers and folds the norm and the sigmoid gate into the same kernel, so the state
+   never round-trips. This is the largest *kernel* item and it does not depend on VRAM.
+2. **Attention efficiency.** ~67 GB/s of ~170 GB/s achievable, flat in context, so the
+   shortfall is the per-position block reduction in `fattn-vec`. ~15 ms/token.
+3. **Grouped expert GEMV** (`s2_expert_grouped`). Only pays once experts are resident on the
+   GPU, and g=4 already saturates, so this is gated on VRAM that this card does not have.
+4. Everything else in Strata's tree is either already in llama.cpp or does not apply here.
+
+**Retired:** the CPU/GPU overlap seam. It was the largest item in the previous draft of this
+list and it is not a win on this box, because the measurement says there is no host-side
+stall for it to reclaim: `wait-prev` is 0.1 us and the copy-phase wait is 0.0 us. The
+per-layer cost is GPU work the host is waiting for, so a schedule that runs the CPU pool
+earlier cannot start it earlier, because the router has not run. That is not a reason to
+rule the seam out forever - it is a reason it is not the 96% win it was claimed to be.
 
 ## The measurement trap on this box, restated because it cost real time
 
