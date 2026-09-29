@@ -178,6 +178,13 @@ if(AMP_BUILD_TOOLS)
   add_executable(amp-gdn-bench tools/gdn_bench.cpp)
   target_link_libraries(amp-gdn-bench PRIVATE amp_model amp_io amp_util llama ggml ggml-cuda)
   target_compile_options(amp-gdn-bench PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+  # budget: a measurement tool, not part of the serving path. Prints an upper bound on what
+  # each remaining candidate could win, so the next one is picked by the size of its prize
+  # rather than by how plausible it sounds.
+  add_executable(amp-budget tools/budget.cpp)
+  target_link_libraries(amp-budget PRIVATE amp_model amp_io amp_util llama ggml ggml-cuda)
+  target_compile_options(amp-budget PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(AMP_BUILD_TESTS)

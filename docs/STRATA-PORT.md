@@ -227,25 +227,42 @@ pretending otherwise would waste the session. Assessed against this box:
 
 ## Order of work, by measured value
 
-Revised after instrumenting the scheduler, which retired item 1 of the previous list.
+`tools/budget.cpp` prints this table from the model's own geometry and a measured card rate,
+so it can be re-run rather than believed. Against a 45 ms warm decode token:
 
-1. **Fused GDN step** (`fused_gdn` in Strata). 30 of the 40 layers are recurrent, each
-   carrying a 4096x128 f32 state that is read and written per token, 120 MiB/token of
-   traffic plus a kernel boundary per layer. Strata keeps 32 state rows per thread in
-   registers and folds the norm and the sigmoid gate into the same kernel, so the state
-   never round-trips. This is the largest *kernel* item and it does not depend on VRAM.
-2. **Attention efficiency.** ~67 GB/s of ~170 GB/s achievable, flat in context, so the
-   shortfall is the per-position block reduction in `fattn-vec`. ~15 ms/token.
-3. **Grouped expert GEMV** (`s2_expert_grouped`). Only pays once experts are resident on the
-   GPU, and g=4 already saturates, so this is gated on VRAM that this card does not have.
-4. Everything else in Strata's tree is either already in llama.cpp or does not apply here.
+| candidate | bound | of token | verdict |
+|---|---|---|---|
+| scheduler copy phase | 10.6 ms | 24% | shown to be GPU latency, not overhead |
+| attention: reach streaming rate | 8.5 ms | 19% | the only real kernel work left |
+| experts, everything | 12.9 ms | 29% | already at 27.96 GB/s on the CPU |
+| GDN: fuse the state step | 0.8 ms | 2% | a few percent. Do not write this kernel |
+| overlap seam (`hit_hook`) | - | - | implemented, measured, reverted |
+| KV streaming (`kv_stream`) | - | - | needs VRAM this card does not have |
+| grouped expert GEMV | - | - | gated on VRAM; g=4 already saturates |
 
-**Retired:** the CPU/GPU overlap seam. It was the largest item in the previous draft of this
-list and it is not a win on this box, because the measurement says there is no host-side
-stall for it to reclaim: `wait-prev` is 0.1 us and the copy-phase wait is 0.0 us. The
-per-layer cost is GPU work the host is waiting for, so a schedule that runs the CPU pool
-earlier cannot start it earlier, because the router has not run. That is not a reason to
-rule the seam out forever - it is a reason it is not the 96% win it was claimed to be.
+The expert row is bounded against the GPU rate but runs on the CPU, where it measures
+27.96 GB/s; its real cost is 12.9 ms and it is already at memory bandwidth, so it is a
+floor rather than an opportunity.
+
+**One item survives, and it is a kernel: the attention gap.** ~67 GB/s against ~170 GB/s
+achievable, flat from 32k to 200k context, so the shortfall is per-position work. The cost
+is the block-wide reduction `fattn-vec` performs once per KV position
+(`ggml/src/ggml-cuda/fattn-vec.cuh:254-290`). Strata's answer to a slow decode attention is
+`qsa_decode_attn`: one block per (64-cell chunk, KV head) so all the query heads sharing a
+KV head are served from a single read of the chunk, per-lane `float4` loads, and split-K
+partials merged with a log-sum-exp pass. That is the port, and it is worth doing against
+the 8.5 ms bound.
+
+**Retired:** the CPU/GPU overlap seam. It was the largest item two drafts ago and it is not a
+win on this box, because there is no host-side stall for it to reclaim: `wait-prev` is
+0.1 us and the copy-phase wait is 0.0 us. The per-layer cost is GPU work the host is waiting
+on, so a schedule that starts the CPU pool earlier cannot start it earlier, because the
+router has not run.
+
+**Retired:** the fused GDN step. 30 of the 40 layers are recurrent, which looked like the
+obvious place for Strata's register-resident state. `tools/gdn_bench.cpp` bounds it: 120 MiB
+of state traffic per token against 155 GB/s is a floor of 0.812 ms, 27 us per recurrent
+layer, under 2% of a token even at half the streaming rate. There is no prize.
 
 ## The measurement trap on this box, restated because it cost real time
 
