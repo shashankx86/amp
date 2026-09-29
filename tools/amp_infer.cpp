@@ -47,7 +47,8 @@ options:
   --temp F            sampler temperature (default 0.6)
   --top-p F           sampler top-p (default 0.95)
   --top-k N           sampler top-k (default 20)
-  --logprobs-n N      how many logprobs to track per position (default 32)
+  --logprobs-n N      track this many logprobs per position for --emit-score and
+                      --dump-logprobs (default 0, off: it sorts the whole vocab every token)
   --dump-output PATH  write the generated text
   --dump-logprobs PATH  write per-position logprobs, one line per position, tab-separated
                       token/logprob pairs in descending logprob order
@@ -135,6 +136,12 @@ int main(int argc, char ** argv) {
     }
     if (!prompt_file.empty()) {
         prompt = read_file(prompt_file);
+    }
+    // The top-k logprob tracking is off by default, so these two would otherwise write an
+    // empty file and look like a run that produced no data.
+    if ((!emit_score.empty() || !dump_logprobs.empty()) && cfg.top_k_track <= 0) {
+        fprintf(stderr, "amp-infer: --emit-score and --dump-logprobs need --logprobs-n N\n");
+        return 2;
     }
     if (prompt.empty()) {
         prompt =

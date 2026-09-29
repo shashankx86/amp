@@ -42,9 +42,12 @@ struct RuntimeConfig {
     float       top_p            = 0.95f;
     int32_t     top_k            = 20;
     // Width of the per-position top-k retained for --dump-logprobs. Reporting only, never
-    // sampling. 32, because 5 is narrow enough that a token leaving the window in one arm and
-    // not the other reads as a disagreement that is really the window's edge.
-    int32_t     top_k_track      = 32;
+    // sampling, and off by default: it builds and partial-sorts the whole 248320-entry vocab
+    // every token, which costs 0.16 ms per token for output nobody asked for. Pass
+    // --logprobs-n 32 when comparing engines. 32 rather than 5 because 5 is narrow enough
+    // that a token leaving the window in one arm and not the other reads as a disagreement
+    // that is really the window's edge.
+    int32_t     top_k_track      = 0;
     uint32_t    seed             = LLAMA_DEFAULT_SEED;
     bool        verbose          = false;
 };
@@ -201,8 +204,8 @@ private:
     // sampling one: the sampler still uses top_k. But it bounds every quality comparison made
     // from the dump, because a token that falls out of the window in one arm and not the other
     // reads as a disagreement that is really the window. 5 made an 87% "disagreement" that was
-    // entirely the window. Default raised to 32; expose it on amp-infer and amp-server.
-    int32_t                              top_k_track_ = 32;
+    // entirely the window. Off by default; --logprobs-n turns it on.
+    int32_t                              top_k_track_ = 0;
 };
 
 } // namespace amp

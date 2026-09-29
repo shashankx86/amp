@@ -241,9 +241,9 @@ Result<std::unique_ptr<ModelRuntime>> ModelRuntime::create(const RuntimeConfig &
         return Status::Error("llama_init_from_model failed for unknown reasons");
     }
 
-    if (cfg.top_k_track > 0) {
-        rt->top_k_track_ = cfg.top_k_track;
-    }
+    // Assigned unconditionally so that --logprobs-n 0 actually turns the tracking off; with
+    // the old guard a 0 fell through and left the runtime at its own default.
+    rt->top_k_track_ = cfg.top_k_track;
     llama_sampler_chain_params sp = llama_sampler_chain_default_params();
     sp.no_perf                  = true;
     rt->smpl_                   = llama_sampler_chain_init(sp);   // a chain is a llama_sampler
@@ -436,16 +436,24 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
     logprobs_.clear();
 
     const Stopwatch sw;
+    // Phase timers for AMP_TRACE_DECODE. Every decode token is prefetch + decode + sample, and
+    // the sample and the prefetch are host work that has nothing to do with the model, so
+    // without this the only way to attribute a token is to infer it from a sweep.
+    const bool  trace    = getenv("AMP_TRACE_DECODE") != nullptr;
+    double      t_pref = 0.0, t_dec = 0.0, t_smpl = 0.0, t_logp = 0.0;
+    int64_t     t0 = 0;
     // The KV cache already holds the whole prompt, so the logits for the *next* token are ready.
     // Sample first, then feed the sampled token: decoding before sampling would append a spurious
     // token (this bug shifted every generation by one and was caught by the logit parity check).
     for (int32_t i = 0; i < max_new; i++) {
+        t0 = trace ? ggml_time_us() : 0;
         if (prefetch_) {
             // Deliberately not prefetching the full expert set during decode: decode only needs the
             // active experts, and pulling 12 GiB per token evicts the resident set. See
             // Prefetcher::prime_for_decode().
             prefetch_->prime_for_decode();
         }
+        if (trace) { t_pref += (double) (ggml_time_us() - t0); t0 = ggml_time_us(); }
 
         // Capture the distribution we are about to sample from, so quality can be compared
         // numerically against another engine rather than by eyeballing text.
@@ -476,8 +484,11 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
             }
         }
 
+        if (trace) { t_logp += (double) (ggml_time_us() - t0); t0 = ggml_time_us(); }
+
         const llama_token id = llama_sampler_sample(smpl_, ctx_, -1);
         llama_sampler_accept(smpl_, id);
+        if (trace) { t_smpl += (double) (ggml_time_us() - t0); t0 = ggml_time_us(); }
         if (llama_vocab_is_eog(vocab_, id)) {
             break;
         }
@@ -487,6 +498,7 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
             decode_batch_[0] = id;
             llama_batch batch = llama_batch_get_one(decode_batch_.data(), 1);
             const int32_t rc = llama_decode(ctx_, batch);
+            if (trace) { t_dec += (double) (ggml_time_us() - t0); }
             if (rc != 0) {
                 return Status::Errorf("llama_decode failed during decode (rc=%d)", rc);
             }
@@ -502,6 +514,18 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
     }
     stats_.decode_tokens = (int64_t) out.size();
     stats_.decode_ms    = sw.elapsed_s() * 1e3;
+
+    if (trace && out.size() > 0) {
+        const double n   = (double) out.size();
+        const double tot = t_pref + t_dec + t_smpl + t_logp;
+        AMP_INFO("amp: decode phases per token (", out.size(), " tokens, ",
+                 format("%.2f", stats_.decode_ms / n), " ms/token)",
+                 "  prefetch ",      format("%.3f", t_pref / 1e3 / n), " ms",
+                 "  llama_decode ",  format("%.3f", t_dec  / 1e3 / n), " ms",
+                 "  sampler ",       format("%.3f", t_smpl  / 1e3 / n), " ms",
+                 "  logprobs ",      format("%.3f", t_logp  / 1e3 / n), " ms",
+                 "  unaccounted ",   format("%.3f", (stats_.decode_ms * 1e3 - tot) / 1e3 / n), " ms");
+    }
 
     // Detokenize the whole completion. Pieces can be partial UTF-8, so accumulate bytes and
     // strip a trailing incomplete sequence.
