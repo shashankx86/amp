@@ -156,6 +156,21 @@ if(AMP_BUILD_TOOLS)
   target_include_directories(amp-kernel-bound PRIVATE "${AMP_VENDOR_DIR}/include" "${AMP_VENDOR_DIR}/ggml/include")
   target_link_libraries(amp-kernel-bound PRIVATE llama ggml ggml-cpu)
   target_compile_options(amp-kernel-bound PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+  # page-walk: a measurement tool, not part of the serving path. It answers whether the CPU
+  # expert read is limited by DRAM or by address translation, which decides whether page size
+  # is a lever at all on a 12.19 GiB mmap'd working set.
+  add_executable(amp-page-walk tools/page_walk.cpp)
+  target_link_libraries(amp-page-walk PRIVATE amp_util)
+  target_compile_options(amp-page-walk PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+  # fa-bench: a measurement tool, not part of the serving path. It times one decode
+  # attention alone, with nothing else in the graph, so kernel changes can be compared
+  # without the page-cache variance that swamps an end-to-end A/B on this box.
+  add_executable(amp-fa-bench tools/fa_bench.cpp)
+  target_include_directories(amp-fa-bench PRIVATE "${AMP_VENDOR_DIR}/include" "${AMP_VENDOR_DIR}/ggml/include")
+  target_link_libraries(amp-fa-bench PRIVATE llama ggml ggml-cuda)
+  target_compile_options(amp-fa-bench PRIVATE -Wall -Wextra -Wno-unused-parameter)
 endif()
 
 if(AMP_BUILD_TESTS)
