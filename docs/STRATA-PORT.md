@@ -449,15 +449,28 @@ host first waits for the device, and it does grow with context: 3.89 ms at 3.4k,
 **But 4.4 ms of it is unexplained and is recorded as an open lead.** A bracket around the
 `llama_sampler_sample` call from the caller says 5.90 ms. A bracket inside that same
 function, from its first statement to its last, says 1.19 ms. Both are wall clock and they
-cannot both be right. The likely explanation is that the sampler's 3 MB of writes and reads
-land in a memory system that the OpenMP spin pool and the expert pages have just thrashed,
-so the same work that costs 0.17 ms on an idle machine costs several times that here - but
-that is a hypothesis, and it was not confirmed. It needs an instrument that can sample the
-host while it is in there, which this session did not build.
+cannot both be right.
 
-The one thing that is safe to say: 10.6% of a decode token is spent in a function whose
-entire purpose is to pick a token from 248,320 logits, and almost none of it is the
-selection.
+Two candidate explanations, one tested and refuted:
+
+- *The OpenMP spin pool is thrashing memory underneath the sampler.* Tested with
+  `OMP_WAIT_POLICY=passive` and `GOMP_SPINCOUNT=0`. The sampler phase does not move
+  (5.90 -> 5.74 ms), so this is not it. The experiment was worth running for another
+  reason: the spin is worth **12%** end to end. 56.6/57.7 s spinning against 63.6/64.2 s
+  passive, and it is 6 ms of that gap inside `llama_decode`, which is exactly the
+  `libgomp` 47% the profile shows. The default is right and is now known to be.
+- *The sampler is blocked, not computing.* This one the profile supports and the timing
+  cannot settle. `perf` over the same decode shows 47.2% `libgomp`, 42.7% the two matvecs
+  and 2.5% everything else - and no symbol for the sampler at all. If the sampler burned
+  4.4 ms of CPU per 35 ms token it would be ~13% of the cycles and would be plainly
+  visible. It is not there, so the time is most likely spent blocked in
+  `ctx->synchronize()`, which `perf`'s cycle event does not sample.
+
+That is the reading, and it is not proven. Settling it needs an instrument that samples
+the host while it is inside that call, which this session did not build.
+
+What is safe to say either way: 10.6% of a decode token sits in a function whose entire
+purpose is to pick a token from 248,320 logits, and almost none of it is the selection.
 
 ### What this changes about the plan
 
