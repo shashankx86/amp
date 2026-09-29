@@ -98,7 +98,7 @@ AMP_TEST(planner_prefers_large_ubatch_over_gpu_experts) {
     auto geo_res = ModelGeometry::build(*gguf_res);
     const ModelGeometry & geo = **geo_res;
 
-    PlannerOptions opts;  // defaults: ctx 200k, q8_0/q4_0, ubatch <= 2048
+    PlannerOptions opts;  // defaults: ctx 200k, q8_0/q8_0, ubatch <= 2048
     const CostModel cost = CostModel::for_this_machine();
     const DeviceBudget budget = this_box();
 

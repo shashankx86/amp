@@ -29,7 +29,7 @@ struct RuntimeConfig {
     std::string model_path;
     int64_t     n_ctx            = 200000;
     CacheType   cache_k          = CacheType::kQ8_0;
-    CacheType   cache_v          = CacheType::kQ4_0;
+    CacheType   cache_v          = CacheType::kQ8_0;
     int32_t     n_expert_layers_gpu = 2;
     int64_t     n_ubatch         = 2048;
     int32_t     n_batch          = 2048;

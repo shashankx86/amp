@@ -36,7 +36,7 @@ options:
   --n-predict N       tokens to generate (default 64)
   --ctx N             context size (default 200000)
   --ctk TYPE          K cache type (default q8_0)
-  --ctv TYPE          V cache type (default q4_0)
+  --ctv TYPE          V cache type (default q8_0)
   --gpu-layers N      expert layers on the GPU (default: from the planner)
   --ubatch N          ubatch size (default: from the planner)
   --threads N         CPU threads (default 8)

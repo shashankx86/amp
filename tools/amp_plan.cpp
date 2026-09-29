@@ -30,7 +30,7 @@ options:
   --model PATH        GGUF model (required)
   --ctx N             context length to plan for (default 200000)
   --ctk TYPE          K cache type (default q8_0)
-  --ctv TYPE          V cache type (default q4_0)
+  --ctv TYPE          V cache type (default q8_0)
   --ubatch-max N      largest ubatch to consider (default 2048)
   --max-gpu-layers N  cap on expert layers placed on the GPU (default 8)
   --cache-target B    page cache budget, e.g. 11.5GiB (default: auto-detected)
@@ -123,7 +123,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     opts.cache_k = cache_type_from_string(cache_k_str ? cache_k_str : "q8_0");
-    opts.cache_v = cache_type_from_string(cache_v_str ? cache_v_str : "q4_0");
+    opts.cache_v = cache_type_from_string(cache_v_str ? cache_v_str : "q8_0");
 
     // ---- model ----
     auto gguf_res = GGUFFile::open(model);

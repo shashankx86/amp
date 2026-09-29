@@ -393,14 +393,14 @@ These are llama.cpp's own defaults, not amp's, and each is a way to OOM or thras
 
 | default | value | why it is dangerous here | clamped to |
 |---|---|---|---|
-| `n_ctx_checkpoints` | 32 | each checkpoint is a **full** serialized sequence state (`common_prompt_checkpoint::data_tgt`, filled by `llama_state_seq_get_data_ext`) - 8320 B/token of KV plus the 62.81 MiB recurrent state, so ~1.6 GiB each at 200k, and the ring reaches tens of GiB | 2 |
+| `n_ctx_checkpoints` | 32 | each checkpoint is a **full** serialized sequence state (`common_prompt_checkpoint::data_tgt`, filled by `llama_state_seq_get_data_ext`) - 10.9 KB/token of KV plus the 62.81 MiB recurrent state, so ~2.1 GiB each at 200k, and the ring reaches tens of GiB | 2 |
 | `cache_ram_mib` | 8192 | an *anonymous* RAM prompt cache that evicts the model's page cache - the exact mechanism behind the 10x decode cliff | 512 |
 | `fit_params` | on | llama.cpp's fitter throws on our layout (`fit.cpp:463-486`), the failure is ignored (`common.cpp:1320`), and a *successful* fit would overwrite the buft overrides and re-fill the GPU | off |
 
 ## Facts about this model that are easy to get wrong
 
 - **30 of the 40 layers are recurrent** (linear attention / SSM), only 10 use the KV cache. That is
-  why the KV is 8320 B/token and why the recurrent state is a flat 62.81 MiB (40 layers, f32, 1 cell).
+  why the recurrent state is a flat 62.81 MiB (40 layers, f32, 1 cell).
 - **A recurrent state cannot be partially erased.** `llama_memory_seq_rm` only rewinds one through a
   bounded snapshot ring (`n_rs_seq`, 62.81 MiB of VRAM *per snapshot*, 0 by default) and for M-RoPE
   models the position check then aborts the decode outright. Any design that assumes "truncate the KV

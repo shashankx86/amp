@@ -49,12 +49,13 @@ struct PreflightOptions {
     uint64_t warm_chunk = 2ull * 1024 * 1024; // per pread() in the warm
 
     // Context size to plan for, and to set when the user did not pass -c. 200000 is
-    // the measured optimum: the KV cache (8320 B/token) plus the compute buffers fit
+    // the measured optimum: the KV cache (10.9 KB/token) plus the compute buffers fit
     // the 6 GB card there, the model's native 262144 does not.
     int64_t n_ctx = 200000;
 
-    // KV cache dtypes. Must stay q8_0/q4_0: those are the dtypes the BENCH.md
-    // numbers were measured with (zero-quality-loss constraint, AGENT.md).
+    // KV cache dtypes. Must stay q8_0/q8_0: those are the dtypes the BENCH.md numbers
+    // were measured with, and q8_0 V is 8.8x closer to f16 than q4_0 (zero-quality-loss
+    // constraint, AGENT.md).
     CacheType cache_k = CacheType::kQ8_0;
     CacheType cache_v = CacheType::kQ8_0;
 
