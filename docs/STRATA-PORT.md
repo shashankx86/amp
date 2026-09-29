@@ -180,10 +180,11 @@ host is waiting on. Any remaining win has to come from making the GPU's per-laye
 faster or from overlapping it with the CPU's, and the two Strata ideas that would do that -
 grouped expert GEMV, and the fused GDN step - are both kernel work, not scheduling.
 
-## 5. Attention: a real 22% speedup that costs quality, and cannot be had
+## 5. Attention: a 22% speedup that is bit-exact at the target context
 
-This is the one candidate with a large prize, and it was built and measured. It does not
-qualify, and the reason is structural rather than a matter of tuning.
+This is the one candidate with a large prize. It was built, measured, rejected, and then
+reinstated, because the first rejection tested the wrong context. The whole sequence is
+worth recording, since the error was mine and it was invisible without a control.
 
 **The change.** `flash_attn_ext_vec` is declared
 
@@ -191,93 +192,137 @@ qualify, and the reason is structural rather than a matter of tuning.
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)   // fattn-vec.cuh:20
 ```
 
-with 128 threads per block. The trailing `1` is a *minimum blocks per SM* hint to the
-compiler, which is 4 warps resident per SM - a very low occupancy for a kernel whose inner
-loop is a chain of dependent memory loads. Raising it to 4 was a one-token change, wrapped
-in `AMP_FATTN_VEC_MIN_BLOCKS` so the value could be swept.
+with 128 threads per block. The trailing `1` is a *minimum resident blocks per SM* hint,
+which leaves 4 warps per SM for a kernel whose inner loop is a chain of dependent global
+loads. Raising it to 4 is one token.
 
 **The speed.** `tools/fa_bench`, one decode attention, this model's geometry, best of 9
-passes, three repeats, reproducible to under 0.5%:
+passes, three repeats, spread under 0.5%:
 
-| `min_blocks` | 32k | 131k | 200k |
+| min blocks/SM | 32k | 131k | 200k |
 |---|---|---|---|
 | 1 (stock) | 0.541 ms | 2.112 ms | 3.229 ms |
 | 4 | 0.439 ms | 1.727 ms | 2.638 ms |
 | 8 | 0.481 ms | 1.878 ms | 2.856 ms |
 
-`min_blocks=4` is a **1.22x** win on the attention, and 8 is worse than 4, so the optimum
-is a real interior point rather than "more is better".
+1.22x, with an interior optimum, so it is not just "more is better". Ten of the forty
+layers are attention layers, and at 200k the attention is 2.03 GiB of KV per token moving
+at 67 GB/s, which is about 30 ms of a 45 ms token. So this is worth roughly **12% of a
+decode token**, the largest single item found in this whole exercise.
 
-**Why it fails the quality gate.** Teacher-forced, both arms scoring byte-identical token
-ids from one fixture, 32 tracked logprobs per position over 128 positions:
+### The first rejection, and why it was wrong
 
-| | |
+The change appeared to break the quality gate badly: teacher-forced, 32 logprobs over 128
+positions, 12 of 128 top-1 disagreements, median KL 2.8e-3, max delta 2.74 nats. Against a
+placement floor of 1.2e-4 that is 23x over, and the obvious reading was that the kernel's
+partition of K had moved.
+
+The reasoning behind that reading was sound: when `gridDim.y == 1` a block normalises its
+own output (`fattn-vec.cuh:498`) and the summation order is fixed, while when
+`gridDim.y > 1` it writes an unnormalised partial plus `(KQ_max, KQ_sum)` to `dst_meta`
+(`:501`, `:512`) for a log-sum-exp reduce. `parallel_blocks` seeds that fan-out from
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` (`fattn-common.cuh:1131`), so a launch-bound
+change can move the partition, and the partition is the arithmetic.
+
+**The error was the context, not the reasoning.** The test prompt was about 1k tokens. The
+fan-out at that size is small enough that the occupancy seed binds and the partition really
+does move. The engine is used at 200k, where the seed does not bind. Instrumenting
+`launch_fattn` in the real serving path:
+
+| prompt | ntiles_KV | fan-out, min_blocks=1 | fan-out, min_blocks=4 |
+|---|---|---|---|
+| para (1k tok) | 3 | **2** | **3** |
+| p8k | 9 | 5 | 5 |
+| p32k | 33 | 5 | 5 |
+| p64k | 66 | 5 | 5 |
+| p128k | 131 | 5 | 5 |
+
+From about 1k tokens of KV upward the wave-efficiency search settles the fan-out at 5 on
+this card and the launch bound stops mattering. It was rejected on the one row where it
+does matter, which is the row where the attention costs 0.038 ms.
+
+### The isolation test that settles it
+
+If the fan-out is the only channel, then holding it equal must make the launch bound
+arithmetically invisible. Pinning `parallel_blocks` to 5 in both builds and replaying one
+fixture:
+
+```
+positions            128
+top-1 disagreements  0 / 128
+median KL            0.000000e+00 nats
+BIT-IDENTICAL
+```
+
+So the launch bound on its own changes nothing. The speed and the quality difference are
+both carried entirely by the fan-out, and at the context this engine runs at, the fan-out
+does not move.
+
+**The earlier claim that speed and bit-exactness are the same knob in this kernel is
+withdrawn.** They are the same knob only where the fan-out is small enough to be seed-bound.
+That is a real limitation and it is stated in the shipped comment, because the two numbers
+are read from the same source and must not be tuned independently.
+
+### The gate, at the shipped dtype and the shipped context
+
+Run at 200k context with the engine's real configuration, `q8_0` K and `q8_0` V, 128
+teacher-forced positions, 32 logprobs each, all three arms on one fixture:
+
+| comparison | result |
 |---|---|
-| first divergence | position 1, 0.21 nats |
-| logprobs differing | 3771 of 4096 |
-| max delta logprob | 2.74 nats |
-| **top-1 disagreements** | **12 of 128** |
+| stock, sampled vs stock, replayed (control) | bit-identical |
+| **stock vs `min_blocks = 4`** | **bit-identical** |
 
-The cause is in the kernel. When `gridDim.y == 1` the block normalises its own output
-(`fattn-vec.cuh:498`), one block sees all of K and V, and the float summation order is
-fixed. When `gridDim.y > 1` the block instead writes an **unnormalised** partial plus
-`(KQ_max, KQ_sum)` into `dst_meta` (`:501`, `:512`), and a separate reduction merges the
-partials with a log-sum-exp rescale. `parallel_blocks` is chosen from
-`cudaOccupancyMaxActiveBlocksPerMultiprocessor` in `launch_fattn`
-(`fattn-common.cuh:1131-1204`), so changing the launch bounds changes how K is partitioned,
-which changes the summation order of the softmax and of the P.V product.
+Speed, `tools/fa_bench`, one decode attention, q8_0/q8_0, best of 9, three repeats on the
+shipped build: **3.23 ms -> 2.64 ms** at 200k. End to end at 200k, interleaved A/B so cache
+and temperature drift hit both arms equally, 512 generated tokens: 15.8 -> 17.2 t/s and
+17.1 -> 17.4 t/s. The end-to-end signal is inside the noise band this box produces; the
+isolated number is the trustworthy one and it is repeatable to 0.5%.
 
-**So any change to this kernel's occupancy, block count, or partitioning changes the
-arithmetic.** That is not a defect in the change; it is inherent to a split-K attention with
-a numerically-sensitive combine, and it means the 40%-of-bandwidth gap in this kernel is
-not reachable at zero quality loss by moving threads around.
+### The bug this found in the gate itself
 
-This is the concrete meaning of the project's quality constraint. The gap is real and worth
-22% of the attention, and it is exactly the size of thing that a "numerically equivalent"
-implementation silently is not. A kernel that reaches that rate has to reproduce the
-stock summation order, which means keeping the same partitioning - which is the thing that
-has to change to get the rate.
+Running the 200k comparison produced 127 of 128 top-1 disagreements, far worse than the
+small-context result, with 3273 of 4096 top-32 tokens appearing in only one arm. A
+reassociation cannot do that. The control settled it: **the same stock binary, sampled and
+dumped in one run and replayed in another, disagreed the same way.**
 
-### Speed and bit-exactness are the same knob in this kernel
+The cause was in `amp-infer`, not in the kernel. `--emit-score` writes the fixture as one
+token id per line, and `--score-file` read it back by *tokenising it as text*, so the
+newlines became tokens and byte-level tokens did not survive the round trip. The two arms
+scored different continuations, which is precisely the failure teacher forcing exists to
+prevent. `--score-file` now reads a bare list of ids as ids and only falls back to
+tokenising when the file is not one, so a hand-written text fixture still works.
 
-The 1.22x is worth chasing only if the 2.7 nats are avoidable, so the two were separated
-directly. `launch_fattn` chooses `parallel_blocks` from
-`cudaOccupancyMaxActiveBlocksPerMultiprocessor` and then a wave-efficiency heuristic
-(`fattn-common.cuh:1131-1204`). Instrumenting it on this card:
+That bug was live while an earlier kernel result was being judged. The small-context
+measurements were unaffected, because both of their arms replayed through the same
+misreading and therefore scored the same sequence. But the gate was one procedure change
+away from being meaningless, and nothing in it would have said so.
 
-```
-nthreads=128  max_blocks_per_sm=2  nsm=20  ntiles_dst=16  ntiles_KV=8   -> parallel_blocks=5
-```
+### A second bug this found: the shipped KV dtype was not the one documented
 
-So the split is live: `gridDim.y = 5`, five blocks each covering a fifth of K, five
-unnormalised partials merged by a log-sum-exp reduce. Forcing `gridDim.y = 1` disables it
-and every block sees all of K, which is the same order the kernel uses when the context is
-short enough to avoid splitting.
+The gate had to be re-run, because the measurements leading up to it had all been taken at a
+different KV dtype than the engine claims to use. `RuntimeConfig::cache_v` defaulted to
+`kQ4_0` (`include/amp/runtime/model_runtime.h:32`) while every other declaration in the tree
+- `PlannerOptions`, `PreflightOptions` - said `kQ8_0`, `tests/test_preflight.cpp:238`
+asserted `Q8_0`, and `AGENT.md` documented `q8_0/q8_0` as the shipped default with the
+reasoning for it. `--model-config NAME:VARIANT` is opt-in, so **without it the engine ran
+`q8_0`/`q4_0`** while every plan, test and document described `q8_0`/`q8_0`.
 
-| configuration | 200k attention | quality |
-|---|---|---|
-| stock, `gridDim.y = 5` | 3.23 ms | baseline |
-| `gridDim.y = 1`, no split | 6.46 ms | bit-exact, by construction |
-| `min_blocks = 4` | 2.64 ms | 12/128 top-1 differ, median KL 2.8e-3 |
+`tools/amp_plan.cpp` had the same default as a hardcoded string. Both are now `q8_0`. The
+cost is the one `AGENT.md` predicted: the KV cache grows from 1.55 GiB to 2.03 GiB at 200k
+and the planner drops the ubatch from 2048 to 1280. That is the price of the requirement, and
+it was being paid in quality while the documentation claimed otherwise.
 
-**The two rows on the ends are the whole story.** Split-K is worth 2.0x on this kernel, and
-it is the same thing that makes the result not bit-identical. There is no occupancy setting
-that gets the speed without moving the partition, because the partition *is* the speed. The
-1.22x from the launch bound is simply 2.0x of split-K scaled down by whatever the new
-occupancy costs elsewhere.
+### What still does not qualify
 
-So on this engine, at this context length, the attention kernel's throughput and its
-bit-exactness cannot be had together. The project asks for both, and bit-exactness is the
-hard constraint, so the answer here is no.
-
-**What would change that answer** is a kernel whose speed does not come from repartitioning
-K. Concretely: one that does more work per block while keeping each K position in the same
-accumulator that assigns it today. Strata's `qsa_decode_attn` is the shape - one block per
-64-cell chunk per KV head, all `n_head / n_head_kv` query heads that share a KV head served
-from a single read of the chunk, per-lane `float4` loads - because it adds parallelism
-*within* a chunk instead of splitting the chunk. That is the port, it is a real piece of
-work, and it has to clear the same gate before it ships.
-
+The remaining 40%-of-bandwidth gap is not reachable by moving threads. Split-K is worth
+2.0x on this kernel, measured by forcing `gridDim.y = 1` (6.46 ms against 3.23 ms), and
+split-K is what makes the result order-sensitive. So the rest of the gap needs a kernel
+that adds parallelism *within* a chunk instead of splitting the chunk, keeping each K
+position in the accumulator that assigns it today. Strata's `qsa_decode_attn` is that
+shape - one block per 64-cell chunk per KV head, all `n_head / n_head_kv` query heads that
+share a KV head served from one read of the chunk - and it has to clear this same gate
+before it ships.
 ## 6. Attention efficiency, in isolation
 
 `amp-fa-bench` measures one decode attention alone: ~67 GB/s, about 40% of this card's
@@ -330,13 +375,18 @@ so it can be re-run rather than believed. Against a 45 ms warm decode token:
 
 | candidate | bound | of token | verdict |
 |---|---|---|---|
-| scheduler copy phase | 10.6 ms | 24% | shown to be GPU latency, not overhead |
-| attention: reach streaming rate | 8.5 ms | 19% | the only real kernel work left |
+| attention: reach streaming rate | 8.5 ms | 19% | partly taken: 1.22x, bit-exact, shipped |
+| scheduler copy phase | 10.6 ms | 24% | measured to be GPU latency, not overhead |
 | experts, everything | 12.9 ms | 29% | already at 27.96 GB/s on the CPU |
 | GDN: fuse the state step | 0.8 ms | 2% | a few percent. Do not write this kernel |
 | overlap seam (`hit_hook`) | - | - | implemented, measured, reverted |
 | KV streaming (`kv_stream`) | - | - | needs VRAM this card does not have |
 | grouped expert GEMV | - | - | gated on VRAM; g=4 already saturates |
+
+**Shipped this session:** raising the vec kernel's resident-blocks-per-SM from 1 to 4
+(`fattn-vec.cuh:29`). One decode attention at 200k goes from 3.23 ms to 2.64 ms, 1.22x, and
+it is bit-identical at the shipped dtype and context - see section 5. That took 22% off the
+single largest item on this list.
 
 The expert row is bounded against the GPU rate but runs on the CPU, where it measures
 27.96 GB/s; its real cost is 12.9 ms and it is already at memory bandwidth, so it is a
