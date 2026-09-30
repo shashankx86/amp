@@ -41,10 +41,12 @@ constexpr ggml_type kTypeK  = GGML_TYPE_Q8_0;
 constexpr ggml_type kTypeV  = GGML_TYPE_Q8_0;
 
 // Head dim, and the query/KV head counts, are overridable because they are the knobs that
-// separate "this kernel cannot reach the card's rate" from the ways it might be reaching for
-// one: head dim moves bytes-per-row and math-per-row together, and the GQA ratio moves how
-// many blocks stream the same KV rows. 16 / 2 / 256 is the model.
+// separate "this kernel cannot reach the card's rate" from "this kernel is also being asked
+// to serve more query heads": head dim moves bytes-per-row and math-per-row together, and
+// AMP_FA_H/AMP_FA_HKV hold the KV bytes fixed while the query-head count changes, which is
+// what separates the two. 16 / 2 / 256 is the model.
 static int kHeadDim   = getenv("AMP_FA_D")   ? atoi(getenv("AMP_FA_D"))   : 256;
+static int ncols      = 1;   // decode shape: one query column
 static int kNHead     = getenv("AMP_FA_H")   ? atoi(getenv("AMP_FA_H"))   : 16;
 static int kNHeadKV   = getenv("AMP_FA_HKV") ? atoi(getenv("AMP_FA_HKV")) : 2;
 
@@ -231,9 +233,9 @@ int main(int argc, char ** argv) {
     }
 
     printf("amp-fa-bench\n");
-    printf("  geometry     D=%d  heads=%d  kv_heads=%d (gqa %d)  K=%s V=%s  1 query\n",
+    printf("  geometry     D=%d  heads=%d  kv_heads=%d (gqa %d)  K=%s V=%s  %d query column(s)\n",
            kHeadDim, kNHead, kNHeadKV, kNHead / kNHeadKV,
-           ggml_type_name(kTypeK), ggml_type_name(kTypeV));
+           ggml_type_name(kTypeK), ggml_type_name(kTypeV), ncols);
     printf("  backend      %s\n", ggml_backend_name(backend));
 
     const double stream = measure_stream_bandwidth(backend);
@@ -277,10 +279,24 @@ int main(int argc, char ** argv) {
                ctx, best.ms, best.gb_per_s, best.pct_of_stream, best.base_gbps, gib);
     }
 
-    printf("\n  A decode attention that reads the whole KV at the streaming rate would show\n"
-           "  ~100%% in the last column. Far below that means the kernel is not limited by\n"
-           "  memory: it is limited by its own thread mapping, and the fix is a different\n"
-           "  kernel or a different launch geometry, not fewer bytes.\n");
+    // The % column is a bandwidth ratio, and at gqa > 1 it is a ratio of two different
+    // things, so say what it means rather than let it be read as an efficiency.
+    const int gqa = kNHead / kNHeadKV;
+    printf("\n"
+           "  The %% column is useful KV bytes over wall time against this card's measured\n"
+           "  streaming rate, so at gqa 1 it is a bandwidth ratio and a value near 100%% would\n"
+           "  mean the kernel is moving KV as fast as the card streams. At this model's gqa %d\n"
+           "  it is not that: each KV row is read once but scored against %d query heads, so\n"
+           "  the denominator counts only part of the work. Measured on this box, holding the\n"
+           "  KV bytes fixed at one KV head and raising only the query heads gives\n"
+           "\n"
+           "      2/1 0.906 ms    4/1 0.946 ms    8/1 1.310 ms   16/1 2.420 ms\n"
+           "\n"
+           "  so the time grows with the head count on its own, and at the model's shape the\n"
+           "  cost is per query head, not KV bytes. And going from 8/1 to 8/2 doubles the KV\n"
+           "  for 0.58 ms more, i.e. the marginal KV streams at ~177 GB/s. Re-run this bench\n"
+           "  with AMP_FA_H and AMP_FA_HKV set as above to reproduce that, rather than reading\n"
+           "  a low %% here as a kernel that cannot reach memory bandwidth.\n", gqa, kNHead);
 
     ggml_backend_free(backend);
     return 0;
