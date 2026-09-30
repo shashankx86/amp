@@ -534,11 +534,14 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
     if (trace && out.size() > 0) {
         const double n   = (double) out.size();
         const double tot = t_pref + t_dec + t_smpl + t_logp;
+        // The drain is timed inside llama_decode, so it is part of t_dec and not a phase of
+        // its own. Print it indented under it, or the lines read as though they sum past the
+        // token, which is what it looked like before.
         AMP_INFO("amp: decode phases per token (", out.size(), " tokens, ",
                  format("%.2f", stats_.decode_ms / n), " ms/token)",
                  "  prefetch ",      format("%.3f", t_pref / 1e3 / n), " ms",
                  "  llama_decode ",  format("%.3f", t_dec  / 1e3 / n), " ms",
-                 "  post-decode drain ", format("%.3f", t_drain / 1e3 / n), " ms",
+                 "    of which the post-decode device drain ", format("%.3f", t_drain / 1e3 / n), " ms",
                  "  sampler ",       format("%.3f", t_smpl  / 1e3 / n), " ms",
                  "    of which the call ", format("%.3f", t_call_ms / 1e3 / n), " ms",
                  "  logits_fetch ", format("%.3f", t_logp  / 1e3 / n), " ms",

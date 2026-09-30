@@ -825,6 +825,65 @@ the instrument. After subtracting it the glue is **<= 0.8 ms/token**.
 It saves nothing.** The decision to retire it stands; the reason it was previously given - that
 the recurrence is free - was wrong, and this is the right one.
 
+### The CPU expert stream is at this box's DRAM read ceiling, so it is closed
+
+The token's second phase is 40 layers of batch-1 expert matvec on the CPU, 8 selected experts
+per layer, about 431 MB of weights per token, which the engine measures at **27.96 GB/s**. It
+was never clear whether that is the memory system's limit or a limit of the matvec's
+memory-level parallelism, and the two have opposite consequences: at the limit nothing helps,
+below it both prefetching and threading do.
+
+`amp-page-walk` answers it, and the answer is the limit:
+
+| backing | contiguous sweep | scattered (decode shape) |
+|---|---|---|
+| the model file, 4 KiB pages | **26.37 GB/s** | **25.88 GB/s** |
+| anonymous, 4 KiB pages | 24.19 | 17.27 |
+
+**The expert stream is already running at or slightly above the rate at which the model file
+can be read at all** (27.96 against 26.37), so the matvec is bandwidth-bound and not
+latency-bound. No prefetch can help, because a prefetch issues a read into a bus that is
+already full. An independent threaded read benchmark puts the box's controller limit at
+28.0 GB/s over anonymous memory, flat from 1 thread to 16 - one thread reaches 20.5 and more
+threads add contention without adding bandwidth - so the wall is the memory controller rather
+than per-core latency, which is also why 16 threads measured 1.55x slower than 8.
+
+**Page size is not a lever here either.** `MADV_HUGEPAGE` obtains no pages on this btrfs file
+mapping, so a direct A/B of the same file mapped both ways reads 25.7 and 26.1 GB/s, within
+noise. Worth restating because the *anonymous* buffer does go from 28.0 to 31.3 GB/s with
+`MADV_HUGEPAGE`, and a reader who only ran that test would conclude the TLB was worth 12% and
+that the fix was one line away. It is not: the weights are a file mapping, and file mappings on
+this filesystem do not get huge pages.
+
+### A latent no-op in the expert prefetch, and why it still does not matter
+
+The `ggml-cpu.c` M3c prefetch has a positive depth, which prefetches the experts the router
+just selected, and a negative depth, which is documented as prefetching the next layer's
+*previous* selection so that one layer of compute is available as lead time. The negative mode
+never ran. Its span was computed from a signed depth:
+
+```c
+const int64_t want = (int64_t) m3c_kib*1024;
+const int64_t span = want < expert_bytes ? want : expert_bytes;
+```
+
+so a negative depth gave a negative `span`, and both prefetch loops are `for (off = 0; off <
+span; off += 64)`, which then never executed. Fixed by taking the magnitude of the depth, with
+a note that the bus is full so the path cannot help on this box. It is off by default, so this
+changes nothing about a default run - but a silent no-op wearing the name of a predictive mode
+is the kind of thing that costs the next person a day, and it would have been read as
+"prefetching does not help" when the real answer was "prefetching never happened".
+
+### The drain line was printed as a phase when it is a subset
+
+`AMP_TRACE_DECODE` times an explicit `llama_synchronize` after decode, and that timer is
+nested **inside** `llama_decode`. It was printed as a peer, so the lines read as summing past
+the token - at 200k, `llama_decode 71.463` plus `post-decode drain 5.912` plus `sampler 0.539`
+against a 72.00 ms token. It is now printed indented under `llama_decode` as
+`of which the post-decode device drain`, and the phases sum: 38.863 + 0.495 = 39.36 at ctx
+8192. The 200k split is `llama_decode` 99.3% of the token with the drain 8.3% of it, and the
+sampler 0.7%.
+
 ### The decode graph is 698 nodes per token, and per-node device timing measures launch gaps
 
 `AMP_TRACE_OPS` with `AMP_NO_CUDA_GRAPH=1` and no filter reports 698 nodes per decode token.

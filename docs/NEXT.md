@@ -147,6 +147,15 @@ wrong by 2.8x on this axis.
 
 ## What is left
 
+**The CPU expert phase is closed.** 431 MB of weights per token at a measured 27.96 GB/s, and
+`amp-page-walk` measures the model file itself at 26.37 GB/s contiguous and 25.88 scattered. The
+stream is already at the rate the file can be read at, the bus is full, and the memory
+controller is the wall (28.0 GB/s over anonymous memory, flat from 1 thread to 16). Prefetching
+cannot help, threading cannot help, and page size is not a lever because `MADV_HUGEPAGE`
+obtains no pages on this btrfs mapping - a conclusion worth keeping, because the *anonymous*
+buffer does gain 12% from huge pages and testing only that would make the fix look one line
+away.
+
 **The sampler's 4.4 ms is closed, and it was never the sampler.** `llama-context.cpp:2087`
 has the end-of-decode `synchronize()` commented out, which is upstream and correct: the host
 returns while the graph runs, and the wait lands on whichever call blocks first, which was
