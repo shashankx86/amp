@@ -37,11 +37,16 @@
 namespace {
 
 // The model's own shape, read off the GGUF by amp-plan.
-constexpr int      kHeadDim = 256;
-constexpr int      kNHead   = 16;
-constexpr int      kNHeadKV = 2;
 constexpr ggml_type kTypeK  = GGML_TYPE_Q8_0;
 constexpr ggml_type kTypeV  = GGML_TYPE_Q8_0;
+
+// Head dim, and the query/KV head counts, are overridable because they are the knobs that
+// separate "this kernel cannot reach the card's rate" from the ways it might be reaching for
+// one: head dim moves bytes-per-row and math-per-row together, and the GQA ratio moves how
+// many blocks stream the same KV rows. 16 / 2 / 256 is the model.
+static int kHeadDim   = getenv("AMP_FA_D")   ? atoi(getenv("AMP_FA_D"))   : 256;
+static int kNHead     = getenv("AMP_FA_H")   ? atoi(getenv("AMP_FA_H"))   : 16;
+static int kNHeadKV   = getenv("AMP_FA_HKV") ? atoi(getenv("AMP_FA_HKV")) : 2;
 
 struct Measurement {
     double      ms;
@@ -210,7 +215,7 @@ int main(int argc, char ** argv) {
             passes = atoi(argv[++i]);
         } else if (a == "--help" || a == "-h") {
             printf(
-                "usage: amp-fa-bench [--ctx N] [--passes N]\n"
+                "usage: amp-fa-bench [--ctx N] [--passes N]   (AMP_FA_D overrides head dim)\n"
                 "\n"
                 "Times one decode attention at this model's geometry (16 heads / 2 KV heads,\n"
                 "head_dim 256, q8_0 K and V) with no other work in the graph, and reports the\n"

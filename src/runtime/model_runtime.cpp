@@ -440,7 +440,7 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
     // the sample and the prefetch are host work that has nothing to do with the model, so
     // without this the only way to attribute a token is to infer it from a sweep.
     const bool  trace    = getenv("AMP_TRACE_DECODE") != nullptr;
-    double      t_pref = 0.0, t_dec = 0.0, t_smpl = 0.0, t_logp = 0.0, t_call_ms = 0.0;
+    double      t_pref = 0.0, t_dec = 0.0, t_smpl = 0.0, t_logp = 0.0, t_call_ms = 0.0, t_drain = 0.0;
     int64_t     t0 = 0;
     // The KV cache already holds the whole prompt, so the logits for the *next* token are ready.
     // Sample first, then feed the sampled token: decoding before sampling would append a spurious
@@ -506,6 +506,14 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
             decode_batch_[0] = id;
             llama_batch batch = llama_batch_get_one(decode_batch_.data(), 1);
             const int32_t rc = llama_decode(ctx_, batch);
+            if (trace) {
+                // An explicit drain, timed, to separate "llama_decode returned before the device
+                // was done" from host work. If the sampler's time collapses into this, the sampler
+                // was never doing anything: it was the first call to block on the device.
+                const int64_t t_x = ggml_time_us();
+                llama_synchronize(ctx_);
+                t_drain += (double) (ggml_time_us() - t_x);
+            }
             if (trace) { t_dec += (double) (ggml_time_us() - t0); }
             if (rc != 0) {
                 return Status::Errorf("llama_decode failed during decode (rc=%d)", rc);
@@ -530,6 +538,7 @@ Result<std::vector<llama_token>> ModelRuntime::generate(int32_t max_new, std::st
                  format("%.2f", stats_.decode_ms / n), " ms/token)",
                  "  prefetch ",      format("%.3f", t_pref / 1e3 / n), " ms",
                  "  llama_decode ",  format("%.3f", t_dec  / 1e3 / n), " ms",
+                 "  post-decode drain ", format("%.3f", t_drain / 1e3 / n), " ms",
                  "  sampler ",       format("%.3f", t_smpl  / 1e3 / n), " ms",
                  "    of which the call ", format("%.3f", t_call_ms / 1e3 / n), " ms",
                  "  logits_fetch ", format("%.3f", t_logp  / 1e3 / n), " ms",

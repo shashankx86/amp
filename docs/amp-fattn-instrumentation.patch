@@ -1,0 +1,30 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 6d1ce52..b074d67 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1206,6 +1206,11 @@ void launch_fattn(
+         blocks_num.y = parallel_blocks;
+         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+ 
++        if (const char * pb_env = getenv("AMP_FATTN_PB")) {
++            parallel_blocks = std::min(ntiles_KV, atoi(pb_env));
++            blocks_num.y = parallel_blocks;
++        }
++
+         if (parallel_blocks > 1) {
+             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+@@ -1236,6 +1241,13 @@ void launch_fattn(
+     GGML_ASSERT(block_dim.x % warp_size == 0);
+ 
+     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
++    if (getenv("AMP_TRACE_FATTN")) {
++        fprintf(stderr, "[fattn] nsm=%d max_blocks_per_sm=%d ntiles_KV=%d ntiles_dst=%d ntiles_x=%d ntiles_z_gqa=%d ne2=%d ne3=%d "
++                        "parallel_blocks=%d grid=(%u,%u,%u) block=(%u,%u,%u) shm=%zu stream_k=%d\n",
++                nsm, max_blocks_per_sm, ntiles_KV, ntiles_dst, ntiles_x, ntiles_z_gqa, int(K->ne[2]), int(Q->ne[3]),
++                parallel_blocks, blocks_num.x, blocks_num.y, blocks_num.z,
++                block_dim.x, block_dim.y, block_dim.z, nbytes_shared, int(stream_k));
++    }
+     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+         (const char *) Q->data,
+         K_data,

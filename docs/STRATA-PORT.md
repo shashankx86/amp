@@ -672,6 +672,66 @@ CPU's traffic rather than the kernel; the recurrent recurrence is free; the LM h
 above the card's rate in isolation. The one item that was both large and improvable, the
 vec attention kernel's occupancy, was taken and is worth 1% of a token.
 
+### The sampler's 4.4 ms was the device finishing the token, and the attention kernel is the
+### one place the engine is not close to a hardware limit
+
+Two things the earlier sections of this document got wrong, both found by instrumenting rather
+than inferring.
+
+**The sampler's unexplained 4.4 ms is `llama_decode` returning before the device is done.**
+`llama-context.cpp:2087` has the end-of-decode `synchronize()` commented out, which is upstream
+behaviour and is correct: it lets the host return while the graph runs. The consequence is that
+the wait lands on whichever call blocks first, and that is `llama_sampler_sample`. Adding a timed
+`llama_synchronize` after decode moves the number exactly: the sampler falls from 4.789 ms to
+0.362 ms and a 4.411 ms post-decode drain appears. It was never the sampler doing work.
+
+That drain is a constant 3.4-4.7 ms, independent of context, of the prefetcher, and of
+`AMP_NO_CUDA_GRAPH`, and it grows about 0.35 ms per GPU-resident expert layer, so it is the
+GPU's un-overlapped work at the end of a token. It cannot be filled: the next token needs the
+sampled id, and the id needs the logits the drain is producing. **Irreducible.**
+
+**The attention kernel is at 49% of the card's streaming rate, and the reason is GQA.**
+
+`amp-fa-bench` has always reported this and it was never acted on. At the model's geometry
+(16 Q heads over 2 KV heads, D=256, q8_0 K/V) it moves KV at **82.5 GB/s against a measured
+148-163 GB/s** streaming rate. That is 26.4 ms of a 55.5 ms token at 200k, the single largest
+item in the token, running at half speed. Every cheap explanation is now excluded by measurement:
+
+| hypothesis | result |
+|---|---|
+| q8_0 rows are 260 B, not 32 B aligned | no. 260 / 272 / 288 pitch: 65.6 / 66.1 / 60.8 |
+| 4 B per lane is too narrow | no. Flat 4 B/lane alone reaches 142.9 of 161 GB/s |
+| too much math per byte | no. D = 64 / 128 / 256 gives 70.3 / 70.1 / 82.7 |
+| register spill | no. `REG:128 STACK:0` for the ncols=1 instantiation |
+| launch bound / occupancy | no. lb = 2/3/4/6/8/12 gives 67/57/**82**/55/76/56 |
+| split-K fan-out | no. pb = 5 and 10 tie at 82.5, and 16/24/40/80 collapse to 46/44/47/23 |
+
+**What it is: grouped-query redundancy.** Holding the KV bytes fixed and varying only the head
+counts:
+
+| Q heads / KV heads | KV read | ms | GB/s | % stream |
+|---|---|---|---|---|
+| 16 / 2 (**the model**) | 2 heads | 2.640 | 82.5 | 49% |
+| 2 / 2 | 2 heads | 1.734 | **125.6** | 74% |
+| 1 / 1 | 1 head | 0.875 | 124.5 | 73% |
+
+The first two rows read **the same KV**. Sixteen Q heads over two KV heads takes **1.52x**
+longer than two over two. Each of the 8 query heads that share a KV head is a separate block
+that streams the same K and V rows; four of them are co-resident on an SM, each holding a
+128-row tile of 33 KB, and 4 x 33 KB is just past the 128 KB L1, so the repeats go to L2 and
+L2 bandwidth becomes the limit. The kernel is not short of bandwidth and not short of
+parallelism. It is reading the same rows eight times from the wrong level of the hierarchy.
+
+**This overturns the previous conclusion in this document.** The engine was described as being
+at 74% of a shared memory ceiling with nothing left in code. That number averaged a memory
+system that is nearly saturated with a kernel that is not: attention is at 49% of the card's
+own streaming rate, and it is 48% of the token. The fix is to give one block all 8 query heads
+of a KV head so each loaded K/V tile is reused eight times, which is bit-exact because each
+head's arithmetic, its softmax and its reduction order are unchanged - only which block does it
+changes. The cost is register pressure: eight heads of Q and of V accumulators is roughly 176
+registers against the 128 the kernel uses now, which would halve occupancy from 16 warps per SM
+to 8. Whether that trade wins is not something to guess at; see the next section.
+
 ### Both regimes are at about three quarters of a hardware limit, and the reasons differ
 
 Prefill at 200k is 332 s, eleven times a 512-token decode, and it had never been examined.
