@@ -38,8 +38,9 @@ options:
   --ctk TYPE          K cache type (default q8_0)
   --ctv TYPE          V cache type (default q8_0)
   --gpu-layers N      expert layers on the GPU (default: from the planner)
-  --prefer-decode     bias the planner towards generation: moves an expert layer from the CPU
-                      to the GPU, 3.3% faster decode at 200k, for 181 -> 119 t/s prefill
+  --prefer-decode     bias the planner towards generation. Measured at 200k this moves one
+                      expert layer to the GPU: decode 2.2% faster, prefill 2.8x slower
+                      (79 s -> 221 s). Almost never worth it, and the default does not
   --ubatch N          ubatch size (default: from the planner)
   --threads N         CPU threads (default 8)
   --no-prefetch       disable the page-cache prefetcher (baseline A/B)

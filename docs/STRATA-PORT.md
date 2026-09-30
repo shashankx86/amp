@@ -672,9 +672,41 @@ CPU's traffic rather than the kernel; the recurrent recurrence is free; the LM h
 above the card's rate in isolation. The one item that was both large and improvable, the
 vec attention kernel's occupancy, was taken and is worth 1% of a token.
 
-The remaining measured items are the sampler's 4.4 ms, which no instrument here could
-attribute, and 2.2% from placing a fourth expert layer on the GPU, which is a placement
-change and so is not a default under a hard no-quality-loss constraint.
+### Both regimes are at about three quarters of a hardware limit, and the reasons differ
+
+Prefill at 200k is 332 s, eleven times a 512-token decode, and it had never been examined.
+The expert work there is 2.38 TFLOP per 1280-token ubatch, all but three layers of it on the
+CPU, in 3.17 s:
+
+**753 GFLOPS, which is 74% of this CPU's AVX2 peak.** The part is a Ryzen 7 7735HS: eight
+cores, `avx avx2 f16c fma` and no `avx512` and no `amx`, so there is no wider ISA to switch
+to. Thread count does not move it either - 8 threads 423 and 417 t/s, 12 threads 408, 16
+threads 425 - because it is FP-throughput-bound and SMT shares the FP units rather than
+adding any. The DRAM side is not the constraint: prefill reads 14.6 GB per ubatch, which is
+4.6 GB/s, about a sixth of what the same memory path delivers during decode.
+
+So prefill is compute-bound on a CPU that has no spare instruction set, and the only lever
+is moving the work to the GPU. Which is a placement change, and it is ruinous:
+
+| g | prefill, 34k tokens | decode, 1024 tokens |
+|---|---|---|
+| 3 (the default) | 79.1 s, 81.1 s | 57.27 s |
+| 4 | 222.3 s, 220.6 s | 56.01 s |
+
+**One extra expert layer on the GPU makes prefill 2.8x slower and decode 2.2% faster.** The
+reason is the expert count: at batch 1 a layer reads 8 of its 256 experts, so a GPU-resident
+layer reads 294 MiB and is nearly free, while at batch 1280 it reads all 256 and the GPU does
+2 TFLOP of small per-expert GEMMs in a layer whose neighbours are waiting on the CPU. g=6
+does not fit in 5.85 GiB at any ubatch the engine will run.
+
+**This corrects the previous two sections of this document.** I had found g=4 worth 2.2% on
+decode over three clean interleaved pairs and called it "available"; it is not available, and
+the planner's prefill-heavy weighting is not conservatism, it is the measurement. It also
+means the 2.2% should not have been listed as a live item at all, and `--prefer-decode`
+trades 2.2% of decode for 2.8x of prefill, which is not a trade anyone should take.
+
+What is left is therefore only the sampler's 4.4 ms, which no instrument here could
+attribute, and which is 8% of a token.
 
 ### A bound of mine that was wrong by 15x
 

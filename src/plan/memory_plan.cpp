@@ -240,10 +240,13 @@ std::vector<CandidatePlan> MemoryPlanner::rank(const ModelGeometry & geo, const 
             // move the decision here, because the model prices g=4 at 12% decode for 34% prefill
             // and the weights are not enough to buy that.
             //
-            // Measured on this box at 200k, g=4 against g=3: decode 57.78 s -> 55.85 s per 1024
-            // tokens, 3.3% faster, and prefill 181 -> 119 t/s. So the trade is real and it is
-            // probably not worth taking; it is a flag because the right answer depends on the
-            // session, not because it is the better default.
+            // Measured on this box at 200k, g=4 against g=3: decode 57.27 s -> 56.01 s per 1024
+            // tokens, 2.2% faster, and prefill 79 s -> 221 s for 34k tokens, 2.8x slower. One
+            // expert layer on the GPU is nearly free at decode, where 8 of 256 experts are
+            // read, and ruinous at prefill, where all 256 are. So the trade is not close and
+            // the default is right; the flag exists because the right answer depends on the
+            // session, and because the cost model is what makes g=3 the default in the first
+            // place. g=6 does not fit at any ubatch this engine will run.
             if (opts.prefer_decode) {
                 c.score = std::log(std::max(0.01, c.predicted_decode_tps)) * 1000.0 +
                           std::log(std::max(0.01, c.predicted_prefill_tps));
