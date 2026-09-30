@@ -50,7 +50,10 @@ struct PlannerOptions {
     int64_t   ubatch_min     = 256;
     int64_t   ubatch_max     = 2048;
     int32_t   max_expert_layers_gpu = 8;
-    bool      prefer_decode  = false;  // tie-break towards generation
+    // Bias the plan towards generation. The weights below are prefill-heavy by default,
+    // because at 200k the prefill is minutes and losing decode speed costs every token. Set
+    // this when the session is mostly generation: it trades prefill throughput for decode.
+    bool      prefer_decode  = false;
     bool      allow_streaming = true;   // stream the non-resident tail instead of thrashing
     // fraction of the CPU expert set we insist on keeping resident (0..1]
     double    resident_fraction = 1.0;

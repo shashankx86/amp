@@ -123,6 +123,39 @@ AMP_TEST(planner_prefers_large_ubatch_over_gpu_experts) {
                   "planner neither resident nor streaming");
 }
 
+// prefer_decode used to be a documented option that nothing read. It now ranks on decode
+// alone, and on this box that is the difference between g=3 and g=4 expert layers on the GPU.
+AMP_TEST(planner_prefer_decode_moves_experts_to_the_gpu) {
+    const char * model = getenv("AMP_TEST_MODEL");
+    model = model ? model
+                  : "/home/e0u/localhost/models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf";
+    auto geo_res = ModelGeometry::build(*GGUFFile::open(model));
+    AMP_CHECK(geo_res.ok());
+    const ModelGeometry & geo = **geo_res;
+
+    const CostModel cost = CostModel::for_this_machine();
+    const DeviceBudget budget = this_box();
+
+    PlannerOptions opts;
+    auto def = MemoryPlanner::plan(geo, budget, opts, cost);
+    AMP_CHECK(def.ok());
+
+    opts.prefer_decode = true;
+    auto pref = MemoryPlanner::plan(geo, budget, opts, cost);
+    AMP_CHECK(pref.ok());
+
+    AMP_CHECK_MSG(pref->n_expert_layers_gpu >= def->n_expert_layers_gpu,
+                  format("prefer_decode put fewer expert layers on the GPU: %d vs %d",
+                         pref->n_expert_layers_gpu, def->n_expert_layers_gpu));
+    AMP_CHECK_MSG(pref->predicted_decode_tps >= def->predicted_decode_tps,
+                  format("prefer_decode predicted slower decode: %.2f vs %.2f t/s",
+                         pref->predicted_decode_tps, def->predicted_decode_tps));
+    // The trade is real and the plan must still fit, with the safety margin.
+    AMP_CHECK_MSG((uint64_t) ((double) pref->vram_total * cost.constants().vram_safety)
+                      <= budget.vram_usable(),
+                  "prefer_decode chose a plan that does not fit");
+}
+
 AMP_TEST(planner_handles_impossible_budgets) {
     const char * model = getenv("AMP_TEST_MODEL");
     model = model ? model

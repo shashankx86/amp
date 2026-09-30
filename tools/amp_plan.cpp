@@ -37,6 +37,8 @@ options:
   --vram-total B      override total VRAM (default: auto-detected)
   --vram-reserved B   override VRAM already in use (default: auto-detected)
   --no-streaming      assume everything is kept resident (no streaming tail)
+  --prefer-decode     bias the plan towards generation: at 200k this moves a layer of experts
+                      from the CPU to the GPU, 3.3% faster decode, at 181 -> 119 t/s prefill
   --resident-frac F   fraction of the CPU expert set to keep resident (0..1, default 1.0)
   --top N             number of candidates to print (default 8)
   --json              machine-readable output
@@ -97,6 +99,8 @@ int main(int argc, char ** argv) {
             budget_overridden = true;
         } else if (a == "--no-streaming") {
             opts.allow_streaming = false;
+        } else if (a == "--prefer-decode") {
+            opts.prefer_decode = true;
         } else if (a == "--resident-frac") {
             opts.resident_fraction = atof(next("--resident-frac").c_str());
         } else if (a == "--top") {

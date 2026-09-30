@@ -38,6 +38,8 @@ options:
   --ctk TYPE          K cache type (default q8_0)
   --ctv TYPE          V cache type (default q8_0)
   --gpu-layers N      expert layers on the GPU (default: from the planner)
+  --prefer-decode     bias the planner towards generation: moves an expert layer from the CPU
+                      to the GPU, 3.3% faster decode at 200k, for 181 -> 119 t/s prefill
   --ubatch N          ubatch size (default: from the planner)
   --threads N         CPU threads (default 8)
   --no-prefetch       disable the page-cache prefetcher (baseline A/B)
@@ -95,6 +97,7 @@ int main(int argc, char ** argv) {
     // for why this and plain --dump-logprobs are different measurements.
     std::string   score_file;
     std::string   emit_score;
+    bool          prefer_decode = false;
 
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -110,6 +113,7 @@ int main(int argc, char ** argv) {
         else if (a == "--ctk") cfg.cache_k = cache_type_from_string(next("--ctk"));
         else if (a == "--ctv") cfg.cache_v = cache_type_from_string(next("--ctv"));
         else if (a == "--gpu-layers") gpu_layers = atoi(next("--gpu-layers").c_str());
+        else if (a == "--prefer-decode") prefer_decode = true;
         else if (a == "--ubatch") ubatch = atoll(next("--ubatch").c_str());
         else if (a == "--threads") cfg.n_threads = atoi(next("--threads").c_str());
         else if (a == "--no-prefetch") cfg.prefetch = false;
@@ -167,6 +171,7 @@ int main(int argc, char ** argv) {
     opts.n_ctx  = cfg.n_ctx;
     opts.cache_k = cfg.cache_k;
     opts.cache_v = cfg.cache_v;
+    opts.prefer_decode = prefer_decode;
     const CostModel    cost   = CostModel::from_environment();
     const DeviceBudget budget = detect_device_budget(cost.constants());
     auto plan_res = MemoryPlanner::plan(geo, budget, opts, cost);

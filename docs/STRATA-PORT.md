@@ -515,9 +515,49 @@ the CPU input-copy phase as 9.08 ms at 3.4k and 26.54 ms at 135k. The difference
 where the wait lands: with the drain measured, the host's copy phase falls to 0.51 ms and the
 same time appears in the device column. So the 9-26 ms "copy cost" that this document has
 carried for two sessions is the host waiting for the device, and the copies themselves are
-three round trips of 73 KiB per layer boundary. The compute-stream fix from section 5, which
-cut individual read-backs from 44-162 us to 13-23 us, is worth 1.3 ms here and was correctly
-judged worthless before; that judgement stands.
+three round trips of 73 KiB per layer boundary.
+
+### Which matmuls, and the LM head
+
+Per-tensor device time, same 200-token run, the layer index and numeric suffixes collapsed so
+the stems are per-tensor-kind:
+
+| tensor | ms/token | calls/token |
+|---|---|---|
+| `node_#` (unnamed) | 9.49 | 130 |
+| **`result_output`** | **6.63** | **1** |
+| `linear_attn_out-#` | 3.53 | 30 |
+| `z-#` | 3.02 | 30 |
+| `Qcur_full-#` | 2.74 | 10 |
+| `ffn_shexp-#` | 1.05 | 40 |
+| `ffn_moe_logits-#` | 0.93 | 40 |
+| `shared_expert_gate-#` | 0.51 | 40 |
+| `ffn_moe_down-#` (MUL_MAT_ID) | 0.67 | 3 |
+
+`result_output` is the LM head and it is **one matvec costing 6.63 ms, 12% of a token.** It is
+`Q6_K` at 248320 x 2048, so 397.9 MiB read per token, which is 62.9 GB/s. The card streams at
+128-155. So the head is at about half the achievable rate and there is roughly 3.4 ms in it.
+
+Worth recording the wrong turn this took: assuming the head was f16 - which is what a
+`-logprobs-n` reading of "248320 logits" suggests - gives 970 MiB and 153 GB/s, i.e. exactly at
+the limit and nothing to win. The model is fully quantized, `file type = IQ3_XXS - 3.0625 bpw`,
+with a Q6_K output head. The whole conclusion flips on the dtype, and the dtype is in the file.
+
+The GDN projections are the other pair: `linear_attn_out` 3.53 ms and `z` 3.02 ms for 30
+layers, 103 MiB of Q3_K between them, which is 29 GB/s. Against the card that is a 4.4x gap,
+and it is the same gap as the 3.84 MiB-per-layer reading in the section above.
+
+**So the largest remaining item is not the recurrence, not the attention, and not the experts.
+It is that batch-1 quantized matmuls on this card run at 29-63 GB/s where the card does
+128-155.** MUL_MAT is 24.0 ms of a 30.0 ms device budget; at streaming rate it would be about
+10 ms, and 14 ms is 25% of a decode token.
+
+Whether that is reachable at zero quality loss is the open question, and the structure of the
+answer matters. A matvec's only order-sensitive operation is the reduction over K. Changing
+which block computes which output row does not change it and is free; splitting K across
+blocks does change it and is not. So the prize is a scheduling and occupancy change, not a
+rewriting of the reduction - the same distinction that killed the attention occupancy change
+in section 5, and it needs the same discipline to tell them apart.
 
 ### A bound of mine that was wrong by 15x
 

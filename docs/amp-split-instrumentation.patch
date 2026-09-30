@@ -1,0 +1,128 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 20bf965..7b69630 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,9 +20,64 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <atomic>
++#include <cstring>
+ #include <unordered_map>
+ #include <vector>
+ 
++// AMP_TRACE_SPLITS decomposes a decode token by scheduler split: the host time waiting for
++// the previous split, copying this split's inputs, and launching it, split further by what
++// the split contains. Without the class split every split looks alike, and the recurrent
++// layers are indistinguishable from the attention ones. See docs/STRATA-PORT.md section 6.
++enum { kAmpWait = 0, kAmpCopy = 1, kAmpLaunch = 2, kAmpGpu = 3, kAmpPhaseN = 4 };
++enum { kAmpCPU = 0, kAmpGPU = 1, kAmpBkn = 2 };
++enum { kAmpAttn = 0, kAmpExpert = 1, kAmpRecur = 2, kAmpOther = 3, kAmpClsn = 4 };
++
++static std::atomic<uint64_t> g_amp_us[kAmpBkn * kAmpClsn][kAmpPhaseN];
++static std::atomic<uint64_t> g_amp_n[kAmpBkn * kAmpClsn];
++
++static int amp_split_class(const ggml_cgraph * gf) {
++    for (int i = 0; i < gf->n_nodes; i++) {
++        switch (gf->nodes[i]->op) {
++            case GGML_OP_FLASH_ATTN_EXT:     return kAmpAttn;
++            case GGML_OP_MUL_MAT_ID:         return kAmpExpert;
++            case GGML_OP_SSM_CONV:
++            case GGML_OP_SSM_SCAN:
++            case GGML_OP_GATED_LINEAR_ATTN:  return kAmpRecur;
++            default: break;
++        }
++    }
++    return kAmpOther;
++}
++
++static void amp_split_report() {
++    static const char * bkn[2] = { "CPU", "CUDA" };
++    static const char * cln[4] = { "attention", "experts", "recurrent", "other" };
++    static const char * phn[4] = { "wait-prev", "input-copy", "launch", "gpu-drain" };
++    double total = 0.0;
++    fprintf(stderr, "[SPLITS] %-5s %-10s %4s %9s %10s %9s %9s %9s\n", "bknd", "class", "n",
++            "wait-prev", "input-copy", "launch", "gpu-drain", "total");
++    for (int b = 0; b < 2; b++) {
++        for (int c = 0; c < 4; c++) {
++            const uint64_t n = g_amp_n[b*kAmpClsn + c].load();
++            if (n == 0) continue;
++            const double t[4] = { g_amp_us[b*kAmpClsn + c][0].load()/1e3,
++                                  g_amp_us[b*kAmpClsn + c][1].load()/1e3,
++                                  g_amp_us[b*kAmpClsn + c][2].load()/1e3,
++                                  g_amp_us[b*kAmpClsn + c][3].load()/1e3 };
++            total += t[0] + t[1] + t[2];
++            fprintf(stderr, "[SPLITS] %-5s %-10s %4llu", bkn[b], cln[c], (unsigned long long) n);
++            for (int p = 0; p < 4; p++) fprintf(stderr, " %9.3f", t[p]);
++            fprintf(stderr, " %9.3f\n", t[0] + t[1] + t[2]);
++        }
++    }
++    fprintf(stderr, "[SPLITS] host time inside the split loop: %.3f ms\n", total);
++    for (int i = 0; i < kAmpBkn*kAmpClsn; i++) {
++        for (int p = 0; p < kAmpPhaseN; p++) g_amp_us[i][p] = 0;
++        g_amp_n[i] = 0;
++    }
++}
++
+ #ifdef __APPLE__
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
+@@ -1658,6 +1713,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        const bool   amp_trace = getenv("AMP_TRACE_SPLITS") != nullptr;
++        const int64_t amp_t0   = amp_trace ? ggml_time_us() : 0;
++        const int     amp_ix   = amp_trace ? (split_backend_id == 0 ? kAmpGPU : kAmpCPU)*kAmpClsn
++                                                        + amp_split_class(&split->graph) : 0;
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+@@ -1668,6 +1728,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        const int64_t amp_t1 = amp_trace ? ggml_time_us() : 0;
++
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+@@ -1796,10 +1858,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+ 
+         if (!sched->callback_eval) {
++            const int64_t amp_t2 = amp_trace ? ggml_time_us() : 0;
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
++            if (amp_trace) {
++                g_amp_us[amp_ix][kAmpWait]   += (uint64_t) (amp_t1 - amp_t0);
++                g_amp_us[amp_ix][kAmpCopy]   += (uint64_t) (amp_t2 - amp_t1);
++                g_amp_us[amp_ix][kAmpLaunch] += (uint64_t) (ggml_time_us() - amp_t2);
++                g_amp_n[amp_ix] += 1;
++                if (getenv("AMP_TRACE_GPU") && split_backend_id == 0) {
++                    // Synchronising here serialises the pipeline further than the scheduler
++                    // already does, so the token gets slower. It is the only way to see how
++                    // much device time the split actually enqueued, and the CPU split that
++                    // follows blocks on exactly this work.
++                    const int64_t t3 = ggml_time_us();
++                    ggml_backend_synchronize(split_backend);
++                    g_amp_us[amp_ix][kAmpGpu] += (uint64_t) (ggml_time_us() - t3);
++                }
++            }
+         } else {
+             // similar to ggml_backend_compare_graph_backend
+             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+@@ -1842,6 +1920,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         prev_backend_id = split_backend_id;
+     }
+ 
++    if (getenv("AMP_TRACE_SPLITS")) {
++        amp_split_report();
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 

@@ -234,8 +234,23 @@ std::vector<CandidatePlan> MemoryPlanner::rank(const ModelGeometry & geo, const 
             c.cpu_expert_bytes_planned = cpu_experts;
             c.cache_needed             = cpu_experts;
 
-            c.score = cc.weight_prefill * std::log(std::max(0.01, c.predicted_prefill_tps)) +
-                      cc.weight_decode * std::log(std::max(0.01, c.predicted_decode_tps));
+            // The weights decide prefill against decode, and at 200k the prefill is minutes, so
+            // the default favours it. prefer_decode ranks on decode alone and uses prefill as
+            // the tie-break, which is what the name says; merely swapping the weights does not
+            // move the decision here, because the model prices g=4 at 12% decode for 34% prefill
+            // and the weights are not enough to buy that.
+            //
+            // Measured on this box at 200k, g=4 against g=3: decode 57.78 s -> 55.85 s per 1024
+            // tokens, 3.3% faster, and prefill 181 -> 119 t/s. So the trade is real and it is
+            // probably not worth taking; it is a flag because the right answer depends on the
+            // session, not because it is the better default.
+            if (opts.prefer_decode) {
+                c.score = std::log(std::max(0.01, c.predicted_decode_tps)) * 1000.0 +
+                          std::log(std::max(0.01, c.predicted_prefill_tps));
+            } else {
+                c.score = cc.weight_prefill * std::log(std::max(0.01, c.predicted_prefill_tps)) +
+                          cc.weight_decode  * std::log(std::max(0.01, c.predicted_decode_tps));
+            }
             cands.push_back(c);
         }
     }
