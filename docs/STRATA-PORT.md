@@ -4,8 +4,8 @@ Starting point: the note in `AGENT.md` that M7 is spent and "there is no gap lef
 on the CPU side". That is correct, and it is also the reason the project stalled. The
 optimization target was never the CPU. These are the measurements that moved it.
 
-**This is a chronological log and it is wrong in three places, all corrected later and all
-marked at the point of the error.** The two that matter: the sampler's 4.4 ms was never the
+**This is a chronological log and it is wrong in three places, each marked at the point of
+the error.** The two that matter: the sampler's 4.4 ms was never the
 sampler (see "The sampler's 4.4 ms was the device finishing the token"), and the decode
 attention kernel is not at half of memory bandwidth (see "The attention kernel, and a wrong
 conclusion I drew from its own output"). Read the corrections, not the claims they correct.
@@ -489,7 +489,7 @@ The map is now, for a 135k token of 55.5 ms:
 |---|---|---|
 | attention, from the sweep slope | 18.3 | 33%, at 80 GB/s in situ |
 | expert matvec, from perf | 14.6 | 26%, at 27.96 GB/s, already at bandwidth |
-| sampler's unexplained portion | ~4.4 | 8% |
+| sampler's unexplained portion (superseded: the post-decode device drain) | ~4.4 | 8% |
 | the rest of `llama_decode` | ~18 | 32%, GDN, projections, norms, copies, launches, graph |
 
 The two byte-movers are both at or near their hardware limits. The only item that is not
