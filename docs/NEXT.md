@@ -78,34 +78,59 @@ The device is busy 30.0 of 55.5 ms, so it is idle 46% of the token. The CPU's 16
 expert matvec is exactly that idle window. They cannot be overlapped - layer N+1's input is
 layer N's post-MoE output - which is also why the `hit_hook` seam has nothing to reclaim.
 
-## The next piece of work
+## Where this engine actually stands
 
-**Batch-1 quantized matmuls run at 29-63 GB/s on a card that streams at 128-155.** MUL_MAT
-is 24.0 ms of the 30.0 ms device budget, 341 nodes per token, and at streaming rate it would
-be about 10 ms. 14 ms is 25% of a decode token.
+Per decode token at 200k, from the per-split, per-op and per-tensor measurements:
 
-The two largest single nodes:
+| | bytes/token | device | rate |
+|---|---|---|---|
+| attention KV, q8_0, 10 layers | 2.176 GB | GPU | 80 GB/s |
+| the LM head, q6_K | 398 MB | GPU | 62.9 GB/s in situ |
+| expert weights, 8 of 256 per layer | 413 MB | CPU | 27.96 GB/s |
+| recurrent projections | 103 MB | GPU | 29 GB/s |
+| GPU total | 2.68 GB in 30.0 ms | | 89 GB/s |
+| CPU total | 0.41 GB in 16.3 ms | | 25.3 GB/s |
 
-| node | ms/token | dtype | bytes/token | GB/s |
-|---|---|---|---|---|
-| `result_output` (the LM head) | 6.63 | Q6_K 248320x2048 | 397.9 MiB | 62.9 |
-| `linear_attn_out` + `z` (30 layers) | 6.55 | Q3_K | 103 MiB | 29 |
+**114 GB/s of a ~155 GB/s ceiling, 74% of it, with both processors on one memory path.**
 
-The order-sensitive part of a matvec is only the reduction over K. Moving rows between
-blocks does not change it and is free; splitting K across blocks does change it and is not.
-So the prize is a scheduling and occupancy change, and it has to be separated the same way
-the attention occupancy change was - by pinning the order-dependent part and measuring the
-rest.
+The MUL_MAT item that was the largest live candidate is **closed, and it is not a kernel
+problem.** `tools/matvec_bench.cpp` measures the op in isolation for the model's real
+shapes and dtypes:
 
-Second: the sampler's unexplained 4.4 ms. Its own work is 0.08 ms; the OpenMP explanation is
-tested and refuted; `perf` shows no sampler symbol at all, so it is most likely blocked in
-`ctx->synchronize()`, which `perf`'s cycle event does not sample. Settling it needs `perf -g`
-with `-fno-omit-frame-pointer`, since without frame pointers the call graph was unusable.
+| tensor | ms | GB/s |
+|---|---|---|
+| `output.weight` (the LM head) | 2.24 | 178 |
+| `blk.0.ssm_out.weight` | 0.028 | 123 |
+| `blk.0.ffn_gate_shexp.weight` | 0.007 | 143 |
 
-Third: the 2.2% available from `g=4` at ubatch 1280, measured over three clean interleaved
-pairs (57.27 s -> 56.01 s). **It is a placement change, so it must not become the default
-under a hard no-quality-loss constraint** - `--gpu-layers 4` already exposes it. The planner
-rejects that combination on a VRAM model that over-predicts; the runtime runs it fine.
+At or above the card's rate. And the vec matvec's `__launch_bounds__(..., 1)`, the same lever
+that was worth 1.22x on the attention kernel and is provably bit-exact here, was swept at
+1/2/4/8/16 and changed nothing - because a matvec launches one block per output row, so the
+grid is 512 to 248320 blocks and the GPU is already saturated. Occupancy is the lever only
+when the grid is small.
+
+What is left of the 2.24 ms isolated against 6.63 ms in situ is contention, and it measures
+directly: the same benchmark with 8 CPU threads streaming RAM at the rate the expert matvec
+uses drops the head 10% and `ssm_out` 39%.
+
+So the remaining items are small and the binding constraint is the 6 GB VRAM / 16 GB RAM
+envelope itself:
+
+1. **The sampler's unexplained 4.4 ms.** Its own work is 0.08 ms; the OpenMP explanation is
+   tested and refuted; `perf` shows no sampler symbol, so it is most likely blocked in
+   `ctx::synchronize()`, which `perf`'s cycle event does not sample. Settling it needs
+   `perf -g` with `-fno-omit-frame-pointer`.
+2. **2.2% from `g=4` at ubatch 1280**, measured over three clean interleaved pairs
+   (57.27 s -> 56.01 s). A placement change, so not a default under a hard no-quality-loss
+   constraint; `--gpu-layers 4` exposes it. The planner rejects it on a VRAM model that
+   over-predicts, and the runtime runs it fine.
+3. **The planner's VRAM model**, which is ~0.7 GiB pessimistic and so rules out a
+   configuration that demonstrably fits and is 2.2% faster. Worth correcting if the g=2
+   direction is ever taken.
+
+None of these is a kernel to write. If the goal is a materially faster engine, the levers
+are a bigger card (more experts in VRAM, which also stops the CPU stealing the GPU's
+bandwidth) or smaller expert weights, and the second is excluded by the quality constraint.
 
 ## Strata
 
