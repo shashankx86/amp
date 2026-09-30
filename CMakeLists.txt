@@ -182,6 +182,12 @@ if(AMP_BUILD_TOOLS)
   # budget: a measurement tool, not part of the serving path. Prints an upper bound on what
   # each remaining candidate could win, so the next one is picked by the size of its prize
   # rather than by how plausible it sounds.
+  # matvec-bench: a measurement tool, not part of the serving path. Times one batch-1
+  # quantized matvec for the shapes this model uses, against a measured streaming baseline.
+  add_executable(amp-matvec-bench tools/matvec_bench.cpp)
+  target_link_libraries(amp-matvec-bench PRIVATE amp_model amp_io amp_util llama ggml ggml-cuda)
+  target_compile_options(amp-matvec-bench PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
   add_executable(amp-budget tools/budget.cpp)
   target_link_libraries(amp-budget PRIVATE amp_model amp_io amp_util llama ggml ggml-cuda)
   target_compile_options(amp-budget PRIVATE -Wall -Wextra -Wno-unused-parameter)

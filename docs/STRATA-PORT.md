@@ -585,6 +585,68 @@ blocks does change it and is not. So the prize is a scheduling and occupancy cha
 rewriting of the reduction - the same distinction that killed the attention occupancy change
 in section 5, and it needs the same discipline to tell them apart.
 
+### Closing the MUL_MAT item: it is the memory system, not the kernel
+
+`tools/matvec_bench.cpp` times one batch-1 quantized matvec for the shapes this model uses,
+dtypes read from the file, against a streaming baseline measured alongside. In isolation:
+
+| tensor | type | K | N | ms | GB/s | % of stream |
+|---|---|---|---|---|---|---|
+| `output.weight` (the LM head) | q6_K | 2048 | 248320 | 2.24 | 178 | above |
+| `blk.0.ssm_out.weight` | q3_K | 4096 | 2048 | 0.028 | 123 | near |
+| `blk.0.ffn_gate_shexp.weight` | q5_K | 2048 | 512 | 0.007 | 143 | near |
+
+**In isolation these are at or above the card's streaming rate.** The LM head reads 397.9 MiB
+in 2.24 ms, which is above the 155 GB/s a plain copy achieves, because part of the weight
+fits in L2. So there is no kernel problem here at all, and the two largest single nodes in
+the token are not improvable by making the matvec faster.
+
+The obvious lever was the same one that worked on the attention kernel: the vec matvec is
+declared `__launch_bounds__(nwarps*warp_size, 1)`, so 1 is also a *minimum resident blocks per
+SM* hint and the compiler is free to use enough registers to make few blocks fit. Unlike the
+attention kernel this is provably bit-exact to change - `calc_nwarps` and
+`calc_rows_per_block` are compile-time functions of the type and column count alone, so
+neither the grid nor the order of the reduction over K depends on it - so it was worth
+sweeping. Swept 1, 2, 4, 8, 16, three warm repeats each:
+
+| min blocks/SM | LM head | `ssm_out` | `ffn_gate_shexp` |
+|---|---|---|---|
+| 1 (stock) | 2.240, 2.240 | 0.028, 0.028 | 0.007, 0.007 |
+| 2 | 2.243, 2.240 | 0.029, 0.028 | 0.007, 0.007 |
+| 4 | 2.241, 2.242 | 0.028, 0.029 | 0.007, 0.007 |
+| 8 | 2.243, 2.242 | 0.028, 0.028 | 0.007, 0.007 |
+| 16 | 2.243, 2.244 | 0.029, 0.029 | 0.007, 0.007 |
+
+Nothing. The reason is visible in the shape: a matvec launches one block per output row, so
+`N` is 512 to 248320 blocks. The GPU is saturated with work and does not need more resident
+warps. Occupancy was the lever on the attention kernel only because that grid was 9 to 16
+tiles times the split fan-out, which is small. **Occupancy is the lever when the grid is
+small; these matvecs have an enormous grid and are already at the memory system.**
+
+So the 2.24 ms isolated against 6.63 ms in situ is not the kernel. It is contention, and it
+is measurable directly: run the same benchmark while 8 CPU threads stream RAM at the rate the
+expert matvec uses.
+
+| | LM head | `ssm_out` |
+|---|---|---|
+| alone | 131.4 GB/s | 81.9 GB/s |
+| with 8 threads streaming RAM | 118.4 GB/s | **50.1 GB/s** |
+
+The big matvec loses 10%, the small one 39%. The small latency-bound ones suffer most,
+because they depend on many requests in flight and the memory system is now shared with a
+second consumer.
+
+**That reframes the whole engine, and it is a hardware-envelope result rather than a code
+one.** The card streams at ~155 GB/s with the CPU idle. During decode the CPU is reading
+413 MiB of experts per token at ~28 GB/s out of the same memory path. The device is
+therefore not "idle 46% of the token" in any useful sense - during that window the memory
+system is being used by the other processor. The engine's target envelope is 6 GB of VRAM
+and 16 GB of RAM, and it is exactly that envelope that forces 37 of 40 expert layers onto the
+CPU, whose traffic then slows the GPU's.
+
+The two ways out are both outside this engine. Put more experts in VRAM, which needs a
+bigger card. Or shrink the expert weights, which is a quantization change and is excluded.
+
 ### A bound of mine that was wrong by 15x
 
 `tools/gdn_bench.cpp` sized the recurrent layers by their SSM **state**: 2 MiB per layer,
