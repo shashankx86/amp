@@ -113,24 +113,49 @@ What is left of the 2.24 ms isolated against 6.63 ms in situ is contention, and 
 directly: the same benchmark with 8 CPU threads streaming RAM at the rate the expert matvec
 uses drops the head 10% and `ssm_out` 39%.
 
-So the remaining items are small and the binding constraint is the 6 GB VRAM / 16 GB RAM
-envelope itself:
+Prefill was the other half of the engine and had never been examined. It is 332 s at 200k,
+eleven times a 512-token decode. Its expert work is 2.38 TFLOP per 1280-token ubatch, 37 of
+40 layers on the CPU, in 3.17 s - **753 GFLOPS, 74% of this CPU's AVX2 peak.** The part is a
+Ryzen 7 7735HS with `avx avx2 f16c fma` and no `avx512` and no `amx`, so there is no wider
+ISA, and thread count does not help (8 threads 423/417 t/s, 12 threads 408, 16 threads
+425) because it is FP-throughput-bound and SMT shares the FP units. DRAM is not the
+constraint: prefill reads 14.6 GB per ubatch, 4.6 GB/s, a sixth of what the same path
+delivers during decode.
 
-1. **The sampler's unexplained 4.4 ms.** Its own work is 0.08 ms; the OpenMP explanation is
-   tested and refuted; `perf` shows no sampler symbol, so it is most likely blocked in
-   `ctx::synchronize()`, which `perf`'s cycle event does not sample. Settling it needs
-   `perf -g` with `-fno-omit-frame-pointer`.
-2. **2.2% from `g=4` at ubatch 1280**, measured over three clean interleaved pairs
-   (57.27 s -> 56.01 s). A placement change, so not a default under a hard no-quality-loss
-   constraint; `--gpu-layers 4` exposes it. The planner rejects it on a VRAM model that
-   over-predicts, and the runtime runs it fine.
-3. **The planner's VRAM model**, which is ~0.7 GiB pessimistic and so rules out a
-   configuration that demonstrably fits and is 2.2% faster. Worth correcting if the g=2
-   direction is ever taken.
+**So both regimes sit at about three quarters of a hardware limit, for different reasons:**
+decode on a shared memory path at 74%, prefill on CPU FP throughput at 74%.
 
-None of these is a kernel to write. If the goal is a materially faster engine, the levers
-are a bigger card (more experts in VRAM, which also stops the CPU stealing the GPU's
-bandwidth) or smaller expert weights, and the second is excluded by the quality constraint.
+## The g=4 question, settled
+
+Three clean interleaved pairs said g=4 was 2.2% better on decode at an identical ubatch, and
+I recorded it as available. It is not, because I had only measured decode:
+
+| g | prefill, 34k tokens | decode, 1024 tokens |
+|---|---|---|
+| 3 (the default) | 79.1 s, 81.1 s | 57.27 s |
+| 4 | 222.3 s, 220.6 s | 56.01 s |
+
+**One extra expert layer on the GPU makes prefill 2.8x slower for 2.2% of decode.** At batch 1
+a layer reads 8 of its 256 experts, so a GPU-resident layer reads 294 MiB and is nearly
+free; at batch 1280 it reads all 256, and the GPU does 2 TFLOP of small per-expert GEMMs in a
+layer whose neighbours are waiting on the CPU. g=6 fits at no ubatch the engine runs.
+
+The planner's prefill-heavy weighting is the measurement, not conservatism. `--prefer-decode`
+is kept because the documented option was dead, but it trades 2.2% of decode for 2.8x of
+prefill and its help now says so in measured numbers rather than the cost model's, which was
+wrong by 2.8x on this axis.
+
+## What is left
+
+**The sampler's unexplained 4.4 ms**, which is 8% of a token and the only item that is both
+unexplained and unattributed. Its own work is 0.08 ms; the OpenMP explanation is tested and
+refuted; `perf` shows no sampler symbol at all, so it is most likely blocked in
+`ctx::synchronize()`, which `perf`'s cycle event does not sample. Settling it needs `perf -g`
+with `-fno-omit-frame-pointer`, since without frame pointers the call graph was unusable.
+
+Nothing else is live. If the goal is a materially faster engine, the levers are a bigger
+card - more experts in VRAM, which also stops the CPU stealing the GPU's bandwidth - or
+smaller expert weights, and the second is excluded by the quality constraint.
 
 ## Strata
 
