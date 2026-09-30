@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7..a7a9b48 100644
+index 8bb0ff7..7984e02 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -1662,6 +1662,130 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1662,6 +1662,135 @@ static void ggml_compute_forward_mul_mat_id(
          }
      }
  
@@ -55,8 +55,13 @@ index 8bb0ff7..a7a9b48 100644
 +            const char * const wdata_src0 = (const char *) src0->data;
 +
 +            const int64_t expert_bytes = ne01*nb01;
-+            const int64_t want = (int64_t) m3c_kib*1024;
-+            const int64_t span = want < expert_bytes ? want : expert_bytes;
++            // The depth is signed: negative selects the predictive path. Take its magnitude
++            // here, because a signed span is negative and the prefetch loops below never run.
++            const int64_t want  = (int64_t) m3c_kib*1024;
++            const int64_t depth = want < 0 ? -want : want;
++            const int64_t span  = depth < expert_bytes ? depth : expert_bytes;
++            // The expert stream already runs at this box's measured DRAM read ceiling (27.96 of
++            // 28 GB/s), so the bus is full and a prefetch has nothing to hide behind. Off by default.
 +
 +            // Positive depth: prefetch the experts this token just selected. The
 +            // hint is issued in the same node that consumes it, so there is

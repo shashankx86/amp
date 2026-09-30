@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 57a2855..4decc43 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -16,8 +16,20 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wpass-failed"
+ #endif // __clang__
++// The second launch_bounds argument is the minimum resident blocks per SM. It is 4 rather
++// than 1 because the inner loop is a chain of dependent global loads, and 1 leaves only
++// 4 warps per SM to hide them.
++//
++// This number is also read back by cudaOccupancyMaxActiveBlocksPerMultiprocessor in
++// launch_fattn, which seeds the split-K fan-out, and the fan-out fixes the order the
++// softmax is summed in. The two therefore must not be changed independently. Measured on
++// this box (20 SMs, 16 Q heads, D=256, q8_0): the wave-efficiency search settles the fan-out
++// at 5 because 16 heads * 5 splits == 20 SMs * 4 blocks exactly, so raising the bound to 4
++// is bit-exact here, and a sweep of 2/3/4/6/8/12 confirms 4 is also the fastest (82.5 GB/s,
++// against 67/57/55/76/56). The equality is a coincidence of this geometry, not a property of
++// the search, so on any other shape the bound and the fan-out have to be re-checked together.
+ template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
++__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 4)
+ static __global__ void flash_attn_ext_vec(
+         const char * Q_ptr,
+         const char * K_ptr,

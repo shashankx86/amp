@@ -41,25 +41,11 @@ while read -r name url sha; do
   fetch_repo "$name" "$url" "$sha" "third_party/$name"
 done < "$LOCK"
 
-# Local patches, applied after the pin is checked out. third_party/llama.cpp is gitignored, so an
-# edit made directly in that tree is not version controlled and disappears on a re-fetch. Anything
-# amp needs in llama.cpp therefore lives here as a patch and is applied on every fetch.
-#
+# Local patches, applied after the pin is checked out. See scripts/apply_vendor_patches.sh for
+# why they are patches rather than edits, and why the CMake configure step calls the same script.
 # Every patch must be inert unless explicitly enabled, so a stock fetch reproduces the measured
 # baseline exactly. m3c-expert-prefetch.patch is the MoE expert prefetch: it reads an env var that
 # is unset by default, so the default build behaves exactly as upstream does.
-for p in "$PWD"/third_party/patches/*.patch; do
-  [ -e "$p" ] || continue
-  pname=$(basename "$p" .patch)
-  if git -C third_party/llama.cpp apply --reverse --check "$p" 2>/dev/null; then
-    echo "fetch_deps: patch $pname already applied"
-  elif git -C third_party/llama.cpp apply --check "$p" 2>/dev/null; then
-    git -C third_party/llama.cpp apply "$p"
-    echo "fetch_deps: applied patch $pname"
-  else
-    echo "fetch_deps: patch $pname does not apply to the pinned tree; refusing to continue" >&2
-    exit 1
-  fi
-done
+./scripts/apply_vendor_patches.sh
 
 echo "fetch_deps: ok"

@@ -22,6 +22,23 @@ if(NOT EXISTS "${AMP_VENDOR_DIR}/CMakeLists.txt")
     "      run:  scripts/fetch_deps.sh")
 endif()
 
+# third_party/llama.cpp is gitignored, so every change amp needs in it is a patch under
+# third_party/patches rather than an edit that a re-fetch would silently discard. Applying them
+# here as well as in fetch_deps.sh means a plain `cmake -S . -B build` cannot build a tree that
+# is missing them, which would otherwise build cleanly and then be numerically different.
+execute_process(
+  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/scripts/apply_vendor_patches.sh"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  RESULT_VARIABLE AMP_PATCH_RC
+  OUTPUT_VARIABLE AMP_PATCH_OUT
+  ERROR_VARIABLE  AMP_PATCH_ERR)
+if(NOT AMP_PATCH_RC EQUAL 0)
+  message(FATAL_ERROR
+    "amp: applying third_party/patches failed (${AMP_PATCH_RC})\n${AMP_PATCH_OUT}${AMP_PATCH_ERR}")
+endif()
+string(STRIP "${AMP_PATCH_OUT}" AMP_PATCH_OUT)
+message(STATUS "amp: vendor patches\n${AMP_PATCH_OUT}")
+
 option(AMP_WITH_CUDA "build amp with CUDA support" ON)
 option(AMP_BUILD_TOOLS "build amp command line tools" ON)
 option(AMP_BUILD_TESTS "build amp tests" ON)

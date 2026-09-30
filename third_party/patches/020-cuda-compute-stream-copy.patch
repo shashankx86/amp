@@ -1,0 +1,82 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 36c6a93..8ff9f78 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2,6 +2,8 @@
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
++
++
+ #include "ggml-cuda/allreduce.cuh"
+ #include "ggml-cuda/common.cuh"
+ #include "ggml-cuda/acc.cuh"
+@@ -92,6 +94,7 @@
+ #include <string>
+ #include <vector>
+ 
++
+ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+ 
+ #define GGML_LOG_WARN_ONCE(str) \
+@@ -724,10 +727,20 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+ 
+ // cuda buffer
+ 
++ggml_backend_t ggml_backend_cuda_init(int device);
++
+ struct ggml_backend_cuda_buffer_context {
+     int device;
+     void * dev_ptr = nullptr;
+     std::string name;
++    // The backend's compute stream, captured at buffer creation.
++    //
++    // ggml_backend_tensor_get/set reach the device through the *buffer* interface, which has
++    // no handle on the stream the work was enqueued on, so they used cudaStreamPerThread and
++    // then synchronised that. The two streams are not ordered against each other, so the
++    // synchronise did not mean "the data is ready". Putting the copy on the compute stream
++    // makes it ordered after the kernels that produced the tensor.
++    cudaStream_t stream = nullptr;
+ 
+     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
+         device(device), dev_ptr(dev_ptr),
+@@ -786,16 +799,18 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    const cudaStream_t stream = ctx->stream ? ctx->stream : cudaStreamPerThread;
++    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+     ggml_cuda_set_device(ctx->device);
+-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++    const cudaStream_t stream = ctx->stream ? ctx->stream : cudaStreamPerThread;
++    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
+@@ -896,6 +911,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+     }
+ 
+     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
++    // Tie the buffer to the backend's compute stream. See ggml_backend_cuda_buffer_context::stream.
++    {
++        ggml_backend_t backend = ggml_backend_cuda_init(buft_ctx->device);
++        if (backend == nullptr) {
++            delete ctx;
++            CUDA_CHECK(cudaFree(dev_ptr));
++            return nullptr;
++        }
++        ctx->stream = ((ggml_backend_cuda_context *) backend->context)->stream();
++    }
+ 
+     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+ }
