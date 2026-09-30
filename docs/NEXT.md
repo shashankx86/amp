@@ -1,184 +1,153 @@
-# Where the work is, 2026-09-30 (end of session)
+# Where the work is, 2026-09-30
 
 `docs/STRATA-PORT.md` has the measurements and the reasoning. This is the state of the
-tree and what is left.
+tree, what shipped, and what is left.
 
 ## State
 
-One change is live in the vendored tree and is **not committed** -
-`third_party/llama.cpp/ggml/src/ggml-cuda/fattn-vec.cuh`, the vec attention kernel's
-`__launch_bounds__(nthreads, 1)` -> `, 4`. It is 12 lines including the comment, it is
-bit-exact at 200k with the shipped dtypes, and it is worth 1% of a decode token. It is left
-uncommitted because `third_party/llama.cpp/AGENTS.md` says not to commit without explicit
-approval, and that instruction was not given for this tree.
+The vendored `third_party/llama.cpp` carries **two uncommitted changes**:
 
-Everything else in `amp/` is committed. `amp_tests` passes.
+| file | change | why |
+|---|---|---|
+| `ggml-cuda/fattn-vec.cuh` | `__launch_bounds__(nthreads, 1)` -> `, 4` | 1.22x on the attention kernel, bit-exact at 200k, worth 1% of a token |
+| `ggml-cuda/ggml-cuda.cu` | buffer get/set copy on the compute stream | correctness: they copied on `cudaStreamPerThread` and synchronised that, which is not ordered against the stream the data was produced on. Measured 0.8% the wrong way over 3 interleaved pairs, so it is not a speed change |
+
+They are uncommitted because `third_party/llama.cpp/AGENTS.md` says not to commit without
+explicit approval and that was not given for this tree. There is also a pre-existing
+`ggml-cpu.c` patch that predates this work.
+
+Everything in `amp/` is committed. `amp_tests` passes. Shipped configuration: `q8_0`/`q8_0`
+KV, `g=3` expert layers, `ubatch 1280`, 8 threads, 18.0 t/s decode and 407 t/s prefill at
+134k context on this box.
+
+The two measurement instruments from this session are saved as
+`docs/amp-split-instrumentation.patch` (per-split host phases, and per-op device time with
+`AMP_NO_CUDA_GRAPH=1`) and removed from the vendored tree. Re-apply to reproduce sections 6
+and 7 of `STRATA-PORT.md`.
 
 ## Bugs found and fixed
 
-0. **`--seed` did not exist.** `RuntimeConfig` has had a `seed` field since the file was
-   created and nothing set it, so it stayed at `LLAMA_DEFAULT_SEED`, which
-   `llama_sampler_init_dist` resolves from the system clock. With the shipped default config
-   - temp 0.6, top_p 0.95, top_k 20 - every run of the same build on the same input
-   produced different text. Nothing was reproducible and nothing about the sampling path
-   could be compared; the quality gate only works because it pins `--temp 0`, which is not
-   what ships. Two runs with `--seed 1234` are now byte-identical.
-0b. **Every token was accepted twice.** `llama_sampler_sample` calls
-   `llama_sampler_accept` before returning and `generate()` called it again. `score()` needs
-   its own, because it never calls `llama_sampler_sample`, so the two are now asymmetric on
-   purpose. Harmless today - every accept in this chain is a no-op - and verified
-   bit-identical under the shipped sampling config with a fixed seed.
-1. **`--score-file` did not read back what `--emit-score` wrote.** The fixture is a list of
-   token ids; the reader tokenised it as text, so newlines became tokens and byte-level
-   tokens did not survive. Two runs of the *same binary* disagreed on 127 of 128 positions.
-   The whole quality gate depended on this and nothing in it would have said so.
-2. **The top-k logprob tracking ran on the hot path by default.** It builds and
-   partial-sorts the whole 248,320-entry vocab every token to produce a report nobody
-   asked for. Measured at 0.16 ms, so 0.3% of a token, but it is pure overhead and
-   `--logprobs-n` turns it on when comparing engines. `--logprobs-n 0` now actually
-   disables it: the old guard was `if (cfg.top_k_track > 0) assign`, so a 0 fell through and
-   left the runtime at its own default.
-3. **The engine ran `q8_0`/`q4_0` KV, not the `q8_0`/`q8_0` it documents.**
-   `RuntimeConfig::cache_v` was the only declaration in the tree that said `kQ4_0`;
-   `PlannerOptions`, `PreflightOptions`, a test and `AGENT.md` all said `kQ8_0`. The
-   requirement is q8_0/q8_0, and it was being violated silently. Cost of the fix, as
+0. **`--seed` did not exist.** `RuntimeConfig` had the field from the start and nothing set
+   it, so it stayed at `LLAMA_DEFAULT_SEED`, which `llama_sampler_init_dist` resolves from
+   the system clock. With the shipped default sampler every run produced different text. Two
+   runs with `--seed 1234` are now byte-identical.
+0b. **Every token was accepted twice.** `llama_sampler_sample` accepts before returning and
+   `generate()` accepted again. `score()` legitimately needs its own. Harmless today (every
+   accept in this chain is a no-op), verified bit-identical with a fixed seed.
+1. **`--score-file` did not read back what `--emit-score` wrote.** The fixture is token ids;
+   the reader tokenised it as text, so the newlines became tokens. Two runs of the same
+   binary disagreed on 127 of 128 positions. The whole quality gate depended on this.
+2. **The top-k logprob tracking ran on the hot path by default**, sorting the whole
+   248,320-entry vocab every token for a report nobody asked for. Now off by default, and
+   `--logprobs-n 0` actually disables it (the old guard let a 0 fall through).
+3. **The engine ran `q8_0`/`q4_0` KV, not the `q8_0`/`q8_0` it documents.** Every other
+   declaration in the tree said `kQ8_0`; this one said `kQ4_0`. Cost of the fix, as
    `AGENT.md` predicted: KV grows 1.55 -> 2.03 GiB at 200k and ubatch drops 2048 -> 1280.
-3. **Three `amp-infer --help` lines that did not match the code**, including two
-   (`--logprobs-n` default, `--dump-logprobs` format) that the quality gate depends on
-   reading correctly.
+4. **`prefer_decode` was a documented option that nothing read** and had no flag. It now
+   ranks on decode alone, with a test. It does not help - see below.
+5. **Four `amp-infer --help` lines** that did not match the code, two of which the quality
+   gate depends on reading correctly.
 
-## The result, and the lesson attached to it
+## Three of my own conclusions this session were wrong, and the corrections
 
-`__launch_bounds__(128, 1)` gives 4 warps per SM. Raising it to 4 is 1.22x on the attention
-kernel and **bit-exact at 200k** - verified teacher-forced, 128 positions, 32 logprobs each,
-with a stock-vs-stock control that also passed.
+- **The GDN bound was wrong by 15x.** `tools/gdn_bench` sized the SSM *state* (2 MiB/layer),
+  put the recurrent layers at 0.8 ms, and `fused_gdn` was retired on that number. They take
+  **11.9 ms**. The whole layer's weights are 3.84 MiB and the layers run at 9.3 GB/s against
+  a card that streams at 128.
+- **Then the recurrence turned out not to be the cost either.** Per-op device time shows
+  `SSM_CONV` and `SSM_SCAN` do not appear in the list at all, under 0.01 ms per token. The
+  11.9 ms is 341 plain matvecs.
+- **The 9-26 ms "input copy" cost was never copies.** With the device drain measured
+  separately, the host's copy phase is 0.51-0.56 ms and the same time appears on the device.
+  That figure has been carried in this document for two sessions.
 
-It was rejected the first time, correctly reasoned and wrongly tested: the gate ran on a
-1k-token prompt, which is the one context where the occupancy seed binds the split-K fan-out.
-From about 1k tokens of KV upward the fan-out is 5 either way. Isolation test: pin the
-fan-out in both builds and the launch bound alone is bit-identical.
+## Where a token goes, measured
 
-**It is worth 1% of a decode token, not the 10% the isolated benchmark predicts.** Two
-interleaved rounds, 2048 tokens, 113 s decode window: 113.44/113.51 s stock, 112.49/112.11 s
-patched. Within-arm spread 0.06%, so the method is precise.
+At 135k context, 55.5 ms:
 
-`tools/fa_bench` is the wrong tool for predicting tokens. It gives K and V as two separate
-contiguous 218 MB buffers; in situ the KV cache is one 2.03 GiB buffer holding all ten
-layers together. It remains the right tool for comparing kernels against each other.
-
-## What this invalidates in the earlier analysis
-
-Every bound derived from a single isolated kernel is suspect by about the same factor. The
-largest one on the list - attention at 19% of a token - was wrong. The two below it were
-checked end to end and held: the expert matvec at 27.96 GB/s (12.9 ms, confirmed in the
-scheduler) and the GDN state floor at 0.8 ms.
-
-Also note: at 200k, **f16 KV is faster than q8_0 KV** (17.9 vs 16.1 t/s) despite 2.46x the
-bytes, so the q8_0 path is dequantisation-bound rather than bandwidth-bound. That is a
-finding about the constraint, not an argument against it.
-
-## Where a token goes, measured 2026-09-30
-
-This was the open question at the end of the last session, and it is now answered.
-`docs/STRATA-PORT.md` section 6 has the numbers. For a 135k token of 55.5 ms:
-
-| | ms | share | at hardware limit? |
+| | ms | share | measured by |
 |---|---|---|---|
-| attention | 18.3 | 33% | 80 GB/s in situ, yes |
-| expert matvec | 14.6 | 26% | 27.96 GB/s, yes |
-| sampler, unexplained portion | ~4.4 | 8% | unknown, this is the lead |
-| the rest of `llama_decode` | ~18 | 32% | not decomposed |
+| attention | 18.9 | 34% | device drain, and an independent context sweep at 18.3 |
+| recurrent layers | 11.9 | 21% | device drain |
+| expert matvec | 16.3 | 29% | host launch phase, and `perf` |
+| copies at layer boundaries | 0.6 | 1% | host copy phase |
+| sampler, unexplained | ~4.4 | 8% | see below |
+| outside the split loop | ~2.6 | 5% | not decomposed |
 
-Tools: `AMP_TRACE_DECODE=1` times the four phases of amp's own decode loop. A context sweep
-(no instrumentation, 1024 generated tokens per point) gives the KV slope and therefore the
-attention share exactly. `perf record` over a 2048-token decode gives the cycle split.
-
-Both byte-movers are at their hardware limits, so neither is a target. 8 threads is
-optimal and scaling is memory-bound, confirmed by a four-point thread sweep. The OpenMP
-spin is worth 12% end to end (`OMP_WAIT_POLICY=passive` costs 56.6 s -> 63.6 s), so the
-default is right.
+The device is busy 30.0 of 55.5 ms, so it is idle 46% of the token. The CPU's 16.3 ms of
+expert matvec is exactly that idle window. They cannot be overlapped - layer N+1's input is
+layer N's post-MoE output - which is also why the `hit_hook` seam has nothing to reclaim.
 
 ## The next piece of work
 
-**The sampler's unexplained 4.4 ms.** The sampler's own arithmetic is 0.08 ms: building the
-248,320-entry candidate array is 0.05 ms and the k=20 `partial_sort` is 0.03 ms, measured
-both in situ and in isolation. It is not the logprob tracking (now off by default, 0.16 ms
-when on) and not `output_reorder` (0.000 ms, zero swaps). All four
-`llama_get_sampled_*_ith` entry points call `ctx->synchronize()`, so the phase is where the
-host first waits for the device, and it does grow with context: 3.89 ms at 3.4k, 4.20 at
-33k, 5.90 at 135k.
+**Batch-1 quantized matmuls run at 29-63 GB/s on a card that streams at 128-155.** MUL_MAT
+is 24.0 ms of the 30.0 ms device budget, 341 nodes per token, and at streaming rate it would
+be about 10 ms. 14 ms is 25% of a decode token.
 
-A bracket around the `llama_sampler_sample` call from the caller reads 5.90 ms. A bracket
-inside the same function, first statement to last, reads 1.19 ms. Both are wall clock and
-they disagree, and that is the whole lead.
+The two largest single nodes:
 
-Two candidate explanations, one already tested:
+| node | ms/token | dtype | bytes/token | GB/s |
+|---|---|---|---|---|
+| `result_output` (the LM head) | 6.63 | Q6_K 248320x2048 | 397.9 MiB | 62.9 |
+| `linear_attn_out` + `z` (30 layers) | 6.55 | Q3_K | 103 MiB | 29 |
 
-- *OpenMP spin thrashing memory under the sampler.* **Refuted.** `OMP_WAIT_POLICY=passive`
-  and `GOMP_SPINCOUNT=0` leave the phase at 5.74 ms.
-- *The sampler is blocked, not computing.* Supported by the profile and not settled by the
-  timing. `perf` shows 47.2% `libgomp`, 42.7% the two matvecs, 2.5% everything else, and no
-  sampler symbol at all. A function burning 4.4 ms of CPU per 35 ms token would be ~13% of
-  the cycles and impossible to miss. So the time is most likely blocked in
-  `ctx->synchronize()`, which `perf`'s cycle event does not sample.
+The order-sensitive part of a matvec is only the reduction over K. Moving rows between
+blocks does not change it and is free; splitting K across blocks does change it and is not.
+So the prize is a scheduling and occupancy change, and it has to be separated the same way
+the attention occupancy change was - by pinning the order-dependent part and measuring the
+rest.
 
-Settling it needs an instrument that samples the host while it is inside that call. The
-vendored-tree timers that were used to bisect it (`llama-sampler.cpp`,
-`llama-context.cpp`) have been reverted; `perf` without frame pointers gave no usable call
-graph, so the next attempt should either build the binary with `-fno-omit-frame-pointer` and
-run `perf record -g`, or add a ring-buffer sampler that records the instruction pointer on a
-timer thread.
+Second: the sampler's unexplained 4.4 ms. Its own work is 0.08 ms; the OpenMP explanation is
+tested and refuted; `perf` shows no sampler symbol at all, so it is most likely blocked in
+`ctx->synchronize()`, which `perf`'s cycle event does not sample. Settling it needs `perf -g`
+with `-fno-omit-frame-pointer`, since without frame pointers the call graph was unusable.
 
-**Second:** the 18 ms of `llama_decode` that is neither attention nor the expert matvec.
-Nobody has decomposed it. The scheduler split instrumentation from earlier in this series -
-three phases per split in `ggml_backend_sched_compute_splits` - is the direct instrument and
-is worth reinstating, extended to separate the ten attention layers from the thirty
-recurrent ones.
+Third: the 2.2% available from `g=4` at ubatch 1280, measured over three clean interleaved
+pairs (57.27 s -> 56.01 s). **It is a placement change, so it must not become the default
+under a hard no-quality-loss constraint** - `--gpu-layers 4` already exposes it. The planner
+rejects that combination on a VRAM model that over-predicts; the runtime runs it fine.
 
 ## Strata
 
-`git pull` is clean at `v0.1.24` (`3ce2523`). The three newest commits were never read
-before this session and none of them transfers:
-
-- `731899f` QSA selection on tensor cores, +14.6% prompt at 128K - this model has full
-  attention, there is no cell selection to speed up. Its commit message does carry one
-  relevant data point: Strata ships a 3xTF32 change that it labels "not bitwise (another
-  summation order)" and calls "the size of any FP32-level change".
-- `3c974b9` GDN phase split in prefill timing - instrumentation, not an optimisation, and it
-  confirms the same projections / conv+gates / recurrence / output decomposition.
-- `3ce2523` version bump.
+`git pull` is clean at `v0.1.24` (`3ce2523`). The three newest commits do not transfer:
+`731899f` is QSA cell selection, an architecture this model does not have; `3c974b9` is
+timing instrumentation. `fused_gdn` is Strata's best idea for this model and it is now
+reinstated, but for a different reason than Strata's: not the recurrence, which is free, but
+the projections around it.
 
 ## The gate
 
 ```bash
 M=../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/p200k.txt --ctx 200000 \
-    --n-predict 128 --temp 0 --logprobs-n 32 --emit-score /tmp/fix.txt
+./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/prompt200k.txt --ctx 200000 \
+    --n-predict 128 --temp 0 --logprobs-n 32 --seed 1234 --emit-score /tmp/fix.txt
 # ... change something ...
-./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/p200k.txt --ctx 200000 \
-    --n-predict 128 --temp 0 --logprobs-n 32 --score-file /tmp/fix.txt \
+./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/prompt200k.txt --ctx 200000 \
+    --n-predict 128 --temp 0 --logprobs-n 32 --seed 1234 --score-file /tmp/fix.txt \
     --dump-logprobs /tmp/after.tsv
 python3 scripts/compare_logprobs.py /tmp/before.tsv /tmp/after.tsv
 ```
 
-**Always run a stock-vs-stock control through the same procedure first.** That is what
-caught bug 1, and it is the only reason this session's two wrong conclusions were caught
-before they were written down. Every arm must replay; none may sample-and-dump, because
-that is the asymmetry the fixture bug hid behind.
+**Always run a stock-vs-stock control through the same procedure first.** That is what caught
+bug 1, and it is the only reason this session's wrong conclusions were caught before they
+were written down. Every arm must replay; none may sample-and-dump.
 
-Zero top-1 disagreements, or it does not ship.
+Last run, 200k, `q8_0`/`q8_0`, 128 positions, 32 logprobs each: control bit-identical,
+shipped against stock **bit-identical**.
 
-## Traps, each of which cost time
+## Traps
 
-- End-to-end decode varies **5.5 to 22 t/s** across a session. With a long enough decode
-  window (2048 tokens, 113 s) it drops to 0.06% within-arm spread and becomes usable. Short
-  runs cannot see a 1% effect.
-- `nvidia-smi` `utilization.memory` is not a bandwidth measurement on this card.
+- End-to-end decode varies 5.5-22 t/s across a session. With a 2048-token window it drops to
+  0.06% within-arm spread; with 1024 it is 0.5%. Short windows cannot see a 1-2% effect.
+- **A leaked inference process holds 5.4 GiB of the 6 and invalidates the next six runs**,
+  each of which fails to plan with `no configuration fits: vram 4.01 GiB > usable 668.00 MiB`.
+  Check free VRAM before every measurement.
+- `nvidia-smi memory.used` reads a flat value across runs that differ by 294 MiB per expert
+  layer, so it cannot resolve a marginal cost. Use llama.cpp's own buffer accounting.
 - The GPU cannot be clock-locked (no root) and idles at 315 MHz; measure a baseline alongside.
 - `n_kv` must be a multiple of 256 or the raw `flash_attn_ext` silently times the generic
-  fallback. The serving path pads it; `amp-fa-bench` asserts it.
-- Timing a code path that aborts early is not a measurement.
-- `/tmp` is tmpfs. `pkill -f` matches its own command line.
-- Check that a kernel is actually on the live path before optimising it. `qwen35moe.cpp`
-  never calls `ggml_flash_attn_ext`; it goes through `build_attn_mha`, and a trace placed at
-  the wrong `return` in the dispatch suggested for a while that no FA kernel ran at all.
+  fallback.
+- Decode runs as a captured CUDA graph, so per-node device times are impossible without
+  bypassing the graph, and launch overhead is not a candidate for anything in the decode path.
+- `/tmp` is tmpfs. `pkill -f` matches its own command line, and a `pkill` in the same command
+  as a patch script kills the patch.
