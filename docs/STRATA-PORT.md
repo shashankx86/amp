@@ -487,7 +487,83 @@ The two byte-movers are both at or near their hardware limits. The only item tha
 accounted for and is not obviously a hardware limit is the sampler's 4.4 ms, which is the
 next thing to chase, and the "rest of llama_decode" at 18 ms, which nobody has decomposed.
 
-## 7. Attention efficiency, in isolation
+## 7. The 18 ms that nobody had decomposed, and a bound of mine that was wrong by 15x
+
+The previous section left "the rest of `llama_decode`, ~18 ms, not decomposed" as the
+open question. Two things settled it, both of which overturned something this document
+previously asserted.
+
+### The device time, measured by draining each split
+
+`AMP_TRACE_GPU=1` synchronises the CUDA backend after every CUDA split and reports the
+device time that split enqueued. It serialises the pipeline more than the scheduler already
+does, so the token gets slower, and the device time it reports is unaffected. Per token:
+
+| split | backend | n | 3.4k ctx | 135k ctx |
+|---|---|---|---|---|
+| attention | CUDA | 9 | 2.03 ms | **18.88 ms** |
+| recurrent | CUDA | 29 | 9.77 ms | **11.89 ms** |
+| experts | CPU | 37 | 15.72 ms | 16.32 ms |
+| input copies at the layer boundaries | CPU | 37 | 0.51 ms | 0.56 ms |
+
+The attention number lands on the context sweep's independent estimate of 18.3 ms within 3%,
+from a completely different instrument, which is the cross-check that makes the rest
+trustworthy.
+
+**The input copies are 0.5 ms, not 9.** The same run without the extra synchronise reports
+the CPU input-copy phase as 9.08 ms at 3.4k and 26.54 ms at 135k. The difference is entirely
+where the wait lands: with the drain measured, the host's copy phase falls to 0.51 ms and the
+same time appears in the device column. So the 9-26 ms "copy cost" that this document has
+carried for two sessions is the host waiting for the device, and the copies themselves are
+three round trips of 73 KiB per layer boundary. The compute-stream fix from section 5, which
+cut individual read-backs from 44-162 us to 13-23 us, is worth 1.3 ms here and was correctly
+judged worthless before; that judgement stands.
+
+### A bound of mine that was wrong by 15x
+
+`tools/gdn_bench.cpp` sized the recurrent layers by their SSM **state**: 2 MiB per layer,
+120 MiB per token, a floor of 0.8 ms against 155 GB/s. It concluded that Strata's `fused_gdn`
+had nothing to win, and the idea was retired on that number.
+
+The device measurement says the recurrent layers take **11.9 ms**, which is 22% of a 135k
+token. The state is not the layer. The whole layer's weights are 3.84 MiB, so 115 MiB per
+token across 30 layers, a bandwidth floor of 0.79 ms - and the layers take 15x that.
+
+**They are not bandwidth-bound, and that is the finding.** 3.84 MiB per layer at 11.9 ms is
+9.3 GB/s on a card that streams at 128. The working set is small enough to sit in L2, so this
+is latency and kernel structure: a handful of dependent kernels per layer (in_proj, conv1d,
+the gated delta recurrence, out_proj, the norm and gate) each paying launch and dependent-load
+latency at batch 1, with the recurrence itself inherently serial.
+
+So `fused_gdn` is the largest item left, not a rounding error. What it would have to do is
+what Strata's does: hold 32 state rows per thread in registers so the state never
+round-trips, and fold the norm and the sigmoid gate into the same kernel so those are not
+separate dependent launches either. The prize is bounded by the 11.1 ms of gap between the
+0.79 ms floor and the 11.9 ms measured, and a fused kernel that reached the floor would be
+worth about 20% of a decode token.
+
+That is a real piece of work - a new CUDA kernel for a recurrence, validated against the same
+teacher-forced gate - and it is the one thing on the list whose size is now known.
+
+### The token, complete
+
+At 135k, of 55.5 ms, everything attributed:
+
+| | ms | share | at its limit? |
+|---|---|---|---|
+| attention, device | 18.9 | 34% | no, 80 GB/s in situ |
+| recurrent layers, device | 11.9 | 21% | **no, 15x its bandwidth floor** |
+| expert matvec, host | 16.3 | 29% | yes, 27.96 GB/s |
+| copies at layer boundaries | 0.6 | 1% | yes |
+| CUDA split launches, host | 0.6 | 1% | yes |
+| sampler's unexplained portion | ~4.4 | 8% | unknown |
+| outside the split loop, in `llama_decode` | ~2.6 | 5% | not decomposed |
+
+Two thirds of the token is now measured rather than inferred, and the one item with a large
+gap to its hardware limit is the recurrent layers - which is the item this document had
+already retired.
+
+## 8. Attention efficiency, in isolation
 
 `amp-fa-bench` measures one decode attention alone: ~67 GB/s, about 40% of this card's
 achievable read bandwidth, flat from 32k to 200k context. The flatness says the shortfall
@@ -547,12 +623,20 @@ so it can be re-run rather than believed. Against a 45 ms warm decode token:
 | KV streaming (`kv_stream`) | - | - | needs VRAM this card does not have |
 | grouped expert GEMV | - | - | gated on VRAM; g=4 already saturates |
 
-**Rewritten by section 6, which measured the token instead of bounding it.** The table above
-is the old set of bounds, kept so the correction is visible. What the token actually looks
-like at 135k, of 55.5 ms: attention 18.3 ms at 80 GB/s, experts 14.6 ms at 27.96 GB/s, an
-unexplained 4.4 ms inside the sampler, and 18 ms of `llama_decode` that nobody has
-decomposed. Both byte-movers are at their hardware limits, so the two things worth attacking
-are the sampler's unexplained portion and the 18 ms.
+**Rewritten by sections 6 and 7, which measured the token instead of bounding it.** The table
+above is the old set of bounds, kept so the corrections are visible. Two of them were wrong:
+
+- *Attention, 19%, "the only real kernel work left".* The kernel work was taken (1.22x,
+  bit-exact) and the kernel is worth 1% of a token. In situ the attention runs at 80 GB/s.
+- *GDN, 0.8 ms, 2%, "do not write this kernel".* Wrong by 15x. The bound sized the SSM state
+  rather than the layer, and the layer does not run at bandwidth: 11.9 ms against a 0.79 ms
+  floor. It is now the largest item on the list.
+
+The token at 135k, everything attributed: recurrent layers 11.9 ms on the device, attention
+18.9 ms on the device, expert matvec 16.3 ms on the host, layer-boundary copies 0.6 ms,
+sampler ~4.4 ms unexplained, 2.6 ms outside the split loop. Of those, the expert matvec is at
+memory bandwidth and the attention is at 80 GB/s. The recurrent layers are 15x off their own
+bandwidth floor, and that is the one with a large gap left.
 
 **Shipped this session:** raising the vec kernel's resident-blocks-per-SM from 1 to 4
 (`fattn-vec.cuh:29`). One decode attention at 200k goes from 3.23 ms to 2.64 ms, 1.22x, and

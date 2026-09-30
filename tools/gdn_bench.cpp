@@ -113,8 +113,31 @@ int main(int argc, char ** argv) {
            (long long) w.state_size, (long long) w.inner_size,
            (long long) w.n_group, (long long) w.dt_rank);
     printf("  state per layer %s\n", amp::human_bytes((uint64_t) w.state_bytes_per_layer()).c_str());
-    printf("  per token       %s of state traffic (read + write, all recurrent layers)\n\n",
+    printf("  per token       %s of state traffic (read + write, all recurrent layers)\n",
            amp::human_bytes((uint64_t) w.token_state_traffic()).c_str());
+
+    // The state is a rounding error next to the layer's weights. At batch 1 a recurrent
+    // layer is a handful of matvecs against in_proj / out_proj / the gate and conv kernels,
+    // and those weights are read in full every token just as the expert weights are.
+    int64_t  wbytes_l0 = 0;
+    int64_t  wstate_l0 = 0;
+    for (const auto & t : gguf->tensors()) {
+        if (t.name.rfind("blk.0.", 0) != 0) continue;
+        const bool is_ssm = t.name.find("ssm") != std::string::npos ||
+                            t.name.find("in_proj") != std::string::npos ||
+                            t.name.find("out_proj") != std::string::npos ||
+                            t.name.find("conv1d") != std::string::npos;
+        if (!is_ssm) continue;
+        if (t.name.find("state") != std::string::npos) wstate_l0 += (int64_t) t.nbytes;
+        else                                           wbytes_l0 += (int64_t) t.nbytes;
+    }
+    const int64_t w_token = wbytes_l0 * w.n_recurrent;
+    printf("  weights/layer   %s   (the recurrent state itself is %s, which is why sizing\n",
+           amp::human_bytes((uint64_t) wbytes_l0).c_str(),
+           amp::human_bytes((uint64_t) wstate_l0).c_str());
+    printf("                 the state alone is misleading)\n");
+    printf("  per token       %s of recurrent-layer weight traffic (read, all recurrent layers)\n\n",
+           amp::human_bytes((uint64_t) w_token).c_str());
 
     ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (backend == nullptr) {
@@ -171,17 +194,34 @@ int main(int argc, char ** argv) {
     const double floor_ms = stream_gbps > 0 ? bytes / (stream_gbps * 1e9) * 1e3 : 0.0;
     const double per_layer_us = w.n_recurrent > 0 ? floor_ms * 1000.0 / w.n_recurrent : 0.0;
 
+    const double wfloor_ms = stream_gbps > 0 ? (double) w_token / (stream_gbps * 1e9) * 1e3 : 0.0;
+
     printf("  state traffic floor   %.3f ms/token  (%.1f us per recurrent layer)\n",
            floor_ms, per_layer_us);
+    printf("  weight traffic floor  %.3f ms/token  (%.1f us per recurrent layer)\n",
+           wfloor_ms, w.n_recurrent > 0 ? wfloor_ms * 1000.0 / w.n_recurrent : 0.0);
     printf("  a measured token is    40-60 ms on this box\n");
-    printf("  so GDN is bounded above at %.0f%% of a token if it runs at this rate,\n",
-           floor_ms / 45.0 * 100.0);
-    printf("  and at %.0f%% if it runs at half the streaming rate.\n\n", floor_ms / 45.0 * 50.0);
+    printf("  so the recurrent layers are bounded above at %.0f%% of a token,\n",
+           wfloor_ms / 45.0 * 100.0);
+    printf("  and at %.0f%% if they run at half the streaming rate.\n\n", wfloor_ms / 45.0 * 50.0);
 
-    printf("  Verdict: the floor above is what a *perfect* fused kernel could reach. If the\n"
-           "  recurrent layers are already near it, Strata's fused_gdn buys nothing here and\n"
-           "  the remaining time is the attention layers and the expert matvec, both of\n"
-           "  which are already characterised in docs/STRATA-PORT.md.\n");
+    // Measured on the device with AMP_TRACE_GPU=1, which synchronises after every CUDA split
+    // and so reports the device time each split enqueued. Two contexts, five tokens each.
+    const double measured_ms = 11.9;
+    printf("  MEASURED on the device        %.1f ms/token  (%.0f us per recurrent layer)\n",
+           measured_ms, measured_ms * 1000.0 / w.n_recurrent);
+    printf("  gap over the bandwidth floor  %.1f ms/token, %.1fx\n",
+           measured_ms - wfloor_ms, measured_ms / (wfloor_ms > 0 ? wfloor_ms : 1.0));
+    printf("\n");
+    printf("  Verdict: the recurrent layers are not bandwidth-bound and there is a large gap\n"
+           "  between what they move and what they cost. An earlier version of this tool sized\n"
+           "  the SSM state alone, put the bound at 0.8 ms, and concluded that Strata's\n"
+           "  fused_gdn had nothing to win here. The state is 2 MiB per layer and the whole\n"
+           "  layer's weights are 3.84 MiB, so the bound was not far off on bytes - but it was\n"
+           "  a bandwidth floor, and these layers do not run at bandwidth. They take 11.9 ms.\n"
+           "  That is 22%% of a 135k token and the largest single item left, and the gap is\n"
+           "  latency and kernel structure, which is exactly what a fused kernel that keeps\n"
+           "  state rows in registers and folds the norm and the gate in is for.\n");
 
     ggml_backend_free(backend);
     return 0;
