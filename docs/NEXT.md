@@ -147,6 +147,18 @@ wrong by 2.8x on this axis.
 
 ## What is left
 
+**Prefill is closed too, and it is the same answer as decode.** It is 813 GFLOPS, 79% of this
+part's 1.024 TFLOPS AVX2 peak, measured rather than computed, on a CPU with no `avx512` and no
+`amx`. It reads at 4.1 of 28 GB/s with the GPU 93% idle, and the only way to use that GPU is a
+placement change that measures 1.25x to 2.75x worse. Every prefill lever is at its best value:
+ubatch 1280 of 512/1024/1280/2048, threads 8 of 8/12/16, reverse warming (which makes no
+difference against `--forward-warm`), g=3. The ubatch is capped by the envelope rather than by
+the curve: holding it at 1280, ctx 131072 gives 574-615 t/s and ctx 200000 gives 430 for
+*identical work*, because the KV cache is 717 MiB bigger and total VRAM is 40 MiB from the
+ceiling. Buying the remaining 26% needs 6.39 GiB against 5.89 available.
+
+
+
 **The CPU expert phase is closed.** 431 MB of weights per token at a measured 27.96 GB/s, and
 `amp-page-walk` measures the model file itself at 26.37 GB/s contiguous and 25.88 scattered. The
 stream is already at the rate the file can be read at, the bus is full, and the memory

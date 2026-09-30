@@ -938,6 +938,46 @@ decode graph is `MUL_MAT` (287), the GDN projections `ssm_out` and the router, t
 `FLASH_ATTN_EXT`, 6 `MUL_MAT_ID` for the three GPU-resident expert layers, and ~240
 elementwise nodes for the recurrence.
 
+### Prefill, measured rather than computed
+
+The 74%-of-AVX2-peak figure earlier in this document was arithmetic, and the AVX2 width had
+been got wrong once already, so it was re-measured. A 33,360-token prompt at ctx 131072 is
+33,360 x 8 experts x 40 layers x 3.146 M MACs = 67.3 TFLOP in 82.8 s, which is **813 GFLOPS,
+79% of this part's 1.024 TFLOPS AVX2 peak**. The part has `avx avx2 f16c fma` and no `avx512`
+and no `amx`, and thread count does not move it, so that is the ceiling for a quantized GEMM
+here: the dequantization shares the same execution pipes as the FMA it feeds.
+
+Every prefill lever, swept:
+
+| lever | result |
+|---|---|
+| ubatch 512 / 1024 / 1280 / 2048 at ctx 200k | 261 / 291 / **323** / 295 t/s - 1280 is the peak |
+| threads 8 / 12 / 16 | 423 / 408 / 425 t/s - flat, it is FP-throughput-bound |
+| `--forward-warm` vs the default reverse | 406 / 409 t/s vs 409 / 409 - identical |
+| g=4 at ctx 200k | 2.75x slower |
+| g=4 at ctx 65536, with 1.2 GiB of VRAM slack | 1.25x slower (571 vs 716 t/s) |
+
+The warm *order* is the one the docs make a point of, and it makes no difference here. The
+g=4 penalty is real but is **partly VRAM starvation**: with headroom it falls from 2.75x to
+1.25x, and it never becomes a win, because a GPU expert layer at batch 1280 is 64.4 GFLOP and
+would only have to beat 85 ms to break even, i.e. 0.75 TFLOPS. It runs at 9.5 GFLOPS, so the
+placement is a loss regardless of the budget.
+
+**And the ubatch is capped by the envelope, which is the same story as decode.** Holding the
+ubatch at 1280 and changing only the allocation:
+
+| ctx | KV buffer | total VRAM | prefill |
+|---|---|---|---|
+| 131072 | 1360 MiB | 5.65 of 5.89 GiB | 574 / 615 t/s |
+| 200000 | 2077 MiB | 5.85 of 5.89 GiB | 430 t/s |
+
+**Identical work, 30% slower, because the KV cache is 717 MiB bigger and the total is 40 MiB
+from the ceiling.** The ubatch explains part of the ctx-to-ctx spread (2048 fits at 131072 and
+gives 536 t/s) but not all of it. Buying the remaining 26% needs ubatch 2048 at 200k, which
+needs 6.39 GiB against 5.89 available. So prefill is at 79% of a CPU that has no wider ISA, on
+a memory system running at 4.1 of 28 GB/s, with the GPU 93% idle - and the only way to use that
+GPU is a placement change that measures 1.25x to 2.75x worse.
+
 ### Both regimes are at about three quarters of a hardware limit, and the reasons differ
 
 Prefill at 200k is 332 s, eleven times a 512-token decode, and it had never been examined.
