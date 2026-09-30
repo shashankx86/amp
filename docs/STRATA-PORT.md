@@ -825,6 +825,48 @@ the instrument. After subtracting it the glue is **<= 0.8 ms/token**.
 It saves nothing.** The decision to retire it stands; the reason it was previously given - that
 the recurrence is free - was wrong, and this is the right one.
 
+### The whole token, accounted for
+
+Every phase of the decode token now has a measured reason for being the size it is. Two
+1024-token windows at the same `--ctx 200000`, differing only in how many KV positions are
+populated, separate the context-free floor from the context cost:
+
+| | 1.1k KV positions | 135.6k | |
+|---|---|---|---|
+| token | **37.09 ms** | **56.55 ms** | |
+| post-decode drain | 3.49 ms | 5.51 ms | +2.0 ms |
+| sampler | 0.39 ms | 0.37 ms | flat |
+
+The context slope is **144.7 us per KV position per token**, of which attention is 131.7
+(`amp-fa-bench`: 13.17 us per position per layer, ten layers) - **91%** - and the rest is the
+drain growing with context. So the context cost is the attention kernel, which is at its
+structural optimum, plus a drain that cannot be filled.
+
+The 37.09 ms floor:
+
+| | ms | at |
+|---|---|---|
+| CPU expert matvec, 431 MB | 15.4 | the DRAM read ceiling, 27.96 of 26-28 GB/s |
+| attention-free MUL_MAT (head, GDN and attention projections, router, shared expert) | 9.4 | at or above card bandwidth per tensor |
+| the LM head alone, of the above | 2.3 | 174 GB/s, card peak |
+| post-decode drain | 3.5 | irreducible: the next token needs the id it produces |
+| GPU-resident expert layers, 3 | 0.8 | 6 `MUL_MAT_ID` nodes |
+| elementwise and gather | 0.8 | after subtracting the instrument's own bubble |
+| sampler | 0.4 | 0.4% of the token |
+| **sum** | **32.6** | against **37.09** measured, 12% |
+
+Within 12% on the floor and 10% on the slope, which is inside this box's run-to-run spread.
+Every line is at a measured hardware or dependency limit: the CPU phase at the memory
+controller, the head at card bandwidth, the GDN projections at bandwidth, the attention at a
+crossed constraint inside the kernel, the drain at a data dependency, and the elementwise glue
+too small to be worth a kernel.
+
+**And the two phases cannot be overlapped.** Layer N's experts produce the residual that layer
+N+1's attention consumes, so the 40 CPU/GPU alternations per token are strictly serial, and
+the token is the *sum* of a VRAM-bound phase and a RAM-bound phase rather than their maximum.
+Overlapping them would need the next layer to run on a predicted residual, which changes the
+arithmetic and so is out of scope under a no-quality-loss constraint.
+
 ### The CPU expert stream is at this box's DRAM read ceiling, so it is closed
 
 The token's second phase is 40 layers of batch-1 expert matvec on the CPU, 8 selected experts
