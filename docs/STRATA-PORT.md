@@ -4,6 +4,12 @@ Starting point: the note in `AGENT.md` that M7 is spent and "there is no gap lef
 on the CPU side". That is correct, and it is also the reason the project stalled. The
 optimization target was never the CPU. These are the measurements that moved it.
 
+**This is a chronological log and it is wrong in three places, all corrected later and all
+marked at the point of the error.** The two that matter: the sampler's 4.4 ms was never the
+sampler (see "The sampler's 4.4 ms was the device finishing the token"), and the decode
+attention kernel is not at half of memory bandwidth (see "The attention kernel, and a wrong
+conclusion I drew from its own output"). Read the corrections, not the claims they correct.
+
 ## 1. Decode is not compute-bound on either device
 
 `scripts/decompose_decode.sh` samples one decode phase and reports both duty cycles.
@@ -446,7 +452,10 @@ it was on, and it is not `output_reorder()`, measured at 0.000 ms with zero swap
 host first waits for the device, and it does grow with context: 3.89 ms at 3.4k, 4.20 ms at
 33k, 5.90 ms at 135k.
 
-**But 4.4 ms of it is unexplained and is recorded as an open lead.** A bracket around the
+**But 4.4 ms of it is unexplained and is recorded as an open lead.**
+
+> **Superseded.** It is the post-decode device drain, measured with a timed
+> `llama_synchronize`. See "The sampler's 4.4 ms was the device finishing the token". A bracket around the
 `llama_sampler_sample` call from the caller says 5.90 ms. A bracket inside that same
 function, from its first statement to its last, says 1.19 ms. Both are wall clock and they
 cannot both be right.
@@ -485,6 +494,7 @@ The map is now, for a 135k token of 55.5 ms:
 
 The two byte-movers are both at or near their hardware limits. The only item that is not
 accounted for and is not obviously a hardware limit is the sampler's 4.4 ms, which is the
+> (superseded: it is the device drain, not host work)
 next thing to chase, and the "rest of llama_decode" at 18 ms, which nobody has decomposed.
 
 ## 7. The 18 ms that nobody had decomposed, and a bound of mine that was wrong by 15x
@@ -785,6 +795,10 @@ trades 2.2% of decode for 2.8x of prefill, which is not a trade anyone should ta
 
 What is left is therefore only the sampler's 4.4 ms, which no instrument here could
 attribute, and which is 8% of a token.
+
+> **Superseded.** It was attributed: the sampler is not doing work, `llama_decode` returns
+> before the device is done, and the wait lands on the first blocking call. See "The sampler's
+> 4.4 ms was the device finishing the token".
 
 ### A bound of mine that was wrong by 15x
 
