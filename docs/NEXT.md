@@ -147,57 +147,49 @@ wrong by 2.8x on this axis.
 
 ## What is left
 
-**The sampler's unexplained 4.4 ms**, which is 8% of a token and the only item that is both
-unexplained and unattributed. Its own work is 0.08 ms; the OpenMP explanation is tested and
-refuted; `perf` shows no sampler symbol at all, so it is most likely blocked in
-`ctx::synchronize()`, which `perf`'s cycle event does not sample. Settling it needs `perf -g`
-with `-fno-omit-frame-pointer`, since without frame pointers the call graph was unusable.
+**The sampler's 4.4 ms is closed, and it was never the sampler.** `llama-context.cpp:2087`
+has the end-of-decode `synchronize()` commented out, which is upstream and correct: the host
+returns while the graph runs, and the wait lands on whichever call blocks first, which was
+`llama_sampler_sample`. `AMP_TRACE_DECODE` now times an explicit `llama_synchronize` right
+after decode, and the number moves exactly: the sampler falls from 4.789 ms to 0.362 ms and
+a 4.411 ms post-decode drain appears. That drain is a constant 3.4-4.7 ms independent of
+context, prefetcher and CUDA graphs, it grows ~0.35 ms per GPU-resident expert layer, and it
+**cannot be filled** - the next token needs the id the drain is producing.
 
-Nothing else is live. If the goal is a materially faster engine, the levers are a bigger
-card - more experts in VRAM, which also stops the CPU stealing the GPU's bandwidth - or
-smaller expert weights, and the second is excluded by the quality constraint.
+**The one live item is the per-query-head cost in decode attention.** At the model's shape the
+attention kernel reports 48% of the card's streaming rate, and it is not a memory deficit.
+Holding the KV bytes fixed at one KV head and raising only the query heads gives 0.906 /
+0.946 / 1.310 / 2.420 ms for 2 / 4 / 8 / 16 heads, so the time grows with the head count on
+its own; and 8/2 against 8/1 doubles the KV for 0.58 ms more, so the marginal KV streams at
+177 GB/s. The cost is per query head: each row is read once and scored against 16 heads, each
+needing a 256-element q8_0 x q8_1 dot product and a 5-shuffle cross-lane reduction.
 
-## Strata
+Everything cheap is excluded by measurement (260-byte row pitch, 4 B/lane width, head dim,
+register spill, launch bound 2/3/4/6/8/12, split-K 5/10/16/24/40/80, L1 footprint). The
+rewrite that the numbers *do* point at is a kernel that scores several query heads per K row
+**without a per-head cross-lane reduction** - one lane per row, no shuffles - trading a worse
+memory pattern (the scattered variant measures 61 GB/s) for none of the reduction work. That
+is a rewrite with an unknown outcome, not a knob.
 
-`git pull` is clean at `v0.1.24` (`3ce2523`). The three newest commits do not transfer:
-`731899f` is QSA cell selection, an architecture this model does not have; `3c974b9` is
-timing instrumentation. `fused_gdn` is Strata's best idea for this model and it is now
-reinstated, but for a different reason than Strata's: not the recurrence, which is free, but
-the projections around it.
-
-## The gate
-
-```bash
-M=../models/Occamy-1.0.APEX-I-MiniPlus-V2.1-Abliterated.gguf
-./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/prompt200k.txt --ctx 200000 \
-    --n-predict 128 --temp 0 --logprobs-n 32 --seed 1234 --emit-score /tmp/fix.txt
-# ... change something ...
-./build/bin/amp-infer --model $M --prompt-file /tmp/opencode/prompt200k.txt --ctx 200000 \
-    --n-predict 128 --temp 0 --logprobs-n 32 --seed 1234 --score-file /tmp/fix.txt \
-    --dump-logprobs /tmp/after.tsv
-python3 scripts/compare_logprobs.py /tmp/before.tsv /tmp/after.tsv
-```
-
-**Always run a stock-vs-stock control through the same procedure first.** That is what caught
-bug 1, and it is the only reason this session's wrong conclusions were caught before they
-were written down. Every arm must replay; none may sample-and-dump.
-
-Last run, 200k, `q8_0`/`q8_0`, 128 positions, 32 logprobs each: control bit-identical,
-shipped against stock **bit-identical**.
+The GQA-merge idea looked like the answer and is **refuted**: it removes redundant K/V loads,
+and the measurements above show those loads are already nearly free.
 
 ## Traps
 
-- End-to-end decode varies 5.5-22 t/s across a session. With a 2048-token window it drops to
-  0.06% within-arm spread; with 1024 it is 0.5%. Short windows cannot see a 1-2% effect.
-- **A leaked inference process holds 5.4 GiB of the 6 and invalidates the next six runs**,
-  each of which fails to plan with `no configuration fits: vram 4.01 GiB > usable 668.00 MiB`.
-  Check free VRAM before every measurement.
-- `nvidia-smi memory.used` reads a flat value across runs that differ by 294 MiB per expert
-  layer, so it cannot resolve a marginal cost. Use llama.cpp's own buffer accounting.
-- The GPU cannot be clock-locked (no root) and idles at 315 MHz; measure a baseline alongside.
-- `n_kv` must be a multiple of 256 or the raw `flash_attn_ext` silently times the generic
-  fallback.
-- Decode runs as a captured CUDA graph, so per-node device times are impossible without
-  bypassing the graph, and launch overhead is not a candidate for anything in the decode path.
-- `/tmp` is tmpfs. `pkill -f` matches its own command line, and a `pkill` in the same command
-  as a patch script kills the patch.
+- **`prompt200k.txt` and `p200k.txt` are different prompts.** The gate recipe uses
+  `prompt200k.txt`; `p200k.txt` is unrelated text. Comparing a run against a stored reference
+  with the wrong one reports 9 top-1 disagreements and a median KL of 8.4e-3 that look exactly
+  like a numerical regression, and pure stock reproduces it too. Check the prompt file before
+  believing a gate failure.
+- The launch-bound second argument and the split-K fan-out are coupled. On this box the
+  wave-efficiency search lands on 5 because 16 heads x 5 splits == 20 SMs x 4 blocks, which is
+  a coincidence of the geometry rather than a property of the search; a sweep of 2/3/4/6/8/12
+  puts `parallel_blocks` at 5/7/5/7/8/8, and the order the softmax is summed in follows it.
+- `#pragma unroll` does not macro-expand, so a `#pragma unroll SOME_MACRO` fails to compile.
+  An unbuildable variant measured as a stale binary, and two sweeps in this session were run
+  against stale binaries before that was noticed. Always confirm the build relinked.
+- `cmake --build build -D...` re-configures and persists the flag into the cache; a later plain
+  `cmake -S . -B build` does not clear it. Check `CMAKE_CUDA_FLAGS` in `build/CMakeCache.txt`
+  after reconfiguring.
+- `/tmp` is tmpfs, so `p200k.txt` at 1 MiB and `prompt200k.txt` at 910 KiB are both
+  page-cache resident and neither reads as a large file.
