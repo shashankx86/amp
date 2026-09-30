@@ -563,6 +563,62 @@ Two thirds of the token is now measured rather than inferred, and the one item w
 gap to its hardware limit is the recurrent layers - which is the item this document had
 already retired.
 
+### Which kernel, and the finding that the recurrence is not the problem
+
+`AMP_TRACE_OPS=1` times every node with a CUDA event pair and accumulates device
+milliseconds per op; `AMP_NO_CUDA_GRAPH=1` is required alongside it, because decode runs as a
+captured graph that replays as a single unit and cannot be attributed per op. The graph is
+what makes 0.41 ms per recurrent layer *kernel execution* rather than launch overhead, and
+with it bypassed the attribution is per op. 200 decode tokens, 3-token prompt, so prefill is
+negligible:
+
+| op | ms/token | nodes/token |
+|---|---|---|
+| **MUL_MAT** | **24.04** | 341 |
+| GET_ROWS | 1.58 | 61 |
+| ADD | 0.82 | 60 |
+| CONCAT | 0.60 | 30 |
+| FLASH_ATTN_EXT | 0.57 | 10 |
+| MUL_MAT_ID | 0.55 | 3 |
+| UNARY | 0.51 | 70 |
+| CPY | 0.45 | 30 |
+| MUL | 0.40 | 40 |
+| SET_ROWS | 0.21 | 20 |
+| ROPE | 0.19 | 20 |
+| **total device** | **30.0** | |
+
+Total device time of 30.0 ms per token against the 18.9 + 11.9 = 30.8 ms the split drain
+measured, from a third instrument.
+
+**`SSM_CONV` and `SSM_SCAN` do not appear in the list at all.** The gated delta recurrence -
+the thing `fused_gdn` exists to accelerate - costs under 0.01 ms per token. The 11.9 ms of
+recurrent splits is 341 plain matvecs: `in_proj`, `out_proj`, the shared expert, the router,
+the qkv and output projections. The recurrence was never the cost, which is a third thing
+this document had wrong about the recurrent layers, after the state-only bound and the
+"not bandwidth-bound" reading.
+
+**MUL_MAT is 24.0 ms of a 30.0 ms device budget, at roughly a quarter of the card's
+streaming rate.** 3.84 MiB of weights per recurrent layer in 0.41 ms is 9.3 GB/s where the
+card streams at 128. At batch 1 each of those is a small matvec, and 341 of them are chained
+serially in one stream, so each pays its own launch and dependent-load latency with nothing
+to overlap against.
+
+### The consequence: the GPU is idle 46% of the token
+
+Device time is 30.0 ms and the token is 55.5 ms, so the device is busy 54% of the time. The
+CPU's 16.3 ms of expert matvec is exactly the GPU's idle window. They cannot be overlapped
+within a token - layer N+1's input is layer N's post-MoE output, so the chain is serial, and
+that is the same reason the `hit_hook` seam has nothing to reclaim - but expert work *moved*
+onto the GPU would land in idle time and be close to free. All 37 CPU expert layers would fit
+in 25.5 ms of GPU idle at 0.41 ms each; VRAM is what stops it, at roughly 2.4 GiB free
+against 294 MiB per expert layer, so the planner's `g=3` is a VRAM answer and not a
+throughput answer.
+
+That makes the expert-layer count a real tuning question rather than a fixed constant, and
+`g` is already a flag. The next thing to establish is where the measured optimum sits now
+that the KV cache is `q8_0`/`q8_0` rather than `q8_0`/`q4_0`, since the larger cache is what
+crowds the expert layers out of VRAM in the first place.
+
 ## 8. Attention efficiency, in isolation
 
 `amp-fa-bench` measures one decode attention alone: ~67 GB/s, about 40% of this card's
