@@ -647,6 +647,35 @@ CPU, whose traffic then slows the GPU's.
 The two ways out are both outside this engine. Put more experts in VRAM, which needs a
 bigger card. Or shrink the expert weights, which is a quantization change and is excluded.
 
+### Where that leaves the engine
+
+Bytes moved per decode token at 200k, from the per-tensor and per-op measurements above:
+
+| | bytes/token | device | rate |
+|---|---|---|---|
+| attention KV, q8_0, 10 layers | 2.176 GB | GPU | 80 GB/s |
+| the LM head, q6_K | 398 MB | GPU | 62.9 GB/s in situ |
+| expert weights, 8 of 256 per layer | 413 MB | CPU | 27.96 GB/s |
+| recurrent projections | 103 MB | GPU | 29 GB/s |
+| **GPU total** | **2.68 GB in 30.0 ms** | | **89 GB/s** |
+| **CPU total** | **0.41 GB in 16.3 ms** | | **25.3 GB/s** |
+
+**114 GB/s of a ~155 GB/s ceiling, 74% of it, with the two processors sharing one memory
+path.** That is the honest summary of where this engine stands: it is not arithmetic-bound
+and it is not kernel-bound, it is within about a third of a memory system that the 6 GB VRAM
+/ 16 GB RAM envelope fixes.
+
+The things that are *not* at the limit, and are shipped or retired with reasons in this
+document: the expert matvec is at 27.96 GB/s and cannot be improved with 8 threads; the
+attention kernel is at 80 GB/s in situ against 122-178 isolated, and the difference is the
+CPU's traffic rather than the kernel; the recurrent recurrence is free; the LM head is at or
+above the card's rate in isolation. The one item that was both large and improvable, the
+vec attention kernel's occupancy, was taken and is worth 1% of a token.
+
+The remaining measured items are the sampler's 4.4 ms, which no instrument here could
+attribute, and 2.2% from placing a fourth expert layer on the GPU, which is a placement
+change and so is not a default under a hard no-quality-loss constraint.
+
 ### A bound of mine that was wrong by 15x
 
 `tools/gdn_bench.cpp` sized the recurrent layers by their SSM **state**: 2 MiB per layer,
