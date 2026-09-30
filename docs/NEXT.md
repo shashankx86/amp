@@ -191,31 +191,53 @@ the overlap costs 2-4x the occupancy to get 2x the overlap.
 
 ## Traps
 
+These cost real time. The first four are the ones that most easily produce a wrong conclusion
+rather than merely a failed command.
+
+- **End-to-end decode varies 5.5-22 t/s across a session.** With a 2048-token window it drops
+  to 0.06% within-arm spread; with 1024 it is 0.5%. Short windows are worse than useless: at
+  200k, 256 tokens reported 72.00 and 63.83 ms/token in two consecutive runs where 1024
+  tokens reported a stable 56.55. Two 256-token runs disagreeing by 13% is enough to invent a
+  phase that is not there.
+- **A leaked inference process holds 5.4 GiB of the 6 and invalidates the next six runs**,
+  each of which fails to plan with `no configuration fits: vram 4.01 GiB > usable 668.00 MiB`.
+  Check free VRAM before every measurement, and do not read a planning failure as a
+  configuration problem.
 - **`prompt200k.txt` and `p200k.txt` are different prompts.** The gate recipe uses
   `prompt200k.txt`; `p200k.txt` is unrelated text. Comparing a run against a stored reference
   with the wrong one reports 9 top-1 disagreements and a median KL of 8.4e-3 that look exactly
   like a numerical regression, and pure stock reproduces it too. Check the prompt file before
   believing a gate failure.
+- **Do not `git checkout` a vendored file to drop a measurement instrument from it.** Doing
+  that on `ggml-cuda.cu` also silently reverted the shipped compute-stream fix, and
+  `grep -c ctx->stream` still reported 24 hits because it matches the unrelated
+  `ctx->stream()` accessor, so the loss looked like it had not happened. Extract the
+  instrument's hunks into a patch first, apply the saved shipped patch back, then confirm the
+  diffstat is byte-for-byte what it was before instrumenting.
+- A per-node CUDA event pair measures the **inter-kernel gap**, not the kernel, whenever the
+  CUDA graph is disabled - which is the only way to get per-node device times at all here.
+  With ~700 nodes per decode token the bubble dominates; `CONT` puts it at ~3.3 us per node.
+  Use `AMP_OPS_MATCH` to price one op class at a time and treat unfiltered per-op tables as
+  upper bounds.
 - The launch-bound second argument and the split-K fan-out are coupled. On this box the
   wave-efficiency search lands on 5 because 16 heads x 5 splits == 20 SMs x 4 blocks, which is
   a coincidence of the geometry rather than a property of the search; a sweep of 2/3/4/6/8/12
   puts `parallel_blocks` at 5/7/5/7/8/8, and the order the softmax is summed in follows it.
+- `nvidia-smi memory.used` reads a flat value across runs that differ by 294 MiB per expert
+  layer, so it cannot resolve a marginal cost. Use llama.cpp's own buffer accounting.
+- The GPU cannot be clock-locked (no root) and idles at 315 MHz; measure a baseline alongside.
+- `n_kv` must be a multiple of 256 or the raw `flash_attn_ext` silently times the generic
+  fallback. Note that `--ctx` sets the *allocation*, not the populated length: `--ctx 200000`
+  with a 910 KiB prompt populates about 134.6k positions, and attention cost follows the
+  populated length, so a context sweep needs different prompts, not just different flags.
+- Decode runs as a captured CUDA graph, so per-node device times are impossible without
+  bypassing the graph, and launch overhead is not a candidate for anything in the decode path.
 - `#pragma unroll` does not macro-expand, so a `#pragma unroll SOME_MACRO` fails to compile.
   An unbuildable variant measured as a stale binary, and two sweeps in this session were run
   against stale binaries before that was noticed. Always confirm the build relinked.
 - `cmake --build build -D...` re-configures and persists the flag into the cache; a later plain
   `cmake -S . -B build` does not clear it. Check `CMAKE_CUDA_FLAGS` in `build/CMakeCache.txt`
   after reconfiguring.
-- `/tmp` is tmpfs, so `p200k.txt` at 1 MiB and `prompt200k.txt` at 910 KiB are both
-  page-cache resident and neither reads as a large file.
-- **Do not `git checkout` a vendored file to drop a measurement instrument from it.** Doing
-  that on `ggml-cuda.cu` also silently reverted the shipped compute-stream fix, and
-  `grep -c ctx->stream` still reported 24 hits because it matches the unrelated
-  `ctx->stream()` accessor, so the loss looked like it had not happened. Extract the
-  instrument's hunks into a patch first and apply the saved shipped patch back, then confirm
-  the diffstat is byte-for-byte what it was before instrumenting.
-- A per-node CUDA event pair measures the **inter-kernel gap**, not the kernel, whenever the
-  CUDA graph is disabled - which is the only way to get per-node device times at all here.
-  With ~700 nodes per decode token the bubble dominates; `CONT` puts it at ~3.3 us per node.
-  Use `AMP_OPS_MATCH` to price one op class at a time and treat unfiltered per-op tables as
-  upper bounds.
+- `/tmp` is tmpfs, so a 1 MiB prompt file is page-cache resident and does not read as a large
+  file. `pkill -f` matches its own command line, and a `pkill` in the same command as a patch
+  script kills the patch.
