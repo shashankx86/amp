@@ -517,6 +517,32 @@ same time appears in the device column. So the 9-26 ms "copy cost" that this doc
 carried for two sessions is the host waiting for the device, and the copies themselves are
 three round trips of 73 KiB per layer boundary.
 
+### The compute-stream copy fix, measured properly, is not a speed change
+
+`ggml_backend_tensor_get/set` reach the device through the *buffer* interface, which has no
+handle on the stream the work was enqueued on, so they copied on `cudaStreamPerThread` and
+synchronised that stream - which is not ordered against the compute stream, so the
+synchronise did not mean "the data is ready". Giving the buffer context the compute stream
+and copying on it removes that hazard. It is kept as a correctness change, not a speed one,
+because three interleaved pairs at 135k say it is not a speed one:
+
+| | decode, 1024 tokens | mean | spread |
+|---|---|---|---|
+| `cudaStreamPerThread` (stock) | 56.18, 57.07, 57.03 | 56.76 s | 0.89 |
+| compute stream (the fix) | 57.23, 57.45, 56.98 | 57.22 s | 0.47 |
+
+0.8% the wrong way, and less than the spread. This is the same result the change gave in
+section 4 and in the first pass at it: cutting individual read-backs from 44-162 us to
+13-23 us moves nothing, because the host was waiting for the device either way. It was worth
+1.29 ms on the input-copy *phase* in one instrumented run and 0 ms end to end, which is what
+the phase measurement was really saying.
+
+The A/B also produced a trap worth recording: a straggler from an aborted earlier script was
+holding 5360 MiB of the 6141, so the next six runs each failed to plan with `no
+configuration fits: vram 4.01 GiB > usable 668.00 MiB`, and one of them raced a rebuild. The
+script now checks free VRAM before every run. On a 6 GB card a leaked inference process is
+not a nuisance, it invalidates the next six measurements.
+
 ### Which matmuls, and the LM head
 
 Per-tensor device time, same 200-token run, the layer index and numeric suffixes collapsed so
