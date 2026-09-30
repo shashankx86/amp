@@ -308,7 +308,7 @@ Realistic prompt (52 KB, ~18k tokens). The numbers in `docs/BENCH.md` come from 
 ```
 
 Flags that matter: `--gpu-layers` / `--ubatch` (override the plan), `--no-prefetch` (A/B baseline),
-`--forward-warm` (warm in layer order instead of reverse), `--drop-cache` (cold start),
+`--forward-warm` (warm in layer order instead of reverse; measured identical, see Prefetcher), `--drop-cache` (cold start),
 `--temp 0` (greedy), `--dump-output PATH` / `--dump-logprobs PATH` (for parity work).
 
 ### 3. Warm the page cache

@@ -67,16 +67,20 @@ struct RuntimeStats {
 
 // Keeps the *next* ubatch's expert bytes in the page cache while the current one computes.
 //
-// Two details make this work, and both come from measurements rather than intuition:
+// The reason this exists is that the working set (12.19 GiB) is larger than the page cache
+// (~9.6 GiB usable), so the access pattern is a cyclic scan and demand faults go to the NVMe.
 //
-//  1. The working set (12.19 GiB) is larger than the page cache (~9.6 GiB usable), so the access
-//     pattern is a cyclic scan and LRU gives ~0% reuse. Warming in *reverse* layer order fixes
-//     that: the compute thread walks layers 0..39, so if the tail of the warm is layers 0..N, the
-//     layers it needs first are the ones that stayed resident. Warming forwards leaves the warm
-//     layers cached, which are exactly the ones the compute reaches last, and it misses them again.
-//  2. Warming must overlap compute. The compute thread's own demand faults are synchronous, so a
-//     cold fault both waits for the NVMe and drains queue depth. If the bytes are already resident
-//     the fault is served from RAM at 3.5 GiB/s instead of 1.8 GiB/s from the drive.
+// What does *not* matter is the warm's layer order. Reverse order was picked on the theory
+// that the compute thread walks layers 0..39, so a warm whose tail is layers 0..N leaves the
+// layers the compute reaches first resident. Measured on this box, that is not what happens:
+// a 33k-token prompt gives 409 t/s reversed and 409 t/s forwards, over three interleaved
+// pairs, with a 3% spread. `--forward-warm` is kept as the A/B that established this, and
+// `reverse_warm` defaults to true only because that is what was shipped.
+//
+// So the lever is whether the bytes are resident at all, not which end of the cycle they were
+// touched at. Warming still has to overlap compute: the compute thread's demand faults are
+// synchronous, so a cold fault both waits for the NVMe and drains queue depth, and a resident
+// one is served from RAM at 3.5 GiB/s instead of 1.8 GiB/s from the drive.
 class Prefetcher {
 public:
     Prefetcher(const ModelGeometry & geo, const ExecutionPlan & plan, const MappedFile & file,
