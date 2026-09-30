@@ -760,6 +760,83 @@ without a cross-lane reduction per head - one lane per row, no shuffles - tradin
 pattern (the scattered variant measures 61 GB/s) for none of the reduction work. That is a real
 rewrite with an unknown outcome, not a knob, and it is not attempted here.
 
+### The attention kernel is at a structural local optimum, and here is why
+
+`nthreads_KQ` is how many lanes cooperate on one 256-element dot product, and it is
+`min(D/4, 32) = 32` for this model. Fewer lanes means a shorter cross-lane reduction - 4
+shuffles at 16, 3 at 8, 2 at 4 - so if the reductions were what the kernel were paying for,
+fewer lanes would be faster. They are not:
+
+| `nthreads_KQ` | ms | GB/s | `max_blocks_per_sm` | `parallel_blocks` |
+|---|---|---|---|---|
+| **32 (ships)** | **2.640** | **82.5** | 4 | 5 |
+| 16 | 2.688 | 81.0 | 4 | 5 |
+| 8 | 2.838 | 76.7 | 4 | 5 |
+| 4 | 3.821 | 57.0 | 4 | 5 |
+
+Monotonically worse, and the register count and the fan-out do not move, so this is not a
+register-pressure effect. Fewer lanes per row means each warp covers more rows per instruction
+and reads a shorter contiguous run out of each, so the coalescing that the 82.5 GB/s depends on
+is exactly what is lost. **This also refutes the rewrite this document pointed at last turn** -
+"score several query heads per K row without a per-head cross-lane reduction" - since that is
+`nthreads_KQ = 1`, further along the same axis, and 4 is already 31% down.
+
+**Why the kernel is stuck, structurally.** The tile loop does a K pass and then a V pass, with
+a shared-memory round trip and a warp barrier between them, and the four co-resident blocks per
+SM march in lockstep, so the memory system sees all-K and then all-V rather than a mix. Two
+tiles cannot be in flight at once:
+
+- one K tile per warp is 32 rows x 8 B = **64 registers per lane**, against a kernel already at
+  128 with `__launch_bounds__(128, 4)`; absorbing it takes the cap to 192 and occupancy from 4
+  blocks per SM to 2
+- one K tile per block is **33,280 B**, so double-buffering it in shared memory is 66,560 B of
+  the 102,400 B an SM has, which is **1 block per SM**
+
+So overlapping the two streams costs 2-4x the occupancy to buy 2x the overlap. And the good
+coalescing that makes 82.5 GB/s possible is the same thing that forces 32 lanes onto a single
+row, which is what forces the 5-shuffle reduction. The kernel sits where those two constraints
+cross. That is a better answer than "a rewrite might help", and it is a reason not to start one.
+
+### fused GDN is closed, now for a measured reason rather than a wrong one
+
+The recurrent layers' own weights, read off the GGUF by `scripts/gguf_stem_bytes.py`:
+
+| per GDN block | bytes | |
+|---|---|---|
+| `ssm_out` | 3.438 MiB | Q3_K, 90% of it |
+| `ssm_alpha` | 0.250 MiB | F32 |
+| `ssm_conv1d` | 0.125 MiB | F32 |
+| `ssm_beta` | 0.027 MiB | Q3_K |
+| **total, x30** | **115 MiB/token** | |
+
+So this document's earlier "recurrent projections 103 MB/token" was right, and a guess of mine
+this session that they were 775 MB was wrong by 7x - there is no `z` or `x_proj` tensor in this
+model's recurrent block, which is why the `z-#` mul_mat in the named per-op table is not one of
+the block's weights.
+
+The recurrence has no weights at all. It moves the state, which for this geometry is
+16 heads x 256 v_dim x 128 k_dim = 2 MiB per layer, so **120 MiB/token read and written**, and
+at the streaming rate that is **0.81 ms**. The elementwise ops it is decomposed into measure
+~3.3 ms/token, but the instrument's own per-node event pair costs **~3.3 us per node** and
+there are ~240 of them per token across the recurrent blocks, so almost all of that 3.3 ms is
+the instrument. After subtracting it the glue is **<= 0.8 ms/token**.
+
+**A fused GDN kernel would replace <= 0.8 ms of glue with a 0.81 ms single pass over the state.
+It saves nothing.** The decision to retire it stands; the reason it was previously given - that
+the recurrence is free - was wrong, and this is the right one.
+
+### The decode graph is 698 nodes per token, and per-node device timing measures launch gaps
+
+`AMP_TRACE_OPS` with `AMP_NO_CUDA_GRAPH=1` and no filter reports 698 nodes per decode token.
+With the graph disabled the host is the bottleneck, so an event pair around each node measures
+the inter-kernel gap rather than the kernel: `CONT`, 10 nodes per token at 0.033 ms, gives
+**3.3 us per node** as the floor. That is why `scripts/price_decode_ops.py` takes an
+`AMP_OPS_MATCH` filter and prices one op class at a time, and why the named per-tensor table
+from the unfiltered run is an upper bound. The structure is still worth having: the whole
+decode graph is `MUL_MAT` (287), the GDN projections `ssm_out` and the router, the head, 10
+`FLASH_ATTN_EXT`, 6 `MUL_MAT_ID` for the three GPU-resident expert layers, and ~240
+elementwise nodes for the recurrence.
+
 ### Both regimes are at about three quarters of a hardware limit, and the reasons differ
 
 Prefill at 200k is 332 s, eleven times a 512-token decode, and it had never been examined.

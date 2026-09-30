@@ -156,23 +156,29 @@ a 4.411 ms post-decode drain appears. That drain is a constant 3.4-4.7 ms indepe
 context, prefetcher and CUDA graphs, it grows ~0.35 ms per GPU-resident expert layer, and it
 **cannot be filled** - the next token needs the id the drain is producing.
 
-**The one live item is the per-query-head cost in decode attention.** At the model's shape the
-attention kernel reports 48% of the card's streaming rate, and it is not a memory deficit.
-Holding the KV bytes fixed at one KV head and raising only the query heads gives 0.906 /
-0.946 / 1.310 / 2.420 ms for 2 / 4 / 8 / 16 heads, so the time grows with the head count on
-its own; and 8/2 against 8/1 doubles the KV for 0.58 ms more, so the marginal KV streams at
-177 GB/s. The cost is per query head: each row is read once and scored against 16 heads, each
-needing a 256-element q8_0 x q8_1 dot product and a 5-shuffle cross-lane reduction.
+**fused GDN is closed, for a measured reason.** The recurrence's own weights are 115 MiB/token
+(`ssm_out` is 90% of it) and it has no `z` or `x_proj` tensor, so the earlier 775 MB guess was
+wrong by 7x. The recurrence moves 120 MiB/token of state, which is 0.81 ms at the streaming
+rate, and the elementwise ops it is decomposed into are <= 0.8 ms of real device time once the
+instrument's own ~3.3 us per node is subtracted out of the ~3.3 ms they appear to cost. A fused
+kernel would swap 0.8 ms of glue for a 0.81 ms single pass. It saves nothing.
 
-Everything cheap is excluded by measurement (260-byte row pitch, 4 B/lane width, head dim,
-register spill, launch bound 2/3/4/6/8/12, split-K 5/10/16/24/40/80, L1 footprint). The
-rewrite that the numbers *do* point at is a kernel that scores several query heads per K row
-**without a per-head cross-lane reduction** - one lane per row, no shuffles - trading a worse
-memory pattern (the scattered variant measures 61 GB/s) for none of the reduction work. That
-is a rewrite with an unknown outcome, not a knob.
+**The one live item is the decode attention kernel, and it is at a structural local optimum.**
+It reports 48% of the card's streaming rate. The cost is per query head - holding the KV bytes
+fixed at one KV head and raising only the query heads gives 0.906 / 0.946 / 1.310 / 2.420 ms for
+2 / 4 / 8 / 16 heads - and the marginal KV streams at 177 GB/s, so the redundancy is already
+free. Every knob is at its best value: launch bound 4 of 2/3/4/6/8/12, split-K 5 of
+5/10/16/24/40/80, `nthreads_KQ` 32 of 32/16/8/4, `REG:128 STACK:0`, row pitch 260 of
+260/272/288, head dim 256 of 64/128/256.
 
-The GQA-merge idea looked like the answer and is **refuted**: it removes redundant K/V loads,
-and the measurements above show those loads are already nearly free.
+The reason is a crossed constraint, not a missing trick. The tile loop runs a K pass then a V
+pass with a barrier between, the four co-resident blocks march in lockstep so the memory system
+sees all-K then all-V, and the two cannot be in flight together: a K tile per warp is 64
+registers per lane against a kernel already at its 128-register cap, which would halve
+occupancy, and a K tile per block is 33,280 B, so double-buffering it is 66 KB of an SM's 100 KB,
+which would leave one block. And the good coalescing that produces 82.5 GB/s is the same thing
+that puts 32 lanes on one 256-byte row, which is what forces the 5-shuffle reduction. Buying
+the overlap costs 2-4x the occupancy to get 2x the overlap.
 
 ## Traps
 
@@ -193,3 +199,14 @@ and the measurements above show those loads are already nearly free.
   after reconfiguring.
 - `/tmp` is tmpfs, so `p200k.txt` at 1 MiB and `prompt200k.txt` at 910 KiB are both
   page-cache resident and neither reads as a large file.
+- **Do not `git checkout` a vendored file to drop a measurement instrument from it.** Doing
+  that on `ggml-cuda.cu` also silently reverted the shipped compute-stream fix, and
+  `grep -c ctx->stream` still reported 24 hits because it matches the unrelated
+  `ctx->stream()` accessor, so the loss looked like it had not happened. Extract the
+  instrument's hunks into a patch first and apply the saved shipped patch back, then confirm
+  the diffstat is byte-for-byte what it was before instrumenting.
+- A per-node CUDA event pair measures the **inter-kernel gap**, not the kernel, whenever the
+  CUDA graph is disabled - which is the only way to get per-node device times at all here.
+  With ~700 nodes per decode token the bubble dominates; `CONT` puts it at ~3.3 us per node.
+  Use `AMP_OPS_MATCH` to price one op class at a time and treat unfiltered per-op tables as
+  upper bounds.

@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 36c6a93..71e5d1d 100644
+index 36c6a93..449aa52 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -2,6 +2,8 @@
@@ -11,10 +11,11 @@ index 36c6a93..71e5d1d 100644
  #include "ggml-cuda/allreduce.cuh"
  #include "ggml-cuda/common.cuh"
  #include "ggml-cuda/acc.cuh"
-@@ -92,6 +94,88 @@
+@@ -92,6 +94,108 @@
  #include <string>
  #include <vector>
  
++
 +// AMP_TRACE_OPS attributes device time to the op that spent it, and AMP_NO_CUDA_GRAPH=1 runs
 +// the nodes directly, because a captured graph replays as a single unit and cannot be
 +// attributed per op. Measurement only. See ggml_backend_cuda_graph_compute.
@@ -23,12 +24,14 @@ index 36c6a93..71e5d1d 100644
 +// single host thread that calls graph_compute, and is read once at exit.
 +static double   g_amp_ops_us[AMP_OPS_SLOTS];
 +static uint64_t g_amp_ops_n[AMP_OPS_SLOTS];
++static uint64_t g_amp_nodes = 0;   // every node, timed or not, so the bubble can be accounted for
++static uint64_t g_amp_timed = 0;   // nodes that actually got an event pair
 +
 +// Attribute by op alone for the report, and by op + a name stem for the detail, so which
 +// matmuls dominate is visible rather than guessed at. The stem collapses the layer index
 +// and any numeric suffix, e.g. "blk.12.ffn_gate_exps" -> "blk.##.ffn_gate_exps".
-+#define AMP_OPS_DETAIL 64
-+struct amp_ops_key { int op; char stem[40]; };
++#define AMP_OPS_DETAIL 512
++struct amp_ops_key { int op; char stem[64]; };
 +static std::vector<amp_ops_key>           g_amp_detail_key;
 +static std::vector<std::array<double, 2>> g_amp_detail_val;   // {us, count}
 +
@@ -47,9 +50,25 @@ index 36c6a93..71e5d1d 100644
 +    g_amp_ops_n[op]  += 1;
 +}
 +
-+static void amp_ops_add_named(int op, const char * name, double ms) {
-+    char stem[40];
-+    amp_ops_stem(name ? name : "?", stem, sizeof(stem));
++// Nodes with an empty name are common enough to matter (341 mul_mats per decode token on
++// this model) and they were the single largest unattributed item, so key them by the shapes
++// of the two source tensors instead. That identifies which projection a node is.
++static void amp_ops_shape_stem(const char * name, const ggml_tensor * a, const ggml_tensor * b,
++                               char * out, size_t n) {
++    if (name && name[0]) { amp_ops_stem(name, out, n); return; }
++    if (a && b && a->ne[0] && b->ne[0]) {
++        snprintf(out, n, "? %" PRId64 "x%" PRId64 " @ %" PRId64 "x%" PRId64 " %s",
++                 (int64_t) a->ne[0], (int64_t) a->ne[1], (int64_t) b->ne[0], (int64_t) b->ne[1],
++                 "mat");
++    } else {
++        amp_ops_stem(name ? name : "?", out, n);
++    }
++}
++
++static void amp_ops_add_named(int op, const char * name, double ms,
++                              const ggml_tensor * a = nullptr, const ggml_tensor * b = nullptr) {
++    char stem[64];
++    amp_ops_shape_stem(name, a, b, stem, sizeof(stem));
 +    for (size_t i = 0; i < g_amp_detail_key.size(); i++) {
 +        if (g_amp_detail_key[i].op == op && strcmp(g_amp_detail_key[i].stem, stem) == 0) {
 +            g_amp_detail_val[i][0] += ms * 1e3;
@@ -78,7 +97,8 @@ index 36c6a93..71e5d1d 100644
 +            tot += us;
 +        }
 +        std::sort(v.rbegin(), v.rend());
-+        fprintf(stderr, "[OPS] total device time %.3f ms\n", tot/1e3);
++        fprintf(stderr, "[OPS] total device time %.3f ms over %llu nodes (%llu timed)\n", tot/1e3,
++                (unsigned long long) g_amp_nodes, (unsigned long long) g_amp_timed);
 +        for (size_t i = 0; i < v.size() && i < 18; i++) {
 +            fprintf(stderr, "[OPS] %9.3f ms  n=%-7llu %s\n", v[i].first/1e3,
 +                    (unsigned long long) g_amp_ops_n[v[i].second],
@@ -88,7 +108,7 @@ index 36c6a93..71e5d1d 100644
 +        for (size_t i = 0; i < g_amp_detail_key.size(); i++) d.push_back({g_amp_detail_val[i][0], i});
 +        std::sort(d.rbegin(), d.rend());
 +        fprintf(stderr, "[OPS] --- by tensor ---\n");
-+        for (size_t i = 0; i < d.size() && i < 24; i++) {
++        for (size_t i = 0; i < d.size() && i < 40; i++) {
 +            const auto & k = g_amp_detail_key[d[i].second];
 +            fprintf(stderr, "[OPS] %9.3f ms  n=%-7.0f %-16s %s\n", d[i].first/1e3,
 +                    g_amp_detail_val[d[i].second][1], ggml_op_name((ggml_op) k.op), k.stem);
@@ -100,7 +120,7 @@ index 36c6a93..71e5d1d 100644
  static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
  
  #define GGML_LOG_WARN_ONCE(str) \
-@@ -724,10 +808,20 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+@@ -724,10 +828,20 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
  
  // cuda buffer
  
@@ -121,7 +141,7 @@ index 36c6a93..71e5d1d 100644
  
      ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
          device(device), dev_ptr(dev_ptr),
-@@ -786,16 +880,18 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+@@ -786,16 +900,18 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
      ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
  
      ggml_cuda_set_device(ctx->device);
@@ -144,7 +164,7 @@ index 36c6a93..71e5d1d 100644
  }
  
  static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
-@@ -896,6 +992,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
+@@ -896,6 +1012,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
      }
  
      ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
@@ -161,11 +181,21 @@ index 36c6a93..71e5d1d 100644
  
      return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
  }
-@@ -4374,7 +4480,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4374,7 +4500,38 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  GGML_UNUSED(integrated);
  #endif  // NDEBUG
  
-+                const bool amp_ops = getenv("AMP_TRACE_OPS") != nullptr;
++                // A per-node event pair costs a pipeline drain, so with ~700 nodes per decode
++                // token timing them all measures the instrument more than the kernels. AMP_OPS_MATCH
++                // restricts the timing to ops whose stem contains that substring, which is how
++                // the elementwise GDN nodes were priced without paying a bubble 700 times.
++                static const char * amp_ops_match = getenv("AMP_OPS_MATCH");
++                // Match against the op name as well, so a filter like ADD prices every ADD node
++                // and not the tensors that happen to have "add" in their name.
++                const char * amp_ops_needle = amp_ops_match ? amp_ops_match : "";
++                const bool amp_ops = getenv("AMP_TRACE_OPS") != nullptr && amp_ops_match &&
++                    (strstr(node->name ? node->name : "", amp_ops_needle) != nullptr ||
++                     strstr(ggml_op_name((ggml_op) node->op), amp_ops_needle) != nullptr);
 +                cudaEvent_t amp_ev0 = nullptr, amp_ev1 = nullptr;
 +                if (amp_ops) {
 +                    if (!amp_ev0) {
@@ -175,19 +205,22 @@ index 36c6a93..71e5d1d 100644
 +                    CUDA_CHECK(cudaEventRecord(amp_ev0, cuda_ctx->stream()));
 +                }
 +
++                g_amp_nodes++;
                  bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
 +                if (amp_ops) {
 +                    CUDA_CHECK(cudaEventRecord(amp_ev1, cuda_ctx->stream()));
 +                    CUDA_CHECK(cudaEventSynchronize(amp_ev1));
 +                    float ms = 0.0f;
 +                    CUDA_CHECK(cudaEventElapsedTime(&ms, amp_ev0, amp_ev1));
++                    g_amp_timed++;
 +                    amp_ops_add((int) node->op, (double) ms);
-+                    amp_ops_add_named((int) node->op, node->name, (double) ms);
++                    amp_ops_add_named((int) node->op, node->name, (double) ms,
++                                      node->src[0], node->src[1]);
 +                }
                  if (!ok) {
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
-@@ -4484,6 +4608,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4484,6 +4641,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      }
  #endif // USE_CUDA_GRAPH
  
